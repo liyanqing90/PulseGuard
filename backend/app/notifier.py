@@ -1,0 +1,440 @@
+from __future__ import annotations
+
+import base64
+import hmac
+import time
+from datetime import datetime, timedelta
+from hashlib import sha256
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import httpx
+
+from . import storage
+from .schemas import NOTIFICATION_STATUSES
+
+
+class AlertDeliveryError(RuntimeError):
+    pass
+
+
+ALERTABLE_RUN_STATUSES = {"ok", "failed", "timeout"}
+WEBHOOK_TYPES = {"feishu", "wecom", "dingtalk"}
+
+
+async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: dict[str, Any]) -> None:
+    settings = storage.get_settings()
+    if not settings.get("alerts_enabled"):
+        _record_notification(run, "disabled")
+        return
+
+    channels = _notification_channels(settings, enabled_only=True, require_webhook=True)
+    if not channels:
+        _record_notification(run, "disabled")
+        return
+
+    if run["status"] not in ALERTABLE_RUN_STATUSES:
+        _record_notification(run, "not_required")
+        return
+
+    should_send = False
+    is_recovery = False
+    current_status = transition.get("current_status")
+    previous_status = transition.get("previous_status")
+    trigger = str(transition.get("trigger") or "")
+    manual_trigger = _is_manual_trigger(trigger)
+
+    if current_status == "failed":
+        if manual_trigger:
+            should_send = True
+        elif previous_status != "failed":
+            should_send = True
+        else:
+            should_send = _cooldown_elapsed(
+                transition.get("last_notified_at"),
+                int(settings.get("alert_cooldown_minutes", 30)),
+            )
+    elif current_status == "ok" and previous_status == "failed" and settings.get("recovery_notification", True):
+        should_send = True
+        is_recovery = True
+
+    channel_summary = _channels_summary(channels)
+    if not should_send:
+        _record_notification(run, "suppressed", channel=channel_summary, error=_suppression_reason(transition, settings))
+        return
+
+    title, text = _format_message(check, run, transition, is_recovery, settings)
+    failures: list[tuple[str, Exception]] = []
+    sent_channels: list[dict[str, Any]] = []
+
+    for channel in channels:
+        try:
+            await send_webhook_alert(channel, title, text)
+        except Exception as exc:
+            failures.append((_channel_display_name(channel), exc))
+        else:
+            sent_channels.append(channel)
+
+    sent_at = storage.now_iso() if sent_channels else None
+    if failures:
+        _record_notification(
+            run,
+            "failed",
+            channel=channel_summary,
+            error=_delivery_error_summary(failures),
+            sent_at=sent_at,
+        )
+        if sent_at:
+            storage.update_last_notified(int(check["id"]), sent_at)
+        return
+
+    _record_notification(run, "sent", channel=channel_summary, sent_at=sent_at)
+    storage.update_last_notified(int(check["id"]), sent_at)
+
+
+def _record_notification(
+    run: dict[str, Any],
+    status: str,
+    channel: str | None = None,
+    error: str | None = None,
+    sent_at: str | None = None,
+) -> None:
+    if status not in NOTIFICATION_STATUSES:
+        raise ValueError(f"unsupported notification status: {status}")
+    run_id = run.get("id")
+    if run_id is None:
+        return
+    storage.update_run_notification(int(run_id), status, channel=channel, error=error, sent_at=sent_at)
+
+
+async def send_test_alert(settings: dict[str, Any]) -> None:
+    channels = _notification_channels(settings, enabled_only=True, require_webhook=True)
+    if not channels:
+        raise AlertDeliveryError("请至少配置一个启用且填写 Webhook URL 的通知渠道")
+
+    title, text = _test_alert_message()
+    failures: list[tuple[str, Exception]] = []
+    for channel in channels:
+        try:
+            await send_webhook_alert(channel, title, text)
+        except Exception as exc:
+            failures.append((_channel_display_name(channel), exc))
+    if failures:
+        raise AlertDeliveryError(_delivery_error_summary(failures))
+
+
+def build_test_alert_preview(settings: dict[str, Any]) -> dict[str, Any]:
+    title, text = _test_alert_message()
+    channels = _notification_channels(settings, enabled_only=False, require_webhook=False)
+    return {
+        "channels": [_channel_preview(channel, title, text) for channel in channels],
+        "message_text": text,
+    }
+
+
+async def send_webhook_alert(channel: dict[str, Any], title: str, text: str) -> None:
+    webhook_type = _channel_type(channel)
+    webhook_url = str(channel.get("webhook_url") or "").strip()
+    if not webhook_url:
+        raise AlertDeliveryError("请先填写 Webhook URL")
+
+    request_url = _request_url(webhook_type, webhook_url, channel)
+    payload = _webhook_payload(webhook_type, title, text)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(request_url, json=payload)
+
+    if response.status_code >= 400:
+        raise AlertDeliveryError(f"Webhook 返回 HTTP {response.status_code}")
+
+    error_message = _robot_error(webhook_type, response)
+    if error_message:
+        raise AlertDeliveryError(error_message)
+
+
+def _notification_channels(
+    settings: dict[str, Any],
+    *,
+    enabled_only: bool,
+    require_webhook: bool,
+) -> list[dict[str, Any]]:
+    channels: list[dict[str, Any]] = []
+    for raw_channel in settings.get("notification_channels") or []:
+        if not isinstance(raw_channel, dict):
+            continue
+
+        channel_type = _channel_type(raw_channel)
+        webhook_url = str(raw_channel.get("webhook_url") or "").strip()
+        enabled = bool(raw_channel.get("enabled", True))
+        if enabled_only and not enabled:
+            continue
+        if require_webhook and not webhook_url:
+            continue
+
+        channels.append(
+            {
+                "id": str(raw_channel.get("id") or ""),
+                "name": str(raw_channel.get("name") or _channel_type_label(channel_type)).strip()
+                or _channel_type_label(channel_type),
+                "type": channel_type,
+                "enabled": enabled,
+                "webhook_url": webhook_url,
+                "dingtalk_secret": str(raw_channel.get("dingtalk_secret") or "").strip(),
+            }
+        )
+    return channels
+
+
+def _channel_preview(channel: dict[str, Any], title: str, text: str) -> dict[str, Any]:
+    webhook_type = _channel_type(channel)
+    webhook_url = str(channel.get("webhook_url") or "").strip()
+    signing_enabled = webhook_type == "dingtalk" and bool(str(channel.get("dingtalk_secret") or "").strip())
+    return {
+        "id": channel.get("id") or "",
+        "name": _channel_display_name(channel),
+        "type": webhook_type,
+        "enabled": bool(channel.get("enabled", True)),
+        "target": _safe_target(webhook_url, webhook_type, signing_enabled),
+        "signing_enabled": signing_enabled,
+        "payload": _webhook_payload(webhook_type, title, text),
+    }
+
+
+def _channel_type(channel: dict[str, Any]) -> str:
+    channel_type = str(channel.get("type") or "feishu")
+    return channel_type if channel_type in WEBHOOK_TYPES else "feishu"
+
+
+def _channel_display_name(channel: dict[str, Any]) -> str:
+    channel_type = _channel_type(channel)
+    return str(channel.get("name") or _channel_type_label(channel_type)).strip() or _channel_type_label(channel_type)
+
+
+def _channel_type_label(channel_type: str) -> str:
+    return {"feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉"}.get(channel_type, channel_type)
+
+
+def _channels_summary(channels: list[dict[str, Any]]) -> str | None:
+    if not channels:
+        return None
+    return "、".join(_channel_display_name(channel) for channel in channels)
+
+
+def _delivery_error_summary(failures: list[tuple[str, Exception]]) -> str:
+    messages = [f"{name}：{_safe_error(exc)}" for name, exc in failures]
+    return "；".join(messages)[:500]
+
+
+def _safe_error(exc: Exception) -> str:
+    message = str(exc) or exc.__class__.__name__
+    return message[:500]
+
+
+def _test_alert_message() -> tuple[str, str]:
+    title = "PulseGuard 测试告警"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    text = "\n".join(
+        [
+            "#### PulseGuard 测试告警",
+            "",
+            "- 类型：通知渠道",
+            "- 任务：配置校验",
+            f"- 时间：{now}",
+            "- 结果：告警链路已连接",
+        ]
+    )
+    return title, text
+
+
+def _request_url(webhook_type: str, webhook_url: str, settings: dict[str, Any]) -> str:
+    if webhook_type != "dingtalk":
+        return webhook_url
+
+    secret = str(settings.get("dingtalk_secret") or "").strip()
+    if not secret:
+        return webhook_url
+
+    timestamp = str(int(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{secret}"
+    digest = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=sha256).digest()
+    sign = base64.b64encode(digest).decode("utf-8")
+
+    parts = urlsplit(webhook_url)
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key not in {"timestamp", "sign"}]
+    query.extend([("timestamp", timestamp), ("sign", sign)])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _safe_target(webhook_url: str, webhook_type: str, signing_enabled: bool) -> dict[str, Any]:
+    if not webhook_url:
+        return {"valid": False, "origin": "", "path": "", "query_keys": [], "issues": ["Webhook URL 为空"]}
+
+    parts = urlsplit(webhook_url)
+    if not parts.scheme or not parts.netloc:
+        return {"valid": False, "origin": "", "path": "", "query_keys": [], "issues": ["Webhook URL 无法解析"]}
+
+    query_keys = [key for key, _ in parse_qsl(parts.query, keep_blank_values=True)]
+    if webhook_type == "dingtalk" and signing_enabled:
+        for key in ("timestamp", "sign"):
+            if key not in query_keys:
+                query_keys.append(key)
+
+    return {
+        "valid": True,
+        "origin": f"{parts.scheme}://{parts.netloc}",
+        "path": _masked_path(parts.path),
+        "query_keys": query_keys,
+        "issues": [],
+    }
+
+
+def _masked_path(path: str) -> str:
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return "/"
+
+    masked: list[str] = []
+    for index, segment in enumerate(segments):
+        if _looks_sensitive_segment(segment):
+            masked.append(_mask_token(segment))
+        elif len(segments) > 3 and index >= 3:
+            masked.append("...")
+            break
+        else:
+            masked.append(segment)
+    return "/" + "/".join(masked)
+
+
+def _looks_sensitive_segment(segment: str) -> bool:
+    return len(segment) >= 16 and any(char.isdigit() for char in segment) and any(char.isalpha() for char in segment)
+
+
+def _mask_token(value: str) -> str:
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _robot_error(webhook_type: str, response: httpx.Response) -> str | None:
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    if webhook_type == "dingtalk":
+        errcode = _robot_failure_code(data, "errcode")
+        if errcode:
+            return f"钉钉返回 {errcode}：{data.get('errmsg') or '发送失败'}"
+    elif webhook_type == "wecom":
+        errcode = _robot_failure_code(data, "errcode")
+        if errcode:
+            return f"企业微信返回 {errcode}：{data.get('errmsg') or '发送失败'}"
+    elif webhook_type == "feishu":
+        code = _robot_failure_code(data, "code", "StatusCode")
+        if code:
+            return f"飞书返回 {code}：{data.get('msg') or data.get('StatusMessage') or '发送失败'}"
+    return None
+
+
+def _robot_failure_code(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value is None:
+            continue
+        code = value.strip() if isinstance(value, str) else str(value)
+        if code and code != "0":
+            return code
+        return None
+    return None
+
+
+def _cooldown_elapsed(last_notified_at: str | None, cooldown_minutes: int) -> bool:
+    if not last_notified_at:
+        return True
+    try:
+        last = datetime.fromisoformat(last_notified_at)
+    except ValueError:
+        return True
+    return datetime.now().astimezone() - last >= timedelta(minutes=cooldown_minutes)
+
+
+def _is_manual_trigger(trigger: str) -> bool:
+    return trigger == "manual" or trigger == "manual-batch" or trigger.startswith("rerun:")
+
+
+def _suppression_reason(transition: dict[str, Any], settings: dict[str, Any]) -> str:
+    current_status = transition.get("current_status")
+    previous_status = transition.get("previous_status")
+    if current_status == "failed" and previous_status == "failed":
+        cooldown = int(settings.get("alert_cooldown_minutes", 30))
+        last_notified_at = transition.get("last_notified_at")
+        if last_notified_at:
+            return f"连续失败仍在 {cooldown} 分钟告警冷却窗口内，上次告警时间：{last_notified_at}"
+        return f"连续失败仍在 {cooldown} 分钟告警冷却窗口内"
+    if current_status == "ok":
+        return "当前运行正常，且未满足恢复通知条件"
+    return "当前运行结果未满足告警发送条件"
+
+
+def _run_detail_url(check: dict[str, Any], run: dict[str, Any], settings: dict[str, Any]) -> str:
+    base_url = str(settings.get("alert_detail_base_url") or "").strip().rstrip("/")
+    run_id = run.get("id")
+    check_id = check.get("id")
+    if not base_url or run_id is None or check_id is None:
+        return ""
+    query = urlencode({"from": f"/runs?check_id={check_id}"})
+    return f"{base_url}/runs/{run_id}?{query}"
+
+
+def _format_message(
+    check: dict[str, Any],
+    run: dict[str, Any],
+    transition: dict[str, Any],
+    recovery: bool,
+    settings: dict[str, Any],
+) -> tuple[str, str]:
+    check_type = "UI" if check["type"] == "ui" else "API"
+    title = "PulseGuard 探活恢复" if recovery else "PulseGuard 探活失败"
+    detail_url = _run_detail_url(check, run, settings)
+    lines = [
+        f"#### {title}",
+        "",
+        f"- 类型：{check_type}",
+        f"- 任务：{check['name']}",
+        f"- 时间：{run.get('finished_at') or run.get('started_at')}",
+        f"- 运行记录：{run['id']}",
+    ]
+    if detail_url:
+        lines.append(f"- 详情页：{detail_url}")
+
+    if recovery:
+        lines.append("- 状态：已恢复")
+    else:
+        lines.extend(
+            [
+                f"- 错误：{run.get('error_message') or '未提供错误摘要'}",
+                f"- 连续失败：{transition.get('consecutive_failures', 1)}",
+                f"- 耗时：{run.get('duration_ms') or 0}ms",
+            ]
+        )
+    return title, "\n".join(lines)
+
+
+def _webhook_payload(webhook_type: str, title: str, text: str) -> dict[str, Any]:
+    if webhook_type == "dingtalk":
+        return {
+            "msgtype": "markdown",
+            "markdown": {"title": title[:64], "text": text},
+            "at": {"isAtAll": False},
+        }
+    if webhook_type == "wecom":
+        return {"msgtype": "text", "text": {"content": _plain_text(text)}}
+    return {"msg_type": "text", "content": {"text": _plain_text(text)}}
+
+
+def _plain_text(text: str) -> str:
+    return text.replace("#### ", "").replace("- ", "")

@@ -1,0 +1,153 @@
+import { Alert, Tag } from "antd";
+import { Eye, History } from "lucide-react";
+import type { ReactNode } from "react";
+import type { CheckType, Run, RunStatus } from "../types";
+import { formatDate, runStatusLabel } from "../utils";
+import { AppButton as Button } from "./common/AppButton";
+
+export type BatchRunNotice = {
+  type: CheckType;
+  total: number;
+  counts: Record<RunStatus, number>;
+  latestRunId: number | null;
+  issueRunId: number | null;
+  finishedAt: string;
+};
+
+const RUN_STATUS_ORDER: RunStatus[] = ["ok", "failed", "timeout", "skipped", "running", "pending"];
+
+export function summarizeBatchRuns(type: CheckType, runs: Run[]): BatchRunNotice {
+  const counts: Record<RunStatus, number> = {
+    pending: 0,
+    running: 0,
+    ok: 0,
+    failed: 0,
+    timeout: 0,
+    skipped: 0
+  };
+  runs.forEach((run) => {
+    counts[run.status] += 1;
+  });
+
+  const orderedRuns = [...runs].sort(compareRunsByRecency);
+  const latestRun = orderedRuns.length ? orderedRuns[orderedRuns.length - 1] : null;
+  const issueRun = [...orderedRuns]
+    .reverse()
+    .find((run) => run.status === "failed" || run.status === "timeout" || run.status === "skipped") || null;
+
+  return {
+    type,
+    total: runs.length,
+    counts,
+    latestRunId: latestRun?.id ?? null,
+    issueRunId: issueRun?.id ?? null,
+    finishedAt: latestRun?.finished_at || latestRun?.started_at || new Date().toISOString()
+  };
+}
+
+export function BatchRunAlert({
+  notice,
+  emptyAction,
+  onClose,
+  onOpenHistory,
+  onOpenRun
+}: {
+  notice: BatchRunNotice;
+  emptyAction?: ReactNode;
+  onClose: () => void;
+  onOpenHistory: (path: string) => void;
+  onOpenRun: (runId: number) => void;
+}) {
+  const action =
+    notice.total > 0 ? (
+      <div className="batch-run-actions">
+        {notice.issueRunId && (
+          <Button size="small" icon={<Eye size={14} />} onClick={() => onOpenRun(notice.issueRunId!)}>
+            查看问题详情
+          </Button>
+        )}
+        {notice.latestRunId && notice.latestRunId !== notice.issueRunId && (
+          <Button size="small" icon={<Eye size={14} />} onClick={() => onOpenRun(notice.latestRunId!)}>
+            查看最近结果
+          </Button>
+        )}
+        <Button size="small" icon={<History size={14} />} onClick={() => onOpenHistory(batchRunHistoryPath(notice))}>
+          执行历史
+        </Button>
+      </div>
+    ) : (
+      emptyAction
+    );
+
+  return (
+    <Alert
+      className="batch-run-alert"
+      type={batchRunAlertType(notice)}
+      message={batchRunMessage(notice)}
+      description={<BatchRunBreakdown notice={notice} />}
+      showIcon
+      closable
+      onClose={onClose}
+      action={action}
+    />
+  );
+}
+
+function compareRunsByRecency(a: Run, b: Run): number {
+  const aTime = runTimeValue(a);
+  const bTime = runTimeValue(b);
+  if (aTime !== bTime) return aTime - bTime;
+  return a.id - b.id;
+}
+
+function runTimeValue(run: Run): number {
+  const finishedAt = run.finished_at ? Date.parse(run.finished_at) : Number.NaN;
+  if (!Number.isNaN(finishedAt)) return finishedAt;
+  const startedAt = Date.parse(run.started_at);
+  return Number.isNaN(startedAt) ? 0 : startedAt;
+}
+
+function batchRunAlertType(notice: BatchRunNotice): "success" | "info" | "warning" {
+  if (!notice.total) return "info";
+  if (notice.counts.failed || notice.counts.timeout) return "warning";
+  if (notice.counts.skipped) return "info";
+  return "success";
+}
+
+function batchRunMessage(notice: BatchRunNotice): string {
+  const typeLabel = notice.type === "ui" ? " UI" : "接口";
+  return notice.total ? `执行全部${typeLabel}任务完成` : `没有可执行的${typeLabel}任务`;
+}
+
+function batchRunHistoryPath(notice: BatchRunNotice): string {
+  const params = new URLSearchParams({ type: notice.type });
+  if (notice.counts.failed || notice.counts.timeout) {
+    params.set("status", "failed");
+  }
+  return `/runs?${params.toString()}`;
+}
+
+function BatchRunBreakdown({ notice }: { notice: BatchRunNotice }) {
+  if (!notice.total) {
+    return `当前没有启用的${notice.type === "ui" ? " UI" : "接口"}任务。`;
+  }
+
+  return (
+    <div className="batch-run-breakdown">
+      <span>共 {notice.total} 条</span>
+      {RUN_STATUS_ORDER.filter((status) => notice.counts[status] > 0).map((status) => (
+        <Tag color={batchRunStatusColor(status)} key={status}>
+          {runStatusLabel(status)} {notice.counts[status]}
+        </Tag>
+      ))}
+      <span className="batch-run-time">完成于 {formatDate(notice.finishedAt)}</span>
+    </div>
+  );
+}
+
+function batchRunStatusColor(status: RunStatus): string {
+  if (status === "ok") return "success";
+  if (status === "failed" || status === "timeout") return "error";
+  if (status === "running" || status === "pending") return "processing";
+  return "warning";
+}
