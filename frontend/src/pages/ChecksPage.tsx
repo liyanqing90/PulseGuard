@@ -1,14 +1,18 @@
-import { Alert, Empty, Input, Popconfirm, Select, Skeleton, Space, Switch, Table, Tag } from "antd";
+import { Alert, App, Button, Card, Empty, Input, Popconfirm, Select, Skeleton, Space, Statistic, Switch, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Copy, Edit3, FilterX, History, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { checkToCopyPayload } from "../checkPayload";
-import { BatchRunAlert, summarizeBatchRuns } from "../components/BatchRunAlert";
-import type { BatchRunNotice } from "../components/BatchRunAlert";
+import {
+  BatchRunActions,
+  BatchRunBreakdown,
+  batchRunMessage,
+  batchRunNotificationType,
+  summarizeBatchRuns
+} from "../components/BatchRunAlert";
 import { CheckEditorDrawer } from "../components/CheckEditorDrawer";
-import { AppButton as Button } from "../components/common/AppButton";
 import { RunDetailDrawer } from "../components/RunDetailDrawer";
 import { TaskStatusBadge } from "../components/StatusBadge";
 import type { Check, CheckType, TaskSurfaceStatus } from "../types";
@@ -17,6 +21,7 @@ import { compactUrl, formatDate, formatDuration, intervalLabel, taskStatus, task
 type EnabledFilter = "" | "enabled" | "disabled";
 
 export function ChecksPage({ type }: { type: CheckType }) {
+  const { message } = App.useApp();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [checks, setChecks] = useState<Check[]>([]);
@@ -27,7 +32,6 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<number | "all" | null>(null);
   const [duplicatingId, setDuplicatingId] = useState<number | null>(null);
-  const [batchRunNotice, setBatchRunNotice] = useState<BatchRunNotice | null>(null);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<TaskSurfaceStatus | "">("");
   const [enabledFilter, setEnabledFilter] = useState<EnabledFilter>("");
@@ -48,7 +52,6 @@ export function ChecksPage({ type }: { type: CheckType }) {
   }
 
   useEffect(() => {
-    setBatchRunNotice(null);
     load();
   }, [type]);
 
@@ -87,12 +90,10 @@ export function ChecksPage({ type }: { type: CheckType }) {
     };
   }, [checks, filtered.length]);
 
-  const focusedCheck = focusedCheckId ? checks.find((check) => String(check.id) === focusedCheckId) : null;
   const hasFilters = Boolean(query || statusFilter || enabledFilter || focusedCheckId);
 
   async function runCheck(check: Check) {
     setBusy(check.id);
-    setBatchRunNotice(null);
     try {
       const run = await api.runCheck(check.id);
       setDetailRunId(run.id);
@@ -146,10 +147,30 @@ export function ChecksPage({ type }: { type: CheckType }) {
   async function runAll() {
     setBusy("all");
     setError(null);
-    setBatchRunNotice(null);
     try {
       const result = await api.runAll(type);
-      setBatchRunNotice(summarizeBatchRuns(type, result.runs));
+      const notice = summarizeBatchRuns(type, result.runs);
+      message.open({
+        key: `batch-run-${type}`,
+        type: batchRunNotificationType(notice),
+        duration: 8,
+        content: (
+          <div className="batch-run-toast">
+            <strong>{batchRunMessage(notice)}</strong>
+            <BatchRunBreakdown notice={notice} />
+            <BatchRunActions
+              notice={notice}
+              onOpenHistory={(path) => navigate(path)}
+              onOpenRun={setDetailRunId}
+              emptyAction={
+                <Button size="small" icon={<Plus size={14} />} onClick={openCreateDrawer}>
+                  新增任务
+                </Button>
+              }
+            />
+          </div>
+        )
+      });
       await load();
     } catch (err) {
       setError((err as Error).message);
@@ -183,7 +204,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
       dataIndex: "name",
       render: (value: string, check) => (
         <div>
-          <Button intent="link" className="table-link strong" onClick={() => check.last_run_id && setDetailRunId(check.last_run_id)}>
+          <Button type="link" className="table-link strong" onClick={() => check.last_run_id && setDetailRunId(check.last_run_id)}>
             {value}
           </Button>
           {check.tags && <div className="tag-line">{check.tags}</div>}
@@ -266,40 +287,34 @@ export function ChecksPage({ type }: { type: CheckType }) {
     <div className="page-content">
       {error && <Alert type="error" message={error} showIcon />}
 
-      {focusedCheckId && (
-        <Alert
-          className="scope-alert"
-          type={focusedCheck ? "info" : "warning"}
-          message={
-            focusedCheck
-              ? `当前定位任务 #${focusedCheckId} · ${focusedCheck.name}`
-              : `任务 #${focusedCheckId} 不在当前 ${type === "ui" ? "UI" : "接口"} 列表`
-          }
-          showIcon
-          action={
-            <Button size="small" onClick={clearTaskFocus}>
-              查看全部任务
-            </Button>
-          }
-        />
-      )}
-
       <section className="check-summary">
-        <SummaryTile label="全部任务" value={summary.total} />
-        <SummaryTile label="正常" value={summary.ok} tone="ok" />
-        <SummaryTile label="失败" value={summary.failed} tone="failed" />
-        <SummaryTile label="未运行" value={summary.never} />
-        <SummaryTile label="已启用" value={summary.enabled} tone="ok" />
+        <Card className="summary-card">
+          <Statistic title="全部任务" value={summary.total} />
+        </Card>
+        <Card className="summary-card metric-success">
+          <Statistic title="正常" value={summary.ok} />
+        </Card>
+        <Card className={`summary-card ${summary.failed ? "metric-danger" : ""}`}>
+          <Statistic title="失败" value={summary.failed} />
+        </Card>
+        <Card className="summary-card metric-info">
+          <Statistic title="未运行" value={summary.never} />
+        </Card>
+        <Card className="summary-card metric-success">
+          <Statistic title="已启用" value={summary.enabled} />
+        </Card>
       </section>
 
       <section className="checks-toolbar">
         <div className="checks-filter-row">
           <Input.Search
             className="checks-search"
+            name="checks-search"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索名称、URL 或标签"
+            placeholder="搜索名称、URL 或标签…"
             allowClear
+            autoComplete="off"
           />
           <Select
             value={statusFilter}
@@ -334,25 +349,11 @@ export function ChecksPage({ type }: { type: CheckType }) {
           <Button icon={<Play size={16} />} onClick={runAll} loading={busy === "all"}>
             执行全部
           </Button>
-          <Button intent="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>
+          <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>
             新增{type === "ui" ? " UI" : "接口"}任务
           </Button>
         </Space>
       </section>
-
-      {batchRunNotice && (
-        <BatchRunAlert
-          notice={batchRunNotice}
-          onClose={() => setBatchRunNotice(null)}
-          onOpenHistory={(path) => navigate(path)}
-          onOpenRun={setDetailRunId}
-          emptyAction={
-            <Button size="small" icon={<Plus size={14} />} onClick={openCreateDrawer}>
-              新增任务
-            </Button>
-          }
-        />
-      )}
 
       <div className="checks-result-bar">
         <span>当前结果</span>
@@ -404,7 +405,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
           locale={{
             emptyText: (
               <Empty description={hasFilters ? "没有符合筛选条件的任务" : "暂无任务"}>
-                {!hasFilters && <Button intent="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>新增任务</Button>}
+                {!hasFilters && <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>新增任务</Button>}
               </Empty>
             )
           }}
@@ -423,15 +424,6 @@ export function ChecksPage({ type }: { type: CheckType }) {
           await load();
         }}
       />
-    </div>
-  );
-}
-
-function SummaryTile({ label, value, tone }: { label: string; value: number; tone?: "ok" | "failed" }) {
-  return (
-    <div className={`check-summary-tile ${tone ? `check-summary-${tone}` : ""}`}>
-      <small>{label}</small>
-      <strong>{value}</strong>
     </div>
   );
 }
@@ -486,7 +478,7 @@ function CompactCheckList({
       <section className="check-card-empty">
         <Empty description={hasFilters ? "没有符合筛选条件的任务" : "暂无任务"}>
           {!hasFilters && (
-            <Button intent="primary" icon={<Plus size={16} />} onClick={onCreate}>
+            <Button type="primary" icon={<Plus size={16} />} onClick={onCreate}>
               新增任务
             </Button>
           )}
@@ -508,7 +500,7 @@ function CompactCheckList({
                   {type === "api" && check.method && <Tag>{check.method}</Tag>}
                 </div>
                 {check.last_run_id ? (
-                  <Button intent="link" className="check-card-title" onClick={() => onOpenLastRun(check)}>
+                  <Button type="link" className="check-card-title" onClick={() => onOpenLastRun(check)}>
                     {check.name}
                   </Button>
                 ) : (

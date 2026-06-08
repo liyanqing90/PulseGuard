@@ -1,7 +1,6 @@
-import { Collapse } from "antd";
+import { Button, Collapse } from "antd";
 import { uiScriptTemplate, uiSetupScriptTemplate } from "../defaults";
-import { AppButton as Button } from "./common/AppButton";
-import { CodeEditorPanel } from "./CodeEditorPanel";
+import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
 
 interface UiScriptSectionsProps {
   setupScript: string;

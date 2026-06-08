@@ -1,4 +1,4 @@
-import { Alert, Card, Collapse, Form, Input, InputNumber, Segmented, Select, Space, Switch, Tag } from "antd";
+import { Alert, Button, Card, Collapse, Empty, Form, Input, InputNumber, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip } from "antd";
 import { ArrowLeft, Play, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -13,13 +13,13 @@ import {
 } from "../checkPayload";
 import { apiScriptTemplate } from "../defaults";
 import { ApiAssertionsBuilder } from "../components/ApiAssertionsBuilder";
-import { CodeEditorPanel } from "../components/CodeEditorPanel";
-import { AppButton as Button } from "../components/common/AppButton";
+import { LazyCodeEditorPanel as CodeEditorPanel } from "../components/LazyCodeEditorPanel";
 import { RunResultPanel } from "../components/RunResultPanel";
 import { UiAssertionsBuilder } from "../components/UiAssertionsBuilder";
 import { UiScriptSections } from "../components/UiScriptSections";
 import { ViewportModeControl } from "../components/ViewportModeControl";
 import type { Check, CheckPayload, Run } from "../types";
+import { dirtyTagColor } from "../utils";
 
 export function DebugPage() {
   const { type, checkId } = useParams();
@@ -128,7 +128,9 @@ export function DebugPage() {
   if (!form || !check) {
     return (
       <div className="page-content">
-        <Card loading />
+        <Card>
+          <Skeleton active paragraph={{ rows: 4 }} />
+        </Card>
       </div>
     );
   }
@@ -141,42 +143,35 @@ export function DebugPage() {
             <Button icon={<ArrowLeft size={16} />}>返回</Button>
           </Link>
           <div>
-            <p className="eyebrow">{checkType === "ui" ? "UI 全屏调试" : "接口全屏调试"}</p>
             <h2>{check.name}</h2>
           </div>
           <Space wrap>
-            <Tag color={isDirty ? "orange" : "green"}>{isDirty ? "未保存变更" : "已保存"}</Tag>
+            <Tooltip title={isDirty ? "运行草稿只验证当前编辑内容，不会保存配置或触发告警" : "当前内容与已保存配置一致"}>
+              <Tag color={dirtyTagColor(isDirty)}>{isDirty ? "未保存变更" : "已保存"}</Tag>
+            </Tooltip>
             <Button icon={<Play size={16} />} onClick={runSaved} loading={busy === "saved-run"} disabled={Boolean(busy)}>
               运行已保存版本
             </Button>
             <Button icon={<Play size={16} />} onClick={runDraft} loading={busy === "draft-run"} disabled={Boolean(busy)}>
               运行草稿
             </Button>
-            <Button intent="primary" icon={<Save size={16} />} onClick={saveOnly} loading={busy === "save"} disabled={Boolean(busy)}>
+            <Button type="primary" icon={<Save size={16} />} onClick={saveOnly} loading={busy === "save"} disabled={Boolean(busy)}>
               保存
             </Button>
           </Space>
         </div>
       </Card>
 
-      {isDirty && (
-        <Alert
-          type="warning"
-          message="存在未保存变更"
-          description="运行草稿可验证当前编辑内容，不会保存配置、改变任务状态或触发告警；运行已保存版本仍使用已保存配置。"
-          showIcon
-        />
-      )}
       {error && <Alert type="error" message={error} showIcon />}
 
       <div className="debug-layout">
         <Card className="debug-form" title="任务配置">
           <Form layout="vertical">
             <Form.Item label="名称" required>
-              <Input value={form.name} onChange={(event) => patchForm({ name: event.target.value })} />
+              <Input name="debug-check-name" value={form.name} onChange={(event) => patchForm({ name: event.target.value })} autoComplete="off" />
             </Form.Item>
             <Form.Item label={checkType === "ui" ? "页面 URL" : "接口 URL"} required>
-              <Input value={form.entry_url} onChange={(event) => patchForm({ entry_url: event.target.value })} />
+              <Input name="debug-entry-url" value={form.entry_url} onChange={(event) => patchForm({ entry_url: event.target.value })} autoComplete="off" />
             </Form.Item>
             {checkType === "api" && (
               <Form.Item label="Method" required>
@@ -194,10 +189,10 @@ export function DebugPage() {
             )}
             <div className="field-grid two">
               <Form.Item label="执行频率">
-                <InputNumber min={5} value={form.interval_seconds} addonAfter="秒" onChange={(value) => patchForm({ interval_seconds: Number(value || 5) })} />
+                <InputNumber min={5} value={form.interval_seconds} suffix="秒" onChange={(value) => patchForm({ interval_seconds: Number(value || 5) })} />
               </Form.Item>
               <Form.Item label="超时时间">
-                <InputNumber min={500} value={form.timeout_ms} addonAfter="ms" onChange={(value) => patchForm({ timeout_ms: Number(value || 500) })} />
+                <InputNumber min={500} value={form.timeout_ms} suffix="ms" onChange={(value) => patchForm({ timeout_ms: Number(value || 500) })} />
               </Form.Item>
             </div>
             <Form.Item label="启用">
@@ -210,7 +205,7 @@ export function DebugPage() {
         </Card>
 
         <Card className="debug-editor">
-          <Space direction="vertical" size={14} className="drawer-stack">
+          <Space orientation="vertical" size={14} className="drawer-stack">
             {checkType === "api" && (
               <>
                 <div className="api-request-editors">
@@ -307,7 +302,7 @@ export function DebugPage() {
         <div className="debug-result">
           {!run ? (
             <Card>
-              <Alert type="info" message="暂无本页运行结果" showIcon />
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
             </Card>
           ) : (
             <RunResultPanel run={run} mode="debug" />

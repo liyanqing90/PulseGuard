@@ -1,13 +1,15 @@
+import { Menu, Typography } from "antd";
 import { Activity, History, LayoutDashboard, MonitorCheck, PlugZap, Settings } from "lucide-react";
-import { Menu } from "antd";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
+const { Text, Title } = Typography;
+
 const navItems = [
-  { key: "/", label: "总览", icon: <LayoutDashboard size={18} /> },
-  { key: "/ui-checks", label: "UI 监控", icon: <MonitorCheck size={18} /> },
-  { key: "/api-checks", label: "接口监控", icon: <PlugZap size={18} /> },
-  { key: "/runs", label: "执行历史", icon: <History size={18} /> },
-  { key: "/settings", label: "系统设置", icon: <Settings size={18} /> }
+  { to: "/", label: "总览", icon: <LayoutDashboard size={16} /> },
+  { to: "/ui-checks", label: "UI 监控", icon: <MonitorCheck size={16} /> },
+  { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> },
+  { to: "/runs", label: "执行历史", icon: <History size={16} /> },
+  { to: "/settings", label: "系统设置", icon: <Settings size={16} /> }
 ];
 
 const titles: Record<string, string> = {
@@ -21,36 +23,44 @@ const titles: Record<string, string> = {
 export function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
-  const selectedKey = navItems.find((item) => item.key !== "/" && location.pathname.startsWith(item.key))?.key || "/";
+  const selectedPath = navItems.find((item) => item.to !== "/" && location.pathname.startsWith(item.to))?.to || "/";
   const activeTitle = location.pathname.startsWith("/debug")
     ? "全屏调试"
-    : titles[selectedKey] || (location.pathname.startsWith("/runs") ? "执行历史" : "PulseGuard");
+    : titles[selectedPath] || (location.pathname.startsWith("/runs") ? "执行历史" : "PulseGuard");
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <a className="skip-link" href="#main-content">
+        跳到主内容
+      </a>
+      <aside className="sidebar" aria-label="主导航">
         <div className="brand">
           <div className="brand-mark">
-            <Activity size={18} />
+            <Activity aria-hidden="true" size={18} />
           </div>
           <div>
-            <div className="brand-name">PulseGuard</div>
-            <div className="brand-subtitle">脉守</div>
+            <Text strong className="brand-name">
+              PulseGuard
+            </Text>
+            <Text type="secondary" className="brand-subtitle">
+              探测控制台
+            </Text>
           </div>
         </div>
         <Menu
           className="nav-menu"
-          theme="dark"
           mode="inline"
-          selectedKeys={[selectedKey]}
-          items={navItems}
+          selectedKeys={[selectedPath]}
+          items={navItems.map((item) => ({ key: item.to, icon: item.icon, label: item.label }))}
           onClick={({ key }) => navigate(key)}
         />
       </aside>
-      <main className="main-area">
+      <main className="main-area" id="main-content">
         <header className="topbar">
           <div>
-            <h1>{activeTitle}</h1>
+            <Title level={1} className="page-title">
+              {activeTitle}
+            </Title>
           </div>
           <div className="runtime-pill">
             <span className="runtime-dot" />

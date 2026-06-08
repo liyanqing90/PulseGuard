@@ -186,6 +186,8 @@ export interface SettingsValues {
   default_ui_timeout_ms: number;
   default_api_timeout_ms: number;
   max_concurrency: number;
+  max_ui_concurrency: number;
+  max_queue_size: number;
   max_task_runtime_seconds: number;
   alerts_enabled: boolean;
   alert_detail_base_url: string;
@@ -200,6 +202,26 @@ export interface SettingsValues {
   screenshot_retention_days: number;
   trace_retention_days: number;
   response_retention_days: number;
+}
+
+export interface RuntimeStatus {
+  queue: {
+    queued: number;
+    limit: number;
+    available: number;
+  };
+  workers: {
+    running: number;
+    limit: number;
+    available: number;
+  };
+  browser: {
+    running: number;
+    limit: number;
+    available: number;
+  };
+  active_checks: number;
+  closing: boolean;
 }
 
 export interface NotificationChannel {

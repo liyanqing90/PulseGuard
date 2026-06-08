@@ -1,4 +1,4 @@
-import { Alert, Empty, Form, Input, InputNumber, Popconfirm, Select, Skeleton, Space, Switch, Tabs, Tag, Tooltip } from "antd";
+import { Alert, App, Button, Card, Empty, Form, Input, InputNumber, Popconfirm, Select, Skeleton, Space, Statistic, Switch, Tabs, Tag, Tooltip } from "antd";
 import {
   BellRing,
   CheckCircle2,
@@ -16,11 +16,10 @@ import {
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { AppButton as Button } from "../components/common/AppButton";
 import { StructuredViewer } from "../components/StructuredViewer";
 import type { AlertPreview, AlertPreviewChannel, NotificationChannel, SettingsValues, WebhookType } from "../types";
+import { dirtyTagColor, enabledTagColor } from "../utils";
 
-type Notice = { type: "success" | "error"; message: string } | null;
 type SettingsTab = "alerts" | "runtime" | "browser" | "retention";
 
 const CHANNEL_OPTIONS: Array<{ label: string; value: WebhookType }> = [
@@ -51,9 +50,9 @@ const CHANNEL_GUIDES: Record<WebhookType, { label: string; expectedHost: string;
 };
 
 export function SettingsPage() {
+  const { message } = App.useApp();
   const [settings, setSettings] = useState<SettingsValues | null>(null);
   const [savedSettings, setSavedSettings] = useState<SettingsValues | null>(null);
-  const [notice, setNotice] = useState<Notice>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -69,9 +68,9 @@ export function SettingsPage() {
         setSettings(cloneSettings(values));
         setSavedSettings(cloneSettings(values));
       })
-      .catch((err: Error) => setNotice({ type: "error", message: err.message }))
+      .catch((err: Error) => message.error(err.message))
       .finally(() => setLoading(false));
-  }, []);
+  }, [message]);
 
   function update<K extends keyof SettingsValues>(key: K, value: SettingsValues[K]) {
     setAlertPreview(null);
@@ -130,6 +129,8 @@ export function SettingsPage() {
         default_ui_timeout_ms: settings.default_ui_timeout_ms,
         default_api_timeout_ms: settings.default_api_timeout_ms,
         max_concurrency: settings.max_concurrency,
+        max_ui_concurrency: settings.max_ui_concurrency,
+        max_queue_size: settings.max_queue_size,
         max_task_runtime_seconds: settings.max_task_runtime_seconds
       };
     }
@@ -152,15 +153,14 @@ export function SettingsPage() {
   async function save(scope: SettingsTab = activeTab) {
     if (!settings) return;
     setSaving(true);
-    setNotice(null);
     try {
       const values = await api.updateSettings(buildPayload(scope));
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
       setAlertPreview(null);
-      setNotice({ type: "success", message: "当前页设置已保存" });
+      message.success("当前页设置已保存");
     } catch (err) {
-      setNotice({ type: "error", message: (err as Error).message });
+      message.error((err as Error).message);
     } finally {
       setSaving(false);
     }
@@ -169,12 +169,11 @@ export function SettingsPage() {
   async function testAlert() {
     if (!settings) return;
     setTesting(true);
-    setNotice(null);
     try {
       const result = await api.testAlert(buildPayload("alerts"));
-      setNotice({ type: "success", message: result.message });
+      message.success(result.message);
     } catch (err) {
-      setNotice({ type: "error", message: (err as Error).message });
+      message.error((err as Error).message);
     } finally {
       setTesting(false);
     }
@@ -183,12 +182,11 @@ export function SettingsPage() {
   async function previewAlert() {
     if (!settings) return;
     setPreviewing(true);
-    setNotice(null);
     try {
       setAlertPreview(await api.alertPreview(buildPayload("alerts")));
     } catch (err) {
       setAlertPreview(null);
-      setNotice({ type: "error", message: (err as Error).message });
+      message.error((err as Error).message);
     } finally {
       setPreviewing(false);
     }
@@ -198,7 +196,7 @@ export function SettingsPage() {
     if (!savedSettings) return;
     setSettings(cloneSettings(savedSettings));
     setAlertPreview(null);
-    setNotice({ type: "success", message: "已撤销未保存更改" });
+    message.success("已撤销未保存更改");
   }
 
   if (loading || !settings) {
@@ -225,10 +223,11 @@ export function SettingsPage() {
     <div className="page-content settings-page">
       <section className="settings-hero">
         <div>
-          <p className="eyebrow">系统设置</p>
           <div className="settings-title-row">
             <h2>运行与告警控制台</h2>
-            <Tag color={hasUnsavedChanges ? "orange" : "green"}>{hasUnsavedChanges ? "未保存更改" : "已保存"}</Tag>
+            <Tooltip title={hasUnsavedChanges ? "当前页存在未保存内容" : "当前内容与已保存配置一致"}>
+              <Tag color={dirtyTagColor(hasUnsavedChanges)}>{hasUnsavedChanges ? "未保存更改" : "已保存"}</Tag>
+            </Tooltip>
           </div>
         </div>
         <Space wrap>
@@ -242,16 +241,23 @@ export function SettingsPage() {
         </Space>
       </section>
 
-      {notice && <Alert type={notice.type} message={notice.message} showIcon />}
-      {settings.alerts_enabled && readyChannels.length === 0 && (
-        <Alert type="warning" message="告警已启用，但当前没有可发送的通知渠道" showIcon />
-      )}
-
       <section className="settings-summary">
-        <SummaryTile icon={<BellRing size={17} />} label="告警状态" value={settings.alerts_enabled ? "已启用" : "未启用"} active={settings.alerts_enabled} />
-        <SummaryTile icon={<ShieldCheck size={17} />} label="可发送渠道" value={`${readyChannels.length}/${settings.notification_channels.length}`} active={readyChannels.length > 0} />
-        <SummaryTile icon={<CheckCircle2 size={17} />} label="恢复通知" value={settings.recovery_notification ? "发送" : "关闭"} active={settings.recovery_notification} />
-        <SummaryTile icon={<Database size={17} />} label="历史保留" value={`${settings.run_retention_days} 天`} />
+        <Card className={`summary-card ${settings.alerts_enabled ? "metric-success" : ""}`}>
+          <span className="metric-icon"><BellRing size={17} /></span>
+          <Statistic title="告警状态" value={settings.alerts_enabled ? "已启用" : "未启用"} />
+        </Card>
+        <Card className={`summary-card ${readyChannels.length > 0 ? "metric-success" : "metric-warning"}`}>
+          <span className="metric-icon"><ShieldCheck size={17} /></span>
+          <Statistic title="可发送渠道" value={`${readyChannels.length}/${settings.notification_channels.length}`} />
+        </Card>
+        <Card className={`summary-card ${settings.recovery_notification ? "metric-success" : ""}`}>
+          <span className="metric-icon"><CheckCircle2 size={17} /></span>
+          <Statistic title="恢复通知" value={settings.recovery_notification ? "发送" : "关闭"} />
+        </Card>
+        <Card className="summary-card">
+          <span className="metric-icon"><Database size={17} /></span>
+          <Statistic title="历史保留" value={`${settings.run_retention_days} 天`} />
+        </Card>
       </section>
 
       <Tabs
@@ -282,14 +288,16 @@ export function SettingsPage() {
               value={settings.alert_cooldown_minutes}
               min={1}
               max={1440}
-              addonAfter="分钟"
+              suffix="分钟"
               onChange={(value) => update("alert_cooldown_minutes", value)}
             />
             <Form.Item label="告警详情链接前缀" className="span-2">
               <Input
+                name="alert-detail-base-url"
                 value={settings.alert_detail_base_url}
                 onChange={(event) => update("alert_detail_base_url", event.target.value)}
-                placeholder="http://10.168.78.49:8787"
+                placeholder="例如：http://10.168.78.49:8787"
+                autoComplete="off"
               />
             </Form.Item>
             <Form.Item label="启用渠道">
@@ -345,11 +353,13 @@ export function SettingsPage() {
         {activeTab === "runtime" && (
         <SettingsPanel title="执行设置" icon={<Zap size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <NumberItem label="默认执行频率" value={settings.default_interval_seconds} min={5} max={86400} addonAfter="秒" onChange={(value) => update("default_interval_seconds", value)} />
+            <NumberItem label="默认执行频率" value={settings.default_interval_seconds} min={5} max={86400} suffix="秒" onChange={(value) => update("default_interval_seconds", value)} />
             <NumberItem label="最大并发任务数" value={settings.max_concurrency} min={1} max={20} onChange={(value) => update("max_concurrency", value)} />
-            <NumberItem label="默认 UI 超时" value={settings.default_ui_timeout_ms} min={500} max={300000} addonAfter="ms" onChange={(value) => update("default_ui_timeout_ms", value)} />
-            <NumberItem label="默认 API 超时" value={settings.default_api_timeout_ms} min={500} max={300000} addonAfter="ms" onChange={(value) => update("default_api_timeout_ms", value)} />
-            <NumberItem label="单任务最大运行时长" value={settings.max_task_runtime_seconds} min={1} max={600} addonAfter="秒" onChange={(value) => update("max_task_runtime_seconds", value)} />
+            <NumberItem label="最大 UI 并发数" value={settings.max_ui_concurrency} min={1} max={5} onChange={(value) => update("max_ui_concurrency", value)} />
+            <NumberItem label="执行队列容量" value={settings.max_queue_size} min={1} max={1000} onChange={(value) => update("max_queue_size", value)} />
+            <NumberItem label="默认 UI 超时" value={settings.default_ui_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_ui_timeout_ms", value)} />
+            <NumberItem label="默认 API 超时" value={settings.default_api_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_api_timeout_ms", value)} />
+            <NumberItem label="单任务最大运行时长" value={settings.max_task_runtime_seconds} min={1} max={600} suffix="秒" onChange={(value) => update("max_task_runtime_seconds", value)} />
           </Form>
         </SettingsPanel>
         )}
@@ -372,10 +382,22 @@ export function SettingsPage() {
               />
             </Form.Item>
             <Form.Item label="代理" className="span-2">
-              <Input value={settings.browser_proxy} onChange={(event) => update("browser_proxy", event.target.value)} placeholder="http://127.0.0.1:7890" />
+              <Input
+                name="browser-proxy"
+                value={settings.browser_proxy}
+                onChange={(event) => update("browser_proxy", event.target.value)}
+                placeholder="例如：http://127.0.0.1:7890"
+                autoComplete="off"
+              />
             </Form.Item>
             <Form.Item label="Viewport" className="span-2">
-              <Input value={settings.browser_viewport} onChange={(event) => update("browser_viewport", event.target.value)} placeholder="1440x900" />
+              <Input
+                name="browser-viewport"
+                value={settings.browser_viewport}
+                onChange={(event) => update("browser_viewport", event.target.value)}
+                placeholder="例如：1440x900"
+                autoComplete="off"
+              />
             </Form.Item>
           </Form>
         </SettingsPanel>
@@ -384,10 +406,10 @@ export function SettingsPage() {
         {activeTab === "retention" && (
         <SettingsPanel title="数据保留" icon={<Database size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <NumberItem label="执行历史保留" value={settings.run_retention_days} min={1} max={365} addonAfter="天" onChange={(value) => update("run_retention_days", value)} />
-            <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} addonAfter="天" onChange={(value) => update("screenshot_retention_days", value)} />
-            <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} addonAfter="天" onChange={(value) => update("trace_retention_days", value)} />
-            <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} addonAfter="天" onChange={(value) => update("response_retention_days", value)} />
+            <NumberItem label="执行历史保留" value={settings.run_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_retention_days", value)} />
+            <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("screenshot_retention_days", value)} />
+            <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("trace_retention_days", value)} />
+            <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("response_retention_days", value)} />
           </Form>
         </SettingsPanel>
         )}
@@ -433,7 +455,7 @@ function NotificationChannelEditor({
           </div>
         </div>
         <Space size={8} wrap>
-          <Tag color={ready ? "green" : channel.enabled ? "orange" : "default"}>{ready ? "可发送" : channel.enabled ? "待配置" : "停用"}</Tag>
+          <Tag color={ready ? "success" : channel.enabled ? "warning" : "default"}>{ready ? "可发送" : channel.enabled ? "待配置" : "停用"}</Tag>
           <Popconfirm title="删除通知渠道" description="删除后保存设置才会生效。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={onRemove}>
             <Tooltip title="删除渠道">
               <Button danger icon={<Trash2 size={15} />} />
@@ -444,17 +466,25 @@ function NotificationChannelEditor({
 
       <Form layout="vertical" className="notification-channel-grid" autoComplete="off">
         <Form.Item label="渠道名称">
-          <Input value={channel.name} onChange={(event) => onPatch({ name: event.target.value })} placeholder="如：值班群" />
+          <Input
+            name={`notification-channel-name-${channel.id}`}
+            value={channel.name}
+            onChange={(event) => onPatch({ name: event.target.value })}
+            placeholder="例如：值班群"
+            autoComplete="off"
+          />
         </Form.Item>
         <Form.Item label="渠道类型">
           <Select value={channel.type} onChange={(value) => changeType(value)} options={CHANNEL_OPTIONS} />
         </Form.Item>
         <Form.Item label="Webhook URL" className="span-2" validateStatus={urlError ? "error" : hostHint ? "warning" : undefined} help={urlError || hostHint || guide.webhookHint}>
           <Input
+            name={`notification-channel-webhook-${channel.id}`}
             value={channel.webhook_url}
             onChange={(event) => onPatch({ webhook_url: event.target.value })}
-            placeholder="https://..."
+            placeholder="https://…"
             status={urlError ? "error" : hostHint ? "warning" : undefined}
+            autoComplete="off"
           />
         </Form.Item>
         {channel.type === "dingtalk" && (
@@ -462,8 +492,8 @@ function NotificationChannelEditor({
             label={
               <Space size={8}>
                 <span>钉钉加签密钥</span>
-                {channel.dingtalk_secret_set && !channel.dingtalk_secret_clear && !channel.dingtalk_secret && <Tag color="green">已配置</Tag>}
-                {channel.dingtalk_secret_clear && <Tag color="orange">待清除</Tag>}
+                {channel.dingtalk_secret_set && !channel.dingtalk_secret_clear && !channel.dingtalk_secret && <Tag color="success">已配置</Tag>}
+                {channel.dingtalk_secret_clear && <Tag color="warning">待清除</Tag>}
               </Space>
             }
             className="span-2"
@@ -472,6 +502,7 @@ function NotificationChannelEditor({
           >
             <Space.Compact className="secret-input-row">
               <Input.Password
+                name={`notification-channel-secret-${channel.id}`}
                 value={channel.dingtalk_secret || ""}
                 onChange={(event) => onPatch({ dingtalk_secret: event.target.value, dingtalk_secret_clear: false })}
                 autoComplete="new-password"
@@ -560,7 +591,7 @@ function PreviewChannel({ channel }: { channel: AlertPreviewChannel }) {
         <strong>{channel.name || channelTypeLabel(channel.type)}</strong>
         <Space size={6} wrap>
           <Tag>{channelTypeLabel(channel.type)}</Tag>
-          <Tag color={channel.enabled ? "green" : "default"}>{channel.enabled ? "启用" : "停用"}</Tag>
+          <Tag color={enabledTagColor(channel.enabled)}>{channel.enabled ? "启用" : "停用"}</Tag>
         </Space>
       </div>
       <div className="alert-preview-facts">
@@ -608,18 +639,6 @@ function SettingsPanel({
   );
 }
 
-function SummaryTile({ icon, label, value, active }: { icon: ReactNode; label: string; value: string; active?: boolean }) {
-  return (
-    <div className={`settings-summary-tile ${active ? "active" : ""}`}>
-      <span>{icon}</span>
-      <div>
-        <small>{label}</small>
-        <strong>{value}</strong>
-      </div>
-    </div>
-  );
-}
-
 function TestAlertButton({
   loading,
   disabledReason,
@@ -656,7 +675,7 @@ function SaveSettingsButton({
   return (
     <Tooltip title={disabledReason || "保存当前页设置"}>
       <span className="tooltip-button-wrapper">
-        <Button intent="primary" icon={<Save size={16} />} onClick={onClick} loading={loading} disabled={disabled}>
+        <Button type="primary" icon={<Save size={16} />} onClick={onClick} loading={loading} disabled={disabled}>
           保存当前页
         </Button>
       </span>
@@ -668,20 +687,20 @@ function NumberItem({
   label,
   value,
   onChange,
-  addonAfter,
+  suffix,
   min,
   max
 }: {
   label: string;
   value: number;
   onChange: (value: number) => void;
-  addonAfter?: string;
+  suffix?: string;
   min?: number;
   max?: number;
 }) {
   return (
     <Form.Item label={label}>
-      <InputNumber min={min} max={max} value={value} addonAfter={addonAfter} onChange={(next) => onChange(Number(next || 0))} />
+      <InputNumber min={min} max={max} value={value} suffix={suffix} onChange={(next) => onChange(Number(next || 0))} />
     </Form.Item>
   );
 }
@@ -810,6 +829,8 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     default_ui_timeout_ms: values.default_ui_timeout_ms,
     default_api_timeout_ms: values.default_api_timeout_ms,
     max_concurrency: values.max_concurrency,
+    max_ui_concurrency: values.max_ui_concurrency,
+    max_queue_size: values.max_queue_size,
     max_task_runtime_seconds: values.max_task_runtime_seconds
   };
   const browser = {

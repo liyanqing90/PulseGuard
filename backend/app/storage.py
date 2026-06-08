@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -24,7 +26,8 @@ def init_db() -> None:
     with _connect() as conn:
         conn.executescript(
             """
-            PRAGMA journal_mode=DELETE;
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
             PRAGMA busy_timeout=30000;
             PRAGMA foreign_keys=ON;
 
@@ -100,6 +103,7 @@ def init_db() -> None:
         _ensure_check_columns(conn)
         _ensure_run_columns(conn)
         _ensure_default_settings(conn)
+        _mark_interrupted_runs(conn)
         _seed_demo_checks(conn)
 
 
@@ -231,6 +235,9 @@ def set_check_enabled(check_id: int, enabled: bool) -> dict[str, Any] | None:
 
 def create_run(check: dict[str, Any], status: str = "running", error_message: str | None = None) -> dict[str, Any]:
     timestamp = now_iso()
+    finished_at = timestamp if status == "skipped" else None
+    duration_ms = 0 if status == "skipped" else None
+    notification_status = "not_required" if status == "skipped" else None
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
@@ -248,8 +255,8 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 check["type"],
                 status,
                 timestamp,
-                timestamp if status == "skipped" else None,
-                0 if status == "skipped" else None,
+                finished_at,
+                duration_ms,
                 error_message,
                 None,
                 None,
@@ -258,7 +265,7 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 None,
                 None,
                 None,
-                "not_required" if status != "running" else None,
+                notification_status,
                 None,
                 None,
                 None,
@@ -267,6 +274,26 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
         )
         run_id = int(cursor.lastrowid)
     return get_run(run_id)  # type: ignore[return-value]
+
+
+def start_run(run_id: int) -> dict[str, Any] | None:
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE runs
+            SET status = 'running',
+                started_at = ?,
+                finished_at = NULL,
+                duration_ms = NULL,
+                error_message = NULL
+            WHERE id = ? AND status = 'pending'
+            """,
+            (timestamp, run_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_run(run_id)
 
 
 def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
@@ -623,12 +650,21 @@ def _clear_artifact_paths(conn: sqlite3.Connection, column: str, paths: list[str
     conn.execute(f"UPDATE runs SET {column} = NULL WHERE {column} IN ({placeholders})", paths)
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.row_factory = sqlite3.Row
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _ensure_check_columns(conn: sqlite3.Connection) -> None:
@@ -663,6 +699,22 @@ def _ensure_default_settings(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
             (key, json.dumps(value, ensure_ascii=False), timestamp),
         )
+
+
+def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
+    timestamp = now_iso()
+    conn.execute(
+        """
+        UPDATE runs
+        SET status = 'skipped',
+            finished_at = COALESCE(finished_at, ?),
+            duration_ms = COALESCE(duration_ms, 0),
+            error_message = COALESCE(error_message, '服务启动时发现任务未完成，已标记为中断'),
+            notification_status = COALESCE(notification_status, 'not_required')
+        WHERE status IN ('pending', 'running')
+        """,
+        (timestamp,),
+    )
 
 
 def _seed_demo_checks(conn: sqlite3.Connection) -> None:

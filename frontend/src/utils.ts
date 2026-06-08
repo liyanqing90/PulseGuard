@@ -1,5 +1,7 @@
 import type { Check, CheckType, NotificationStatus, RunStatus, TaskSurfaceStatus } from "./types";
 
+export type SemanticTagColor = "default" | "blue" | "success" | "warning" | "error" | "processing";
+
 export function taskStatus(check: Check): TaskSurfaceStatus {
   if (!check.enabled) return "disabled";
   if (!check.current_status) return "never";
@@ -31,6 +33,33 @@ export function runStatusTone(status: RunStatus): "ok" | "failed" | "neutral" | 
   if (status === "failed" || status === "timeout") return "failed";
   if (status === "running" || status === "pending") return "running";
   return "neutral";
+}
+
+export function taskStatusTagColor(status: TaskSurfaceStatus): SemanticTagColor {
+  if (status === "ok") return "success";
+  if (status === "failed") return "error";
+  if (status === "never") return "processing";
+  return "default";
+}
+
+export function runStatusTagColor(status: RunStatus): SemanticTagColor {
+  if (status === "ok") return "success";
+  if (status === "failed" || status === "timeout") return "error";
+  if (status === "running" || status === "pending") return "processing";
+  if (status === "skipped") return "warning";
+  return "default";
+}
+
+export function notificationStatusTagColor(status?: NotificationStatus | null): SemanticTagColor {
+  return notificationStatusMeta(status).color as SemanticTagColor;
+}
+
+export function dirtyTagColor(isDirty: boolean): SemanticTagColor {
+  return isDirty ? "warning" : "success";
+}
+
+export function enabledTagColor(enabled: boolean): SemanticTagColor {
+  return enabled ? "success" : "default";
 }
 
 export function notificationStatusMeta(status?: NotificationStatus | null): { label: string; color: string } {

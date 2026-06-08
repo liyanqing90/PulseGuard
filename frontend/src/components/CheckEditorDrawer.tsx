@@ -1,13 +1,13 @@
-import { Alert, Collapse, Drawer, Form, Input, InputNumber, Modal, Segmented, Select, Space, Switch, Tag } from "antd";
+import { Alert, Button, Collapse, Drawer, Form, Input, InputNumber, Modal, Segmented, Select, Space, Switch, Tag, Tooltip } from "antd";
 import { Play, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { checkToPayload, detectBodyMode, normalizeCheckPayload, prepareCheckPayload, sameCheckPayload, type BodyEditorMode } from "../checkPayload";
 import { apiScriptTemplate, blankCheck } from "../defaults";
 import type { Check, CheckPayload, CheckType, Run } from "../types";
+import { dirtyTagColor } from "../utils";
 import { ApiAssertionsBuilder } from "./ApiAssertionsBuilder";
-import { AppButton as Button } from "./common/AppButton";
-import { CodeEditorPanel } from "./CodeEditorPanel";
+import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
 import { RunResultPanel } from "./RunResultPanel";
 import { UiAssertionsBuilder } from "./UiAssertionsBuilder";
 import { UiScriptSections } from "./UiScriptSections";
@@ -152,10 +152,21 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     <Drawer
       title={activeCheck ? "编辑任务" : "新增任务"}
       open={open}
-      width={920}
+      size={920}
       onClose={requestClose}
       destroyOnClose
-      extra={<Tag color={isDirty ? "orange" : activeCheck ? "green" : "blue"}>{isDirty ? "未保存变更" : activeCheck ? "已保存" : "新任务草稿"}</Tag>}
+      extra={
+        <Space size={8}>
+          {debugStale && (
+            <Tooltip title="调试结果来自上一次运行，当前草稿已有新改动">
+              <Tag color="warning">调试已过期</Tag>
+            </Tooltip>
+          )}
+          <Tooltip title={isDirty ? "运行草稿只验证当前编辑内容，不会保存配置或触发告警" : activeCheck ? "当前内容与已保存配置一致" : "保存后才会创建任务"}>
+            <Tag color={activeCheck ? dirtyTagColor(isDirty) : "blue"}>{isDirty ? "未保存变更" : activeCheck ? "已保存" : "新任务草稿"}</Tag>
+          </Tooltip>
+        </Space>
+      }
       footer={
         <Space className="drawer-footer-actions">
           <Button onClick={requestClose}>取消</Button>
@@ -170,35 +181,25 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
           <Button icon={<Play size={16} />} onClick={handleRunDraft} loading={runningMode === "draft"} disabled={saving || running}>
             运行草稿
           </Button>
-          <Button intent="primary" icon={<Save size={16} />} onClick={handleSaveOnly} loading={saving} disabled={running}>
+          <Button type="primary" icon={<Save size={16} />} onClick={handleSaveOnly} loading={saving} disabled={running}>
             保存
           </Button>
         </Space>
       }
     >
-      <Space direction="vertical" size={16} className="drawer-stack">
-        {isDirty && (
-          <Alert
-            type="warning"
-            message="存在未保存变更"
-            description="运行草稿可验证当前编辑内容，不会保存配置、改变任务状态或触发告警；运行已保存版本仍使用已保存配置。"
-            showIcon
-          />
-        )}
-        {debugStale && <Alert type="info" message="调试结果来自上一次运行，当前草稿已有新改动" showIcon />}
-
+      <Space orientation="vertical" size={16} className="drawer-stack">
         <Form layout="vertical">
           <div className="field-grid two">
             <Form.Item label="名称" required>
-              <Input value={form.name} onChange={(event) => patchForm({ name: event.target.value })} />
+              <Input name="check-name" value={form.name} onChange={(event) => patchForm({ name: event.target.value })} autoComplete="off" />
             </Form.Item>
             <Form.Item label="标签">
-              <Input value={form.tags} onChange={(event) => patchForm({ tags: event.target.value })} />
+              <Input name="check-tags" value={form.tags} onChange={(event) => patchForm({ tags: event.target.value })} autoComplete="off" />
             </Form.Item>
           </div>
 
           <Form.Item label={type === "ui" ? "页面 URL" : "接口 URL"} required>
-            <Input value={form.entry_url} onChange={(event) => patchForm({ entry_url: event.target.value })} />
+            <Input name="check-entry-url" value={form.entry_url} onChange={(event) => patchForm({ entry_url: event.target.value })} autoComplete="off" />
           </Form.Item>
 
           <div className="field-grid four">
@@ -220,7 +221,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
               <InputNumber
                 min={5}
                 value={form.interval_seconds}
-                addonAfter="秒"
+                suffix="秒"
                 onChange={(value) => patchForm({ interval_seconds: Number(value || 5) })}
               />
             </Form.Item>
@@ -228,7 +229,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
               <InputNumber
                 min={500}
                 value={form.timeout_ms}
-                addonAfter="ms"
+                suffix="ms"
                 onChange={(value) => patchForm({ timeout_ms: Number(value || 500) })}
               />
             </Form.Item>

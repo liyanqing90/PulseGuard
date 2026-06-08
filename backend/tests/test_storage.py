@@ -70,6 +70,34 @@ class OverviewStorageTests(unittest.TestCase):
         self.assertEqual(loaded["viewport_mode"], "h5")
         self.assertIn("async def setup", loaded["setup_script"])
 
+    def test_pending_run_can_transition_to_running(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            check = storage.create_check(
+                {
+                    "name": "排队任务",
+                    "type": "api",
+                    "enabled": True,
+                    "interval_seconds": 300,
+                    "timeout_ms": 10000,
+                    "entry_url": "https://example.com",
+                    "method": "GET",
+                    "headers_json": "{}",
+                    "body": "",
+                    "script": "async def check(ctx):\n    pass\n",
+                    "tags": "",
+                }
+            )
+
+            queued = storage.create_run(check, "pending")
+            started = storage.start_run(int(queued["id"]))
+
+        self.assertIsNotNone(started)
+        self.assertEqual(started["status"], "running")
+        self.assertIsNone(started["finished_at"])
+
 
 def run_payload(status: str, error_message: str | None = None) -> dict[str, object]:
     return {

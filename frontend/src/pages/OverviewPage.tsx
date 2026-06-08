@@ -1,4 +1,4 @@
-import { Alert, Card, Empty, Space, Statistic, Table, Tag } from "antd";
+import { Alert, App, Button, Card, Empty, Space, Statistic, Table } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   AlertTriangle,
@@ -13,19 +13,23 @@ import {
   ShieldCheck,
   Zap
 } from "lucide-react";
-import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
-import { BatchRunAlert, summarizeBatchRuns } from "../components/BatchRunAlert";
-import { AppButton as Button } from "../components/common/AppButton";
-import type { BatchRunNotice } from "../components/BatchRunAlert";
+import {
+  BatchRunActions,
+  BatchRunBreakdown,
+  batchRunMessage,
+  batchRunNotificationType,
+  summarizeBatchRuns
+} from "../components/BatchRunAlert";
 import { RunDetailDrawer } from "../components/RunDetailDrawer";
 import { RunStatusBadge } from "../components/StatusBadge";
 import type { CheckType, Overview, Run, SettingsValues } from "../types";
 import { checkListPath, formatDate, formatDuration, intervalLabel } from "../utils";
 
 export function OverviewPage() {
+  const { message } = App.useApp();
   const location = useLocation();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
@@ -33,7 +37,6 @@ export function OverviewPage() {
   const [error, setError] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<number | null>(null);
   const [batchRunning, setBatchRunning] = useState<CheckType | null>(null);
-  const [batchRunNotice, setBatchRunNotice] = useState<BatchRunNotice | null>(null);
   const navigate = useNavigate();
 
   async function load() {
@@ -55,7 +58,6 @@ export function OverviewPage() {
 
   async function runNow(run: Run) {
     setRunningId(run.check_id);
-    setBatchRunNotice(null);
     try {
       const latest = await api.runCheck(run.check_id);
       setDetailRunId(latest.id);
@@ -70,10 +72,30 @@ export function OverviewPage() {
   async function runAll(type: CheckType) {
     setBatchRunning(type);
     setError(null);
-    setBatchRunNotice(null);
     try {
       const result = await api.runAll(type);
-      setBatchRunNotice(summarizeBatchRuns(type, result.runs));
+      const notice = summarizeBatchRuns(type, result.runs);
+      message.open({
+        key: `batch-run-${type}`,
+        type: batchRunNotificationType(notice),
+        duration: 8,
+        content: (
+          <div className="batch-run-toast">
+            <strong>{batchRunMessage(notice)}</strong>
+            <BatchRunBreakdown notice={notice} />
+            <BatchRunActions
+              notice={notice}
+              onOpenHistory={(path) => navigate(path)}
+              onOpenRun={setDetailRunId}
+              emptyAction={
+                <Button size="small" onClick={() => navigate(checkListPath(notice.type))}>
+                  查看任务列表
+                </Button>
+              }
+            />
+          </div>
+        )
+      });
       await load();
     } catch (err) {
       setError((err as Error).message);
@@ -91,7 +113,7 @@ export function OverviewPage() {
       title: "任务",
       dataIndex: "check_name",
       render: (value: string, run) => (
-        <Button intent="link" className="table-link" onClick={() => navigate(checkListPath(run.check_type, run.check_id))}>
+        <Button type="link" className="table-link" onClick={() => navigate(checkListPath(run.check_type, run.check_id))}>
           {value}
         </Button>
       )
@@ -118,7 +140,6 @@ export function OverviewPage() {
 
       <section className={`overview-command ${hasIncident ? "overview-command-danger" : ""}`}>
         <div>
-          <p className="eyebrow">运行态</p>
           <h2>{hasIncident ? "存在失败任务，需要处理" : "当前监控面正常"}</h2>
           <p>
             {hasIncident
@@ -139,61 +160,57 @@ export function OverviewPage() {
         </Space>
       </section>
 
-      {batchRunNotice && (
-        <BatchRunAlert
-          notice={batchRunNotice}
-          onClose={() => setBatchRunNotice(null)}
-          onOpenHistory={(path) => navigate(path)}
-          onOpenRun={setDetailRunId}
-          emptyAction={
-            <Button size="small" onClick={() => navigate(checkListPath(batchRunNotice.type))}>
-              查看任务列表
-            </Button>
-          }
-        />
-      )}
-
       <section className="overview-status-grid">
-        <StatusTile
-          icon={<BellRing size={17} />}
-          label="告警通道"
-          value={settings ? alertChannel(settings) : "-"}
-          detail={settings ? alertChannelDetail(settings) : "-"}
-          tone={settings ? alertChannelTone(settings) : "neutral"}
-        />
-        <StatusTile
-          icon={<Zap size={17} />}
-          label="默认调度"
-          value={settings ? intervalLabel(settings.default_interval_seconds) : "-"}
-          detail={settings ? `并发 ${settings.max_concurrency}，单任务上限 ${settings.max_task_runtime_seconds}s` : "-"}
-        />
-        <StatusTile
-          icon={<Monitor size={17} />}
-          label="浏览器运行"
-          value={settings?.browser_type || "-"}
-          detail={settings ? `${settings.browser_headless ? "Headless" : "可视化"}，${settings.browser_viewport}` : "-"}
-        />
-        <StatusTile
-          icon={<Database size={17} />}
-          label="数据保留"
-          value={settings ? `${settings.run_retention_days} 天` : "-"}
-          detail={settings ? `Trace ${settings.trace_retention_days} 天，响应 ${settings.response_retention_days} 天` : "-"}
-        />
+        <Card className={`metric-card metric-compact ${settings ? alertChannelMetricClass(settings) : ""}`}>
+          <span className="metric-icon"><BellRing size={17} /></span>
+          <Statistic title="告警通道" value={settings ? alertChannel(settings) : "-"} />
+          <div className="metric-detail">{settings ? alertChannelDetail(settings) : "-"}</div>
+        </Card>
+        <Card className="metric-card metric-compact metric-info">
+          <span className="metric-icon"><Zap size={17} /></span>
+          <Statistic title="默认调度" value={settings ? intervalLabel(settings.default_interval_seconds) : "-"} />
+          <div className="metric-detail">
+            {settings ? `并发 ${settings.max_concurrency}，UI ${settings.max_ui_concurrency}，队列 ${settings.max_queue_size}` : "-"}
+          </div>
+        </Card>
+        <Card className="metric-card metric-compact">
+          <span className="metric-icon"><Monitor size={17} /></span>
+          <Statistic title="浏览器运行" value={settings?.browser_type || "-"} />
+          <div className="metric-detail">{settings ? `${settings.browser_headless ? "Headless" : "可视化"}，${settings.browser_viewport}` : "-"}</div>
+        </Card>
+        <Card className="metric-card metric-compact">
+          <span className="metric-icon"><Database size={17} /></span>
+          <Statistic title="数据保留" value={settings ? `${settings.run_retention_days} 天` : "-"} />
+          <div className="metric-detail">{settings ? `Trace ${settings.trace_retention_days} 天，响应 ${settings.response_retention_days} 天` : "-"}</div>
+        </Card>
       </section>
 
       <section className="metric-grid">
-        <Metric title="UI 任务" value={overview?.ui_count ?? 0} icon={<ShieldCheck size={19} />} />
-        <Metric title="API 任务" value={overview?.api_count ?? 0} icon={<ShieldCheck size={19} />} />
-        <Metric title="当前失败" value={overview?.failing_count ?? 0} icon={<AlertTriangle size={19} />} danger />
-        <Metric title="今日执行" value={overview?.today_runs ?? 0} icon={<History size={19} />} />
-        <Metric title="最近执行" value={overview?.latest_run ? formatDate(overview.latest_run.started_at) : "未执行"} icon={<Clock3 size={19} />} wide />
-        <Metric
-          title="最近恢复"
-          value={overview?.latest_recovered?.name || "暂无恢复"}
-          suffix={overview?.latest_recovered ? formatDate(overview.latest_recovered.last_success_at) : undefined}
-          icon={<RotateCcw size={19} />}
-          wide
-        />
+        <Card className="metric-card metric-info">
+          <span className="metric-icon"><ShieldCheck size={19} /></span>
+          <Statistic title="UI 任务" value={overview?.ui_count ?? 0} />
+        </Card>
+        <Card className="metric-card metric-info">
+          <span className="metric-icon"><ShieldCheck size={19} /></span>
+          <Statistic title="API 任务" value={overview?.api_count ?? 0} />
+        </Card>
+        <Card className={`metric-card ${hasIncident ? "metric-danger" : "metric-success"}`}>
+          <span className="metric-icon"><AlertTriangle size={19} /></span>
+          <Statistic title="当前失败" value={overview?.failing_count ?? 0} />
+        </Card>
+        <Card className="metric-card">
+          <span className="metric-icon"><History size={19} /></span>
+          <Statistic title="今日执行" value={overview?.today_runs ?? 0} />
+        </Card>
+        <Card className="metric-card metric-wide">
+          <span className="metric-icon"><Clock3 size={19} /></span>
+          <Statistic title="最近执行" value={overview?.latest_run ? formatDate(overview.latest_run.started_at) : "未执行"} />
+        </Card>
+        <Card className="metric-card metric-wide">
+          <span className="metric-icon"><RotateCcw size={19} /></span>
+          <Statistic title="最近恢复" value={overview?.latest_recovered?.name || "暂无恢复"} />
+          {overview?.latest_recovered && <div className="metric-detail">{formatDate(overview.latest_recovered.last_success_at)}</div>}
+        </Card>
       </section>
 
       <Card
@@ -258,9 +275,9 @@ function alertChannelDetail(settings: SettingsValues): string {
   return `${ready}/${total} 个渠道可发送`;
 }
 
-function alertChannelTone(settings: SettingsValues): "ok" | "warning" | "neutral" {
-  if (!settings.alerts_enabled) return "neutral";
-  return readyNotificationChannels(settings).length > 0 ? "ok" : "warning";
+function alertChannelMetricClass(settings: SettingsValues): string {
+  if (!settings.alerts_enabled) return "";
+  return readyNotificationChannels(settings).length > 0 ? "metric-success" : "metric-warning";
 }
 
 function readyNotificationChannels(settings: SettingsValues) {
@@ -274,54 +291,5 @@ function channelTypeLabel(type: string): string {
       wecom: "企业微信",
       dingtalk: "钉钉"
     }[type] || type
-  );
-}
-
-function StatusTile({
-  icon,
-  label,
-  value,
-  detail,
-  tone = "neutral"
-}: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-  detail: string;
-  tone?: "ok" | "warning" | "neutral";
-}) {
-  return (
-    <div className={`overview-status-tile overview-status-${tone}`}>
-      <span className="overview-status-icon">{icon}</span>
-      <div>
-        <small>{label}</small>
-        <strong>{value}</strong>
-        <p>{detail}</p>
-      </div>
-    </div>
-  );
-}
-
-function Metric({
-  title,
-  value,
-  suffix,
-  icon,
-  danger,
-  wide
-}: {
-  title: string;
-  value: string | number;
-  suffix?: string;
-  icon: ReactNode;
-  danger?: boolean;
-  wide?: boolean;
-}) {
-  return (
-    <Card className={`metric-card ${wide ? "metric-wide" : ""}`}>
-      <div className={`metric-icon ${danger ? "metric-icon-danger" : ""}`}>{icon}</div>
-      <Statistic title={title} value={value} valueStyle={{ color: danger ? "#c23a32" : "#202620", fontSize: 22 }} />
-      {suffix && <div className="metric-suffix">{suffix}</div>}
-    </Card>
   );
 }

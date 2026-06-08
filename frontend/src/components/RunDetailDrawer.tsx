@@ -1,11 +1,10 @@
-import { Alert, Drawer, Skeleton, Space } from "antd";
+import { Alert, Button, Drawer, Skeleton, Space } from "antd";
 import { ExternalLink, ListChecks, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { Run } from "../types";
 import { checkListPath } from "../utils";
-import { AppButton as Button } from "./common/AppButton";
 import { RunDetailContent } from "./RunDetailContent";
 
 interface Props {
@@ -56,7 +55,7 @@ export function RunDetailDrawer({ runId, onClose, onRerun, returnTo }: Props) {
       title={run?.check_name || "执行详情"}
       open={Boolean(runId)}
       onClose={onClose}
-      width={840}
+      size={840}
       destroyOnClose
       extra={
         run ? (

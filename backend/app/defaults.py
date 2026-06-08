@@ -8,6 +8,8 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "default_ui_timeout_ms": 15000,
     "default_api_timeout_ms": 10000,
     "max_concurrency": 2,
+    "max_ui_concurrency": 1,
+    "max_queue_size": 50,
     "max_task_runtime_seconds": 60,
     "alerts_enabled": False,
     "alert_detail_base_url": ALERT_DETAIL_BASE_URL,

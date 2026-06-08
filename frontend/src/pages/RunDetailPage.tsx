@@ -1,9 +1,8 @@
-import { Alert, Card, Skeleton, Space } from "antd";
+import { Alert, Button, Card, Skeleton } from "antd";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { AppButton as Button } from "../components/common/AppButton";
 import { RunDetailContent } from "../components/RunDetailContent";
 import type { Run } from "../types";
 
@@ -51,13 +50,10 @@ export function RunDetailPage() {
     <div className="page-content run-detail-page">
       <Card>
         <div className="run-detail-header">
-          <Space>
-            <Link to={returnTo}>
-              <Button icon={<ArrowLeft size={16} />}>{returnTo.startsWith("/runs") ? "返回历史" : "返回来源"}</Button>
-            </Link>
-          </Space>
+          <Link to={returnTo}>
+            <Button icon={<ArrowLeft size={16} />}>{returnTo.startsWith("/runs") ? "返回历史" : "返回来源"}</Button>
+          </Link>
           <div>
-            <p className="eyebrow">完整详情</p>
             <h2>{run?.check_name || `运行记录 #${id}`}</h2>
           </div>
           <Button icon={<RefreshCw size={16} />} onClick={rerun} loading={rerunning} disabled={!run || run.check_id <= 0}>

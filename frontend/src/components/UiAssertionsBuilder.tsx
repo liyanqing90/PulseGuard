@@ -1,4 +1,4 @@
-import { Alert, Checkbox, Empty, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, Tooltip } from "antd";
+import { App, Button, Checkbox, Empty, Input, InputNumber, Modal, Select, Space, Spin, Switch, Table, Tag, Tooltip } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   CopyPlus,
@@ -21,7 +21,6 @@ import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { api } from "../api";
 import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult } from "../types";
 import { createUiAssertion, parseUiAssertions, serializeUiAssertions, UI_ASSERTION_LABELS } from "../uiAssertions";
-import { AppButton as Button } from "./common/AppButton";
 import { VIEWPORT_PRESETS } from "./ViewportModeControl";
 
 type CandidateRuleType = "element_visible" | "element_not_empty" | "element_count" | "text_present";
@@ -72,6 +71,7 @@ interface Props {
 }
 
 export function UiAssertionsBuilder({ check, value, onChange }: Props) {
+  const { message } = App.useApp();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [inspectResult, setInspectResult] = useState<UiInspectResult | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<UiElementCandidate | null>(null);
@@ -80,7 +80,6 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   const [candidateQuery, setCandidateQuery] = useState("");
   const [inspecting, setInspecting] = useState(false);
   const [inspectError, setInspectError] = useState<string | null>(null);
-  const [pickerFeedback, setPickerFeedback] = useState<string | null>(null);
   const candidateItemRefs = useRef<Map<string, HTMLElement>>(new Map());
   const previewScrollRef = useRef<HTMLDivElement | null>(null);
   const previewStageRef = useRef<HTMLDivElement | null>(null);
@@ -143,7 +142,6 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   function selectCandidate(candidate: UiElementCandidate, source: CandidateSelectionSource = "preview") {
     setCandidateSelectionSource(source);
     setSelectedCandidate(candidate);
-    setPickerFeedback(null);
   }
 
   function setCandidateItemRef(key: string, node: HTMLElement | null) {
@@ -209,7 +207,6 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       }
       return { ...current, [key]: nextSelection };
     });
-    setPickerFeedback(null);
   }
 
   function savePickerSelections() {
@@ -226,7 +223,6 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     if (!nextAssertions.length) return;
     commit([...assertions, ...nextAssertions]);
     setPickerSelections({});
-    setPickerFeedback(null);
     setPickerOpen(false);
   }
 
@@ -241,19 +237,22 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   function openPicker() {
     setPickerOpen(true);
     setInspectError(null);
-    setPickerFeedback(null);
     setPickerSelections({});
+    setCandidateQuery("");
+    setInspectResult(null);
+    setSelectedCandidate(null);
+    void inspectPage();
   }
 
   async function inspectPage() {
     const entryUrl = check.entry_url.trim();
     if (!entryUrl) {
       setInspectError("请先填写页面 URL");
+      message.warning("请先填写页面 URL");
       return;
     }
     setInspecting(true);
     setInspectError(null);
-    setPickerFeedback(null);
     try {
       const result = await api.inspectUi({
         type: "ui",
@@ -269,7 +268,9 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       setPickerSelections({});
       setCandidateQuery("");
     } catch (err) {
-      setInspectError((err as Error).message);
+      const nextError = (err as Error).message;
+      setInspectError(nextError);
+      message.error(nextError);
     } finally {
       setInspecting(false);
     }
@@ -345,7 +346,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       </div>
 
       {assertions.length === 0 ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无 UI 校验规则" />
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
       ) : (
         <Table
           rowKey="id"
@@ -357,20 +358,13 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         />
       )}
 
-      <Alert
-        type="info"
-        showIcon
-        message="运行草稿会在当前编辑器下方展示校验结果"
-        description="结构化规则存在时无需填写 Python 脚本；高级脚本只用于登录、多步骤交互或自定义判断。"
-      />
-
       <Modal
         open={pickerOpen}
         title="选择页面元素"
         width="min(1420px, 96vw)"
         footer={
           <div className="ui-picker-footer">
-            <span>{pendingRuleCount ? `已选择 ${pendingElementCount} 个元素 / ${pendingRuleCount} 条规则` : "勾选候选元素的校验项后保存"}</span>
+            {pendingRuleCount ? <span>{`已选择 ${pendingElementCount} 个元素 / ${pendingRuleCount} 条规则`}</span> : <span />}
             <Space>
               <Button onClick={() => setPickerOpen(false)}>取消</Button>
               <Button icon={<Save size={15} />} disabled={!pendingRuleCount} onClick={savePickerSelections}>
@@ -380,7 +374,6 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
           </div>
         }
         className="ui-picker-modal"
-        destroyOnClose={false}
         onCancel={() => setPickerOpen(false)}
       >
         <div className="ui-picker-shell">
@@ -399,21 +392,25 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
               {currentPreset.width} × {currentPreset.height}
             </Tag>
             <Button icon={<ScanSearch size={15} />} onClick={() => void inspectPage()} loading={inspecting}>
-              {inspectResult ? "重新扫描" : "扫描页面"}
+              {inspecting ? "正在扫描" : inspectResult ? "重新扫描" : "扫描页面"}
             </Button>
           </div>
-
-          {inspectError && <Alert type="error" message={inspectError} showIcon />}
-          {pickerFeedback && <Alert type="success" message={pickerFeedback} showIcon />}
 
           <div className="ui-picker-layout">
             <section className="ui-picker-preview-card">
               <div className="ui-picker-card-title">
                 <div>
                   <strong>页面预览</strong>
-                  <span>点击高亮区域选中元素</span>
                 </div>
-                {inspectResult ? <Tag color="blue">{filteredCandidates.length} 个候选</Tag> : <Tag>未扫描</Tag>}
+                {inspectResult ? (
+                  <Tag color="blue">{filteredCandidates.length} 个候选</Tag>
+                ) : inspecting ? (
+                  <Tag color="processing">扫描中</Tag>
+                ) : inspectError ? (
+                  <Tag color="error">扫描失败</Tag>
+                ) : (
+                  <Tag>未扫描</Tag>
+                )}
               </div>
               {inspectResult ? (
                 <div className="ui-picker-preview-scroll" ref={previewScrollRef}>
@@ -443,8 +440,18 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                     ))}
                   </div>
                 </div>
+              ) : inspecting ? (
+                <div className="ui-picker-loading" aria-live="polite">
+                  <Spin />
+                </div>
+              ) : inspectError ? (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false}>
+                  <Button icon={<ScanSearch size={15} />} onClick={() => void inspectPage()} loading={inspecting}>
+                    重新扫描
+                  </Button>
+                </Empty>
               ) : (
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="扫描后可在页面预览中点击元素">
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false}>
                   <Button icon={<ScanSearch size={15} />} onClick={() => void inspectPage()} loading={inspecting}>
                     扫描页面
                   </Button>
@@ -464,7 +471,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                     size="small"
                     value={candidateQuery}
                     prefix={<Search size={15} />}
-                    placeholder="搜索名称 / selector"
+                    placeholder="搜索名称 / selector…"
                     allowClear
                     onChange={(event) => setCandidateQuery(event.target.value)}
                   />
@@ -500,7 +507,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                             <Tag>{candidateKindLabel(candidate)}</Tag>
                             <Tag>{candidate.role || candidate.tag}</Tag>
                             {candidate.selector_type && <Tag>{candidate.selector_type}</Tag>}
-                            {candidate.stability && <Tag color={candidate.stability === "high" ? "green" : candidate.stability === "medium" ? "gold" : "default"}>{stabilityLabel(candidate.stability)}</Tag>}
+                            {candidate.stability && <Tag color={candidateStabilityColor(candidate.stability)}>{stabilityLabel(candidate.stability)}</Tag>}
                           </span>
                           <strong className="ui-candidate-name" title={candidateDisplayName(candidate)}>
                             {candidateDisplayName(candidate)}
@@ -528,7 +535,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                     })}
                   </div>
                 ) : (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={inspectResult ? "没有匹配的候选元素" : "扫描后展示候选元素"} />
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
                 )}
               </section>
             </aside>
@@ -545,7 +552,7 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
       <Space className="ui-assertion-rule" wrap>
         <Input
           value={assertion.selector}
-          placeholder="CSS / text= / role= Playwright 选择器"
+          placeholder="CSS / text= / role= Playwright 选择器…"
           onChange={(event) => update(assertion.id, { selector: event.target.value })}
         />
       </Space>
@@ -567,7 +574,7 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
       <Space className="ui-assertion-rule" wrap>
         <Input
           value={assertion.selector}
-          placeholder="CSS / text= / role= Playwright 选择器"
+          placeholder="CSS / text= / role= Playwright 选择器…"
           onChange={(event) => update(assertion.id, { selector: event.target.value })}
         />
         <Select
@@ -584,7 +591,13 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
       </Space>
     );
   }
-  return <Tag color="green">无需配置</Tag>;
+  return <Tag color="success">无需配置</Tag>;
+}
+
+function candidateStabilityColor(stability: UiElementCandidate["stability"]) {
+  if (stability === "high") return "success";
+  if (stability === "medium") return "warning";
+  return "default";
 }
 
 function containsPoint(candidate: UiElementCandidate, x: number, y: number): boolean {

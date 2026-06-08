@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from .api_assertions import inspect_api_response
-from .ui_assertions import inspect_ui_page
 from . import notifier, storage
 from .defaults import DEFAULT_SETTINGS
 from .config import REPORTS_DIR, RESPONSES_DIR, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, ensure_runtime_dirs
@@ -43,6 +43,8 @@ VALIDATION_FIELD_LABELS = {
     "alert_cooldown_minutes": "告警冷却时间",
     "alert_detail_base_url": "告警详情链接前缀",
     "recovery_notification": "恢复通知",
+    "max_queue_size": "执行队列容量",
+    "max_ui_concurrency": "最大 UI 并发数",
     "viewport_width": "Viewport 宽度",
     "viewport_height": "Viewport 高度",
     "browser_viewport": "浏览器 Viewport",
@@ -58,9 +60,11 @@ async def lifespan(app: FastAPI):
     scheduler = PulseScheduler(runner)
     app.state.runner = runner
     app.state.scheduler = scheduler
+    await runner.start()
     scheduler.start()
     yield
     scheduler.shutdown()
+    await runner.shutdown()
 
 
 ensure_runtime_dirs()
@@ -91,6 +95,11 @@ def overview() -> dict[str, Any]:
     return storage.get_overview()
 
 
+@app.get("/api/runtime")
+def runtime_status(request: Request) -> dict[str, Any]:
+    return request.app.state.runner.runtime_status()
+
+
 @app.get("/api/checks")
 def checks(type: str | None = Query(default=None)) -> list[dict[str, Any]]:
     if type and type not in {"ui", "api"}:
@@ -110,9 +119,12 @@ async def run_all_checks(request: Request, type: str | None = Query(default=None
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
     checks_to_run = [check for check in storage.list_checks(type, enabled_only=True)]
-    results = []
-    for check in checks_to_run:
-        results.append(await request.app.state.runner.run_check(int(check["id"]), trigger="manual-batch"))
+    results = await asyncio.gather(
+        *[
+            request.app.state.runner.run_check(int(check["id"]), trigger="manual-batch")
+            for check in checks_to_run
+        ]
+    )
     return {"runs": results}
 
 
@@ -133,9 +145,9 @@ async def inspect_api_check(payload: ApiInspectRequest) -> dict[str, Any]:
 
 
 @app.post("/api/checks/inspect-ui")
-async def inspect_ui_check(payload: UiInspectRequest) -> dict[str, Any]:
+async def inspect_ui_check(payload: UiInspectRequest, request: Request) -> dict[str, Any]:
     try:
-        return await inspect_ui_page(payload.model_dump(), storage.get_settings())
+        return await request.app.state.runner.inspect_ui(payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -253,12 +265,12 @@ def get_settings() -> dict[str, Any]:
 
 
 @app.put("/api/settings")
-def update_settings(payload: SettingsUpdate, request: Request) -> dict[str, Any]:
+async def update_settings(payload: SettingsUpdate, request: Request) -> dict[str, Any]:
     try:
         storage.update_settings(payload.values)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    request.app.state.runner.reload_settings()
+    await request.app.state.runner.reload_settings()
     request.app.state.scheduler.refresh_all()
     return storage.get_public_settings()
 

@@ -1,7 +1,7 @@
 import Editor from "@monaco-editor/react";
 import type { ReactNode } from "react";
 
-interface Props {
+export interface CodeEditorPanelProps {
   title: string;
   value: string;
   language: string;
@@ -11,7 +11,7 @@ interface Props {
   extra?: ReactNode;
 }
 
-export function CodeEditorPanel({ title, value, language, onChange, height = "360px", compact = false, extra }: Props) {
+export function CodeEditorPanel({ title, value, language, onChange, height = "360px", compact = false, extra }: CodeEditorPanelProps) {
   return (
     <section className="editor-section code-editor-panel">
       <div className="section-title code-editor-header">
@@ -28,7 +28,7 @@ export function CodeEditorPanel({ title, value, language, onChange, height = "36
           options={{
             minimap: { enabled: false },
             fontSize: 13,
-            fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
+            fontFamily: "var(--font-code)",
             lineNumbersMinChars: 3,
             scrollBeyondLastLine: false,
             tabSize: 2,

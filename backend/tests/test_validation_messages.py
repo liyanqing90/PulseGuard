@@ -201,19 +201,23 @@ class ValidationMessageTests(unittest.TestCase):
 
     def test_inspect_ui_route_returns_page_candidates(self) -> None:
         client = TestClient(app)
+        runner = type(
+            "FakeRunner",
+            (),
+            {
+                "inspect_ui": AsyncMock(
+                    return_value={
+                        "title": "Example Domain",
+                        "url": "https://example.com/",
+                        "viewport": {"width": 1440, "height": 900},
+                        "candidates": [{"selector": "text=Example Domain", "text": "Example Domain", "tag": "h1", "role": "heading"}],
+                        "screenshot": "data:image/jpeg;base64,abc",
+                    }
+                )
+            },
+        )()
 
-        with patch(
-            "backend.app.main.inspect_ui_page",
-            new=AsyncMock(
-                return_value={
-                    "title": "Example Domain",
-                    "url": "https://example.com/",
-                    "viewport": {"width": 1440, "height": 900},
-                    "candidates": [{"selector": "text=Example Domain", "text": "Example Domain", "tag": "h1", "role": "heading"}],
-                    "screenshot": "data:image/jpeg;base64,abc",
-                }
-            ),
-        ):
+        with patch.object(app.state, "runner", runner, create=True):
             response = client.post(
                 "/api/checks/inspect-ui",
                 json={

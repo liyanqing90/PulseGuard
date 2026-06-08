@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from backend.app.runner import CheckRunner
 
@@ -174,6 +174,119 @@ class DraftRunnerTests(unittest.TestCase):
         load_check_function.assert_called_once()
         self.assertEqual(load_check_function.call_args.kwargs["function_name"], "setup")
         self.assertIs(run_structured_ui_check.call_args.kwargs["setup_func"], setup_func)
+
+
+class RunnerQueueTests(unittest.TestCase):
+    def test_queue_capacity_skips_excess_submissions(self) -> None:
+        async def scenario() -> list[dict[str, object]]:
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def execute(check: dict[str, object], trigger: str, run_id: int, record_status: bool = True, notify: bool = True) -> dict[str, object]:
+                if check["id"] == 1:
+                    first_started.set()
+                    await release_first.wait()
+                else:
+                    await asyncio.sleep(0.01)
+                return {"id": run_id, "check_id": check["id"], "status": "ok", "trigger": trigger}
+
+            with runner_patches(max_concurrency=1, max_queue_size=1):
+                runner = CheckRunner()
+                runner._execute = execute  # type: ignore[method-assign]
+                first = asyncio.create_task(runner.run_check(1))
+                await first_started.wait()
+                second = asyncio.create_task(runner.run_check(2))
+                for _ in range(20):
+                    if runner.runtime_status()["queue"]["queued"] == 1:
+                        break
+                    await asyncio.sleep(0)
+                third = await runner.run_check(3)
+                release_first.set()
+                results = [await first, await second, third]
+                await runner.shutdown()
+                return results
+
+        results = asyncio.run(scenario())
+
+        self.assertEqual([result["status"] for result in results].count("skipped"), 1)
+        skipped = next(result for result in results if result["status"] == "skipped")
+        self.assertIn("执行队列已满", str(skipped["error_message"]))
+
+    def test_ui_jobs_are_capped_independently_from_global_concurrency(self) -> None:
+        active_ui = 0
+        max_active_ui = 0
+
+        async def scenario() -> list[dict[str, object]]:
+            nonlocal active_ui, max_active_ui
+
+            async def execute(check: dict[str, object], trigger: str, run_id: int, record_status: bool = True, notify: bool = True) -> dict[str, object]:
+                nonlocal active_ui, max_active_ui
+                active_ui += 1
+                max_active_ui = max(max_active_ui, active_ui)
+                try:
+                    await asyncio.sleep(0.03)
+                    return {"id": run_id, "check_id": check["id"], "status": "ok", "trigger": trigger}
+                finally:
+                    active_ui -= 1
+
+            with runner_patches(max_concurrency=2, max_ui_concurrency=1, check_type="ui"):
+                runner = CheckRunner()
+                runner._execute = execute  # type: ignore[method-assign]
+                results = await asyncio.gather(runner.run_check(1), runner.run_check(2))
+                await runner.shutdown()
+                return results
+
+        results = asyncio.run(scenario())
+
+        self.assertEqual([result["status"] for result in results], ["ok", "ok"])
+        self.assertEqual(max_active_ui, 1)
+
+
+def runner_patches(max_concurrency: int = 2, max_ui_concurrency: int = 1, max_queue_size: int = 50, check_type: str = "api"):
+    run_ids = {"value": 0}
+
+    def check_for(check_id: int) -> dict[str, object]:
+        return {
+            "id": check_id,
+            "name": f"任务 {check_id}",
+            "type": check_type,
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/health",
+            "method": "GET" if check_type == "api" else "",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"status_code","expected_status":200}]' if check_type == "api" else '[{"type":"title_contains","expected_text":"Example"}]',
+            "setup_script": "",
+            "script": "",
+            "tags": "",
+        }
+
+    def create_run(check: dict[str, object], status: str = "running", error_message: str | None = None) -> dict[str, object]:
+        run_ids["value"] += 1
+        return {
+            "id": run_ids["value"],
+            "check_id": int(check.get("id") or 0),
+            "status": status,
+            "error_message": error_message,
+        }
+
+    settings = {
+        "max_concurrency": max_concurrency,
+        "max_ui_concurrency": max_ui_concurrency,
+        "max_queue_size": max_queue_size,
+        "max_task_runtime_seconds": 60,
+        "browser_type": "chromium",
+        "browser_headless": True,
+    }
+    return patch.multiple(
+        "backend.app.runner.storage",
+        get_settings=Mock(return_value=settings),
+        get_check=Mock(side_effect=check_for),
+        create_run=Mock(side_effect=create_run),
+        start_run=Mock(),
+    )
 
 
 if __name__ == "__main__":

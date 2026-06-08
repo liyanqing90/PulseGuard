@@ -9,6 +9,7 @@ import type {
   Overview,
   Run,
   RunStatus,
+  RuntimeStatus,
   SettingsValues,
   UiInspectPayload,
   UiInspectResult
@@ -50,6 +51,8 @@ const FIELD_LABELS: Record<string, string> = {
   notification_channels: "通知渠道",
   alert_cooldown_minutes: "告警冷却时间",
   alert_detail_base_url: "告警详情链接前缀",
+  max_queue_size: "执行队列容量",
+  max_ui_concurrency: "最大 UI 并发数",
   browser_viewport: "浏览器 Viewport"
 };
 
@@ -98,6 +101,7 @@ function validationText(error: { msg?: unknown; type?: unknown }): string {
 
 export const api = {
   overview: () => request<Overview>("/api/overview"),
+  runtime: () => request<RuntimeStatus>("/api/runtime"),
   checks: (type: CheckType) => request<Check[]>(`/api/checks?type=${type}`),
   check: (id: number) => request<Check>(`/api/checks/${id}`),
   createCheck: (payload: CheckPayload) =>

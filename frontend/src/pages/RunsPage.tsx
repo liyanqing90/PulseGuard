@@ -1,4 +1,4 @@
-import { Alert, DatePicker, Dropdown, Empty, Input, Pagination, Select, Skeleton, Space, Table, Tag } from "antd";
+import { Alert, Button, DatePicker, Dropdown, Empty, Input, Pagination, Select, Skeleton, Space, Table, Tag } from "antd";
 import type { MenuProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import dayjs from "dayjs";
@@ -7,11 +7,10 @@ import { Download, Eye, FilterX, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { AppButton as Button } from "../components/common/AppButton";
 import { RunDetailDrawer } from "../components/RunDetailDrawer";
 import { RunStatusBadge } from "../components/StatusBadge";
 import type { CheckType, NotificationStatus, Run, RunStatus } from "../types";
-import { artifactHref, formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, runStatusLabel } from "../utils";
+import { artifactHref, formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, notificationStatusTagColor, runStatusLabel } from "../utils";
 
 const { RangePicker } = DatePicker;
 const HISTORY_PAGE_SIZE = 12;
@@ -206,9 +205,9 @@ export function RunsPage() {
       ellipsis: true,
       width: 210,
       render: (value: string, run) => (
-        <Space direction="vertical" size={2}>
+        <Space orientation="vertical" size={2}>
           <Button
-            intent="link"
+            type="link"
             className="table-link strong"
             onClick={(event) => {
               event.stopPropagation();
@@ -229,7 +228,7 @@ export function RunsPage() {
       align: "center",
       render: (_, run) => {
         const notification = notificationStatusMeta(run.notification_status);
-        return <Tag color={notification.color}>{notification.label}</Tag>;
+        return <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>;
       }
     },
     { title: "耗时", dataIndex: "duration_ms", render: (value?: number | null) => formatDuration(value), width: 88, align: "right" },
@@ -278,20 +277,6 @@ export function RunsPage() {
     <div className="page-content">
       {error && <Alert type="error" message={error} showIcon />}
 
-      {checkId && (
-        <Alert
-          className="scope-alert history-scope-alert"
-          type="info"
-          message={`当前仅展示任务 #${checkId}${scopedCheckName ? ` · ${scopedCheckName}` : ""} 的执行历史`}
-          showIcon
-          action={
-            <Button size="small" onClick={clearTaskScope}>
-              查看全部历史
-            </Button>
-          }
-        />
-      )}
-
       <section className="history-toolbar">
         <div className="history-filter-row">
           <Select
@@ -316,8 +301,21 @@ export function RunsPage() {
             onChange={(value) => setNotificationStatus(value)}
             options={NOTIFICATION_FILTER_OPTIONS}
           />
-          <RangePicker value={dateRange} onChange={(value) => setDateRange(value)} className="history-date-range" />
-          <Input value={q} onChange={(event) => setQ(event.target.value)} placeholder="任务名称" allowClear className="history-search" />
+          <RangePicker
+            value={dateRange}
+            onChange={(value) => setDateRange(value)}
+            className="history-date-range"
+            aria-label="按执行日期筛选"
+          />
+          <Input
+            name="runs-search"
+            value={q}
+            onChange={(event) => setQ(event.target.value)}
+            placeholder="任务名称…"
+            allowClear
+            autoComplete="off"
+            className="history-search"
+          />
         </div>
         <Space wrap>
           <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
@@ -441,14 +439,14 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
                   <span>运行记录 #{run.id}</span>
                   {run.check_id <= 0 && <Tag>草稿调试</Tag>}
                 </div>
-                <Button intent="link" className="history-card-title" onClick={() => onOpen(run)}>
+                <Button type="link" className="history-card-title" onClick={() => onOpen(run)}>
                   {run.check_name}
                 </Button>
                 {run.error_message && <div className="history-card-error">{run.error_message}</div>}
               </div>
               <div className="history-card-state">
                 <RunStatusBadge status={run.status} />
-                <Tag color={notification.color}>{notification.label}</Tag>
+                <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>
               </div>
             </header>
 

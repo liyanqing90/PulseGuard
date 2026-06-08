@@ -1,11 +1,10 @@
-import { Alert, Descriptions, Empty, Image as AntImage, Space, Table, Tabs, Tag } from "antd";
+import { Alert, Button, Descriptions, Empty, Image as AntImage, Space, Table, Tabs, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Archive, Download, ExternalLink, FileText, Image as ImageIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { Run } from "../types";
 import { artifactHref, formatDate, formatDuration, parseSnapshot } from "../utils";
-import { AppButton as Button } from "./common/AppButton";
 import { RunStatusBadge } from "./StatusBadge";
 import { StructuredViewer } from "./StructuredViewer";
 
@@ -38,12 +37,12 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
   }, [assertionResults.length, mode, responseSnapshot, run]);
 
   if (!run) {
-    return <Empty description="运行记录不存在" />;
+    return <Empty description={false} />;
   }
 
   const isDraftRun = run.check_id <= 0;
   const overviewPanel = (
-    <Space direction="vertical" size={14} className="drawer-stack">
+    <Space orientation="vertical" size={14} className="drawer-stack">
       <Descriptions bordered column={2} size="small">
         <Descriptions.Item label="状态">
           <RunStatusBadge status={run.status} />
@@ -59,11 +58,11 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
     </Space>
   );
   const errorPanel = (
-    <Space direction="vertical" size={12} className="drawer-stack">
+    <Space orientation="vertical" size={12} className="drawer-stack">
       {run.error_message ? (
         <Alert type="error" message="错误摘要" description={run.error_message} showIcon />
       ) : (
-        <Alert type="success" message={mode === "debug" ? "本次调试没有错误" : "本次运行没有错误"} showIcon />
+        <Tag color="success">{mode === "debug" ? "调试无错误" : "运行无错误"}</Tag>
       )}
       <StructuredViewer title="错误堆栈" value={run.error_stack} defaultMode="text" />
     </Space>
@@ -76,7 +75,7 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
       key: "response",
       label: "响应",
       children: (
-        <Space direction="vertical" size={12} className="drawer-stack">
+        <Space orientation="vertical" size={12} className="drawer-stack">
           <StructuredViewer title="响应快照" value={responseSnapshot} defaultMode="json" />
           <StructuredViewer title="响应体" value={responseBody} defaultMode="auto" />
         </Space>
@@ -94,10 +93,11 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
   ];
   const tabItems = run.check_type === "api" ? apiTabs : uiTabs;
   const content = (
-    <Space direction="vertical" size={16} className="drawer-stack">
+    <Space orientation="vertical" size={16} className="drawer-stack">
       <section className={`run-detail-summary run-detail-${run.status}`}>
         <div className="run-detail-title">
           <RunStatusBadge status={run.status} />
+          {isDraftRun && <Tag color="blue">草稿调试</Tag>}
           <div>
             <strong>{run.check_name}</strong>
             <span>运行记录 #{run.id}</span>
@@ -112,14 +112,6 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
       </section>
 
       {run.error_message && <Alert type="error" message="错误摘要" description={run.error_message} showIcon />}
-      {isDraftRun && (
-        <Alert
-          type="info"
-          message="草稿调试记录"
-          description="本次运行未保存任务配置，不更新任务健康状态，也不会触发告警。"
-          showIcon
-        />
-      )}
 
       <Tabs
         activeKey={activeTab}
@@ -156,7 +148,7 @@ function MetaItem({ label, value }: { label: string; value: string | number }) {
 
 function AssertionResultsPanel({ results }: { results: AssertionResult[] }) {
   if (!results.length) {
-    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="本次运行没有结构化校验结果" />;
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />;
   }
 
   const columns: ColumnsType<AssertionResult> = [
@@ -164,7 +156,7 @@ function AssertionResultsPanel({ results }: { results: AssertionResult[] }) {
       title: "结果",
       dataIndex: "status",
       width: 86,
-      render: (value: AssertionResult["status"]) => <Tag color={value === "ok" ? "green" : "red"}>{value === "ok" ? "通过" : "失败"}</Tag>
+      render: (value: AssertionResult["status"]) => <Tag color={value === "ok" ? "success" : "error"}>{value === "ok" ? "通过" : "失败"}</Tag>
     },
     {
       title: "校验项",
@@ -224,7 +216,7 @@ function EvidencePanel({ run, onOpenResponse }: { run: Run; onOpenResponse: () =
       <div className="run-evidence-header">
         <div>
           <strong>现场留证</strong>
-          <span>{hasArtifacts ? "截图、Trace 与响应体已归档，可直接用于定位" : "本次运行没有生成可查看产物"}</span>
+          <span>{hasArtifacts ? "已归档" : "无产物"}</span>
         </div>
         {responseHref && (
           <Button size="small" icon={<FileText size={15} />} onClick={onOpenResponse}>
@@ -260,14 +252,14 @@ function EvidencePanel({ run, onOpenResponse }: { run: Run; onOpenResponse: () =
           <EvidenceAction
             icon={<ImageIcon size={16} />}
             title="截图"
-            description={screenshotHref ? "在当前页预览或打开原图" : "UI 失败时自动保存"}
+            description={screenshotHref ? "可预览" : "未生成"}
             href={screenshotHref}
             actionLabel="打开原图"
           />
           <EvidenceAction
             icon={<Archive size={16} />}
             title="Trace"
-            description={traceHref ? "下载 Playwright Trace 复盘操作链路" : "失败 Trace 暂未生成"}
+            description={traceHref ? "可下载" : "未生成"}
             href={traceHref}
             actionLabel="下载 Trace"
             download
@@ -275,7 +267,7 @@ function EvidencePanel({ run, onOpenResponse }: { run: Run; onOpenResponse: () =
           <EvidenceAction
             icon={<FileText size={16} />}
             title="Response"
-            description={responseHref ? "响应体已在“响应”标签结构化展示" : "API 响应体暂未生成"}
+            description={responseHref ? "已归档" : "未生成"}
             href={responseHref}
             actionLabel="下载文件"
             download

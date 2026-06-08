@@ -1,5 +1,6 @@
 import {
   Alert,
+  Button,
   Empty,
   Input,
   InputNumber,
@@ -39,7 +40,6 @@ import {
 } from "../jsonPath";
 import type { ApiAssertion, ApiAssertionType, ApiInspectResult, CheckPayload } from "../types";
 import { formatDuration } from "../utils";
-import { AppButton as Button } from "./common/AppButton";
 import { StructuredViewer } from "./StructuredViewer";
 
 interface Props {
@@ -213,7 +213,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
         <section className="api-json-tree-card">
           <div className="api-json-tree-header">
             <strong>响应字段</strong>
-            {selectedPath ? <Tag color="blue">{selectedPath}</Tag> : <Tag>先执行请求</Tag>}
+            {selectedPath ? <Tag color="blue">{selectedPath}</Tag> : <Tag>未执行</Tag>}
           </div>
           {inspectResult ? (
             inspectResult.json_valid && treeData?.length ? (
@@ -226,10 +226,10 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
                 onSelect={(keys) => setSelectedPath(String(keys[0] || ""))}
               />
             ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="响应不是 JSON，字段校验不可选" />
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
             )
           ) : (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="执行请求后可从返回 JSON 选择字段" />
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
           )}
         </section>
 
@@ -273,7 +273,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
               </Space>
             </>
           ) : (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="在左侧选择一个 JSON 字段" />
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />
           )}
         </section>
       </div>
@@ -288,8 +288,8 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
         scroll={{ x: 820 }}
         locale={{
           emptyText: (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无校验项">
-              <Button intent="primary" size="small" icon={<Plus size={14} />} onClick={() => addAssertion("status_code")}>
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false}>
+              <Button type="primary" size="small" icon={<Plus size={14} />} onClick={() => addAssertion("status_code")}>
                 添加状态码
               </Button>
             </Empty>
@@ -327,7 +327,7 @@ function renderRuleEditor(
         min={1}
         value={assertion.max_ms}
         addonBefore="小于等于"
-        addonAfter="ms"
+        suffix="ms"
         onChange={(max_ms) => updateAssertion(assertion.id, { max_ms: Number(max_ms || 1) })}
       />
     );
@@ -340,21 +340,21 @@ function renderRuleEditor(
         value={assertion.path}
         options={pathOptions}
         onChange={(path) => updateAssertion(assertion.id, { path })}
-        placeholder="先执行请求并选择字段"
+        placeholder="先执行请求并选择字段…"
         popupMatchSelectWidth={false}
         filterOption={(input, option) => String(option?.label || "").toLowerCase().includes(input.toLowerCase())}
       />
       {assertion.type === "json_path_equals" && (
         <Input
           value={assertion.expected_value}
-          placeholder="期望值，支持 JSON 字面量"
+          placeholder="期望值，支持 JSON 字面量…"
           onChange={(event) => updateAssertion(assertion.id, { expected_value: event.target.value })}
         />
       )}
       {assertion.type === "json_path_contains" && (
         <Input
           value={assertion.expected_value}
-          placeholder="包含的文本、数组元素或对象键"
+          placeholder="包含的文本、数组元素或对象键…"
           onChange={(event) => updateAssertion(assertion.id, { expected_value: event.target.value })}
         />
       )}
@@ -377,7 +377,7 @@ function renderRuleEditor(
           <InputNumber
             min={0}
             value={assertion.expected_length}
-            addonAfter="长度"
+            suffix="长度"
             onChange={(expected_length) => updateAssertion(assertion.id, { expected_length: Number(expected_length || 0) })}
           />
         </>
