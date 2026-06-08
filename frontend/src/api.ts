@@ -2,17 +2,32 @@ import type {
   AlertPreview,
   ApiInspectPayload,
   ApiInspectResult,
+  AuditEvent,
   Check,
+  CheckBatchPayload,
+  CheckBatchResult,
+  CheckVersion,
   CheckPayload,
   CheckType,
+  ConfigBundle,
+  ConfigExportFile,
+  ConfigImportPreview,
+  ConfigImportResult,
   NotificationStatus,
   Overview,
+  ProbeRunner,
   Run,
+  RunArchive,
+  RunComparison,
+  RunFailureSummary,
   RunStatus,
   RuntimeStatus,
   SettingsValues,
+  StatusPageSnapshot,
   UiInspectPayload,
-  UiInspectResult
+  UiInspectResult,
+  UiRuleInspectPayload,
+  UiRuleInspectResult
 } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -21,20 +36,53 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init
   });
   if (!response.ok) {
-    let message = `请求失败：${response.status}`;
-    try {
-      const data = await response.json();
-      message = formatErrorDetail(data.detail, message);
-    } catch {
-      // keep default message
-    }
-    throw new Error(message);
+    throw await responseError(response);
   }
   return response.json() as Promise<T>;
 }
 
+async function downloadFile(path: string, init?: RequestInit): Promise<ConfigExportFile> {
+  const response = await fetch(path, {
+    headers: { Accept: "application/json", ...(init?.headers || {}) },
+    ...init
+  });
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+  return {
+    blob: await response.blob(),
+    filename: downloadFilename(response.headers.get("content-disposition")) || "pulseguard-config.json"
+  };
+}
+
+async function responseError(response: Response): Promise<Error> {
+  let message = `请求失败：${response.status}`;
+  try {
+    const data = await response.json();
+    message = formatErrorDetail(data.detail, message);
+  } catch {
+    // keep default message
+  }
+  return new Error(message);
+}
+
+function downloadFilename(contentDisposition: string | null): string {
+  if (!contentDisposition) return "";
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition);
+  if (encoded?.[1]) {
+    try {
+      return decodeURIComponent(encoded[1].replace(/^"|"$/g, ""));
+    } catch {
+      return encoded[1].replace(/^"|"$/g, "");
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(contentDisposition);
+  return plain?.[1]?.trim() || "";
+}
+
 const FIELD_LABELS: Record<string, string> = {
   name: "任务名称",
+  action: "批量操作",
   type: "任务类型",
   enabled: "启用状态",
   interval_seconds: "执行频率",
@@ -47,26 +95,49 @@ const FIELD_LABELS: Record<string, string> = {
   assertions_json: "校验项",
   setup_script: "前置脚本",
   script: "Python 脚本",
+  tag: "标签",
   tags: "标签",
+  expected_count: "命中数量",
+  alert_policy_json: "任务告警策略",
   notification_channels: "通知渠道",
+  alert_tag_policies: "标签告警策略",
+  alert_policy_tag: "标签告警策略标签",
   alert_cooldown_minutes: "告警冷却时间",
   alert_detail_base_url: "告警详情链接前缀",
   max_queue_size: "执行队列容量",
   max_ui_concurrency: "最大 UI 并发数",
-  browser_viewport: "浏览器 Viewport"
+  browser_viewport: "浏览器 Viewport",
+  local_runner_name: "Runner 名称",
+  local_runner_address: "Runner 地址",
+  local_runner_region: "Runner 网络区域",
+  maintenance_enabled: "维护公告启用状态",
+  maintenance_title: "维护公告标题",
+  maintenance_message: "维护公告内容",
+  maintenance_starts_at: "维护开始时间",
+  maintenance_ends_at: "维护结束时间"
 };
 
 function formatErrorDetail(detail: unknown, fallback: string): string {
-  if (typeof detail === "string" && detail.trim()) return detail;
+  if (typeof detail === "string" && detail.trim()) return safeErrorText(detail, fallback);
   if (Array.isArray(detail)) {
     const messages = detail.map(formatValidationItem).filter(Boolean);
     return messages.length ? Array.from(new Set(messages)).join("；") : fallback;
   }
   if (detail && typeof detail === "object" && "message" in detail) {
     const message = (detail as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message;
+    if (typeof message === "string" && message.trim()) return safeErrorText(message, fallback);
   }
   return fallback;
+}
+
+function safeErrorText(value: string, fallback: string): string {
+  const text = value.trim();
+  if (!text) return fallback;
+  if (/(traceback|exception|stack|authorization|cookie|set-cookie|headers_json|read_only_token|token|secret|password|webhook)/i.test(text)) {
+    return fallback;
+  }
+  if (/[\r\n{}[\]<>]/.test(text)) return fallback;
+  return text.length > 240 ? `${text.slice(0, 240)}...` : text;
 }
 
 function formatValidationItem(item: unknown): string {
@@ -102,6 +173,7 @@ function validationText(error: { msg?: unknown; type?: unknown }): string {
 export const api = {
   overview: () => request<Overview>("/api/overview"),
   runtime: () => request<RuntimeStatus>("/api/runtime"),
+  statusPage: () => request<StatusPageSnapshot>("/api/status-page"),
   checks: (type: CheckType) => request<Check[]>(`/api/checks?type=${type}`),
   check: (id: number) => request<Check>(`/api/checks/${id}`),
   createCheck: (payload: CheckPayload) =>
@@ -118,7 +190,17 @@ export const api = {
     request<ApiInspectResult>("/api/checks/inspect-api", { method: "POST", body: JSON.stringify(payload) }),
   inspectUi: (payload: UiInspectPayload) =>
     request<UiInspectResult>("/api/checks/inspect-ui", { method: "POST", body: JSON.stringify(payload) }),
+  inspectUiRules: (payload: UiRuleInspectPayload) =>
+    request<UiRuleInspectResult>("/api/checks/inspect-ui-rules", { method: "POST", body: JSON.stringify(payload) }),
   runAll: (type: CheckType) => request<{ runs: Run[] }>(`/api/checks/run-all?type=${type}`, { method: "POST" }),
+  batchChecks: (payload: CheckBatchPayload) =>
+    request<CheckBatchResult>("/api/checks/batch", { method: "POST", body: JSON.stringify(payload) }),
+  auditEvents: () => request<AuditEvent[]>("/api/audit-events"),
+  runArchives: () => request<RunArchive[]>("/api/run-archives"),
+  runners: () => request<ProbeRunner[]>("/api/runners"),
+  checkVersions: (id: number) => request<CheckVersion[]>(`/api/checks/${id}/versions`),
+  restoreCheckVersion: (versionId: number) =>
+    request<Check>(`/api/check-versions/${versionId}/restore`, { method: "POST" }),
   runs: (params: {
     type?: CheckType | "";
     status?: RunStatus | "failed" | "";
@@ -135,6 +217,8 @@ export const api = {
     return request<Run[]>(`/api/runs?${query.toString()}`);
   },
   run: (id: number) => request<Run>(`/api/runs/${id}`),
+  runComparison: (id: number) => request<RunComparison>(`/api/runs/${id}/compare-success`),
+  runFailureSummary: (id: number) => request<RunFailureSummary>(`/api/runs/${id}/failure-summary`),
   rerun: (id: number) => request<Run>(`/api/runs/${id}/rerun`, { method: "POST" }),
   settings: () => request<SettingsValues>("/api/settings"),
   updateSettings: (values: Partial<SettingsValues>) =>
@@ -142,5 +226,10 @@ export const api = {
   alertPreview: (values: Partial<SettingsValues>) =>
     request<AlertPreview>("/api/settings/alert-preview", { method: "POST", body: JSON.stringify({ values }) }),
   testAlert: (values: Partial<SettingsValues>) =>
-    request<{ ok: boolean; message: string }>("/api/settings/test-alert", { method: "POST", body: JSON.stringify({ values }) })
+    request<{ ok: boolean; message: string }>("/api/settings/test-alert", { method: "POST", body: JSON.stringify({ values }) }),
+  exportConfig: () => downloadFile("/api/config/export"),
+  previewConfigImport: (bundle: ConfigBundle) =>
+    request<ConfigImportPreview>("/api/config/import-preview", { method: "POST", body: JSON.stringify({ bundle }) }),
+  importConfig: (bundle: ConfigBundle) =>
+    request<ConfigImportResult>("/api/config/import", { method: "POST", body: JSON.stringify({ bundle }) })
 };

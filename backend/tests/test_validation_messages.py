@@ -224,11 +224,72 @@ class ValidationMessageTests(unittest.TestCase):
                     "type": "ui",
                     "entry_url": "https://example.com",
                     "timeout_ms": 15000,
+                    "setup_script": "async def setup(ctx, page):\n    ctx.log('scan setup')",
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["candidates"][0]["selector"], "text=Example Domain")
+        self.assertIn("async def setup", runner.inspect_ui.call_args.args[0]["setup_script"])
+
+    def test_inspect_ui_setup_script_requires_setup_entry(self) -> None:
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/checks/inspect-ui",
+            json={
+                "type": "ui",
+                "entry_url": "https://example.com",
+                "timeout_ms": 15000,
+                "setup_script": "async def check(ctx):\n    pass",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"], "前置脚本必须定义 async def setup(ctx, page)")
+
+    def test_settings_accept_environment_variables(self) -> None:
+        normalized = normalize_settings_values(
+            {
+                "environment_variables": [
+                    {"id": "host", "name": "API_HOST", "value": "https://api.example.com", "secret": False},
+                    {"id": "token", "name": "SERVICE_TOKEN", "value": "token-secret-123", "secret": True},
+                ]
+            }
+        )
+
+        self.assertEqual(normalized["environment_variables"][0]["name"], "API_HOST")
+        self.assertEqual(normalized["environment_variables"][1]["value"], "token-secret-123")
+        self.assertTrue(normalized["environment_variables"][1]["secret"])
+
+    def test_environment_variable_name_validation_uses_user_facing_rule_message(self) -> None:
+        with self.assertRaisesRegex(ValueError, "NAME.*SERVICE_TOKEN"):
+            normalize_settings_values(
+                {
+                    "environment_variables": [
+                        {"id": "bad", "name": "1BAD", "value": "value", "secret": False},
+                    ]
+                }
+            )
+
+    def test_dingtalk_secret_accepts_variable_placeholder(self) -> None:
+        normalized = normalize_settings_values(
+            {
+                "notification_channels": [
+                    {
+                        "id": "ding",
+                        "name": "Ding",
+                        "type": "dingtalk",
+                        "enabled": True,
+                        "webhook_url": "${DING_WEBHOOK}",
+                        "dingtalk_secret": "${DING_SECRET}",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(normalized["notification_channels"][0]["webhook_url"], "${DING_WEBHOOK}")
+        self.assertEqual(normalized["notification_channels"][0]["dingtalk_secret"], "${DING_SECRET}")
 
     def test_settings_validation_errors_use_user_facing_labels(self) -> None:
         with self.assertRaisesRegex(ValueError, "默认执行频率必须是数字"):
@@ -241,6 +302,53 @@ class ValidationMessageTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "http://"):
             normalize_settings_values({"alert_detail_base_url": "10.168.78.49:8787"})
+
+    def test_settings_accept_alert_tag_policies_without_secret_material(self) -> None:
+        normalized = normalize_settings_values(
+            {
+                "alert_tag_policies": [
+                    {
+                        "id": "critical-policy",
+                        "tag": "critical",
+                        "alert_cooldown_minutes": 5,
+                        "recovery_notification": False,
+                        "notification_channel_ids": ["ops", "backup"],
+                        "webhook_url": "https://example.invalid/should-not-be-saved",
+                        "dingtalk_secret": "SECshouldnotbesaved",
+                    }
+                ]
+            }
+        )
+
+        policy = normalized["alert_tag_policies"][0]
+        self.assertEqual(policy["id"], "critical-policy")
+        self.assertEqual(policy["tag"], "critical")
+        self.assertEqual(policy["alert_cooldown_minutes"], 5)
+        self.assertFalse(policy["recovery_notification"])
+        self.assertEqual(policy["notification_channel_ids"], ["ops", "backup"])
+        self.assertNotIn("webhook_url", policy)
+        self.assertNotIn("dingtalk_secret", policy)
+
+    def test_settings_reject_duplicate_alert_tag_policy_ids(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_settings_values(
+                {
+                    "alert_tag_policies": [
+                        {"id": "critical-policy", "tag": "critical"},
+                        {"id": "critical-policy", "tag": "checkout"},
+                    ]
+                }
+            )
+
+    def test_settings_reject_alert_tag_policy_empty_tag(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_settings_values(
+                {
+                    "alert_tag_policies": [
+                        {"id": "empty-tag-policy", "tag": " "},
+                    ]
+                }
+            )
 
 
 if __name__ == "__main__":

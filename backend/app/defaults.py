@@ -14,6 +14,8 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "alerts_enabled": False,
     "alert_detail_base_url": ALERT_DETAIL_BASE_URL,
     "notification_channels": [],
+    "alert_tag_policies": [],
+    "environment_variables": [],
     "alert_cooldown_minutes": 30,
     "recovery_notification": True,
     "browser_headless": True,
@@ -24,6 +26,15 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "screenshot_retention_days": 30,
     "trace_retention_days": 7,
     "response_retention_days": 30,
+    "read_only_token": "",
+    "local_runner_name": "local",
+    "local_runner_address": "127.0.0.1",
+    "local_runner_region": "local",
+    "maintenance_enabled": False,
+    "maintenance_title": "",
+    "maintenance_message": "",
+    "maintenance_starts_at": "",
+    "maintenance_ends_at": "",
 }
 
 

@@ -19,7 +19,8 @@ export function checkToPayload(check: Check): CheckPayload {
     assertions_json: check.assertions_json || "[]",
     setup_script: check.setup_script || "",
     script: check.script,
-    tags: check.tags || ""
+    tags: check.tags || "",
+    alert_policy_json: check.alert_policy_json || "{}"
   };
 }
 
@@ -125,7 +126,8 @@ export function normalizeCheckPayload(value: CheckPayload): CheckPayload {
     interval_seconds: Math.max(5, Number(value.interval_seconds || 5)),
     timeout_ms: Math.max(500, Number(value.timeout_ms || 500)),
     setup_script: value.type === "ui" ? value.setup_script || "" : "",
-    script: value.script || ""
+    script: value.script || "",
+    alert_policy_json: normalizeAlertPolicyJson(value.alert_policy_json)
   };
 }
 
@@ -141,5 +143,33 @@ export function detectBodyMode(value?: string | null): BodyEditorMode {
     return "json";
   } catch {
     return "text";
+  }
+}
+
+function normalizeAlertPolicyJson(value?: string | null): string {
+  if (!value?.trim()) return "{}";
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "{}";
+    const policy = parsed as {
+      alert_cooldown_minutes?: unknown;
+      recovery_notification?: unknown;
+      notification_channel_ids?: unknown;
+    };
+    const normalized: Record<string, unknown> = {};
+    if (typeof policy.alert_cooldown_minutes === "number" && Number.isFinite(policy.alert_cooldown_minutes)) {
+      normalized.alert_cooldown_minutes = Math.max(1, Math.min(1440, Math.round(policy.alert_cooldown_minutes)));
+    }
+    if (typeof policy.recovery_notification === "boolean") {
+      normalized.recovery_notification = policy.recovery_notification;
+    }
+    if (Array.isArray(policy.notification_channel_ids)) {
+      normalized.notification_channel_ids = Array.from(
+        new Set(policy.notification_channel_ids.map((item) => String(item || "").trim()).filter(Boolean))
+      );
+    }
+    return JSON.stringify(normalized);
+  } catch {
+    return "{}";
   }
 }

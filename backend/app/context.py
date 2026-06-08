@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import datetime
 from typing import Any
 
 import httpx
 from jsonschema import ValidationError, validate
 
+from . import network_checks
 from .artifacts import ArtifactStore
+from .variables import mask_data, resolve_data, resolve_text
 from .viewport import browser_context_options, normalize_viewport_mode, viewport_for_mode
 
 
 class RunFailure(Exception):
     """Expected failure raised by a user script or ctx assertion."""
+
+
+class RunnerEnvironmentFailure(RunFailure):
+    """Expected failure caused by local runner dependencies or browser setup."""
 
 
 class PulseHttpClient:
@@ -21,13 +29,21 @@ class PulseHttpClient:
         self.last_response: httpx.Response | None = None
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        self.ctx.request_snapshot = {
-            "method": method.upper(),
-            "url": url,
-            "headers": dict(kwargs.get("headers") or {}),
-            "body": self._snapshot_body(kwargs),
-        }
-        response = await self._client.request(method, url, **kwargs)
+        resolved_url = resolve_text(url, self.ctx.settings)
+        resolved_kwargs = resolve_data(kwargs, self.ctx.settings)
+        self.ctx.request_snapshot = mask_data(
+            {
+                "method": method.upper(),
+                "url": resolved_url,
+                "headers": dict(resolved_kwargs.get("headers") or {}),
+                "body": self._snapshot_body(resolved_kwargs),
+            },
+            self.ctx.settings,
+        )
+        try:
+            response = await self._client.request(method, resolved_url, **resolved_kwargs)
+        except httpx.RequestError as exc:
+            raise RunFailure(f"请求目标失败：{exc}") from exc
         self.last_response = response
         self.ctx.response_snapshot = self.ctx.response_snapshot_from(response)
         return response
@@ -67,11 +83,11 @@ class RunContext:
         self.run_id = run_id
         self.settings = settings
         self.artifacts = artifacts
-        self.entry_url = check.get("entry_url") or ""
+        self.entry_url = resolve_text(check.get("entry_url") or "", settings)
         self.viewport_mode = normalize_viewport_mode(check.get("viewport_mode"))
         self.method = (check.get("method") or "GET").upper()
-        self.headers = self._parse_headers(check.get("headers_json") or "{}")
-        self.body = check.get("body") or ""
+        self.headers = self._parse_headers(resolve_text(check.get("headers_json") or "{}", settings))
+        self.body = resolve_text(check.get("body") or "", settings)
         self.timeout_ms = int(check.get("timeout_ms") or 15000)
         self.logs: list[str] = []
         self.console_messages: list[dict[str, str]] = []
@@ -81,6 +97,7 @@ class RunContext:
         self.response_path: str | None = None
         self.request_snapshot: dict[str, Any] | None = None
         self.response_snapshot: dict[str, Any] | None = None
+        self.browser_version: str | None = None
         self.http = PulseHttpClient(self)
 
         self._playwright: Any = None
@@ -100,30 +117,92 @@ class RunContext:
 
         return await self.http.request(self.method, self.entry_url, **request_kwargs)
 
+    async def tcp_connect(self, host: str, port: int | None = None, timeout_seconds: float | None = None) -> dict[str, Any]:
+        resolved_host = resolve_text(host, self.settings)
+        target_host, target_port = network_checks.normalize_host_port(resolved_host, port or 80)
+        timeout = timeout_seconds or self.timeout_ms / 1000
+        try:
+            result = await asyncio.to_thread(network_checks.tcp_connect, target_host, target_port, timeout)
+        except Exception as exc:
+            raise RunFailure(f"TCP 连接失败：{target_host}:{target_port} {exc}") from exc
+        self.log(f"TCP 可达：{target_host}:{target_port} {result['duration_ms']}ms")
+        return result
+
+    async def dns_resolve(self, host: str) -> dict[str, Any]:
+        resolved_host = resolve_text(host, self.settings)
+        target_host, _ = network_checks.normalize_host_port(resolved_host, 80)
+        try:
+            result = await asyncio.to_thread(network_checks.resolve_hostname, target_host)
+        except Exception as exc:
+            raise RunFailure(f"DNS 解析失败：{target_host} {exc}") from exc
+        self.log(f"DNS 解析：{target_host} -> {', '.join(result['addresses'])}")
+        return result
+
+    async def tls_certificate(self, host: str, port: int = 443, warn_days: int = 14, timeout_seconds: float | None = None) -> dict[str, Any]:
+        resolved_host = resolve_text(host, self.settings)
+        target_host, target_port = network_checks.normalize_host_port(resolved_host, port)
+        timeout = timeout_seconds or self.timeout_ms / 1000
+        try:
+            result = await asyncio.to_thread(network_checks.tls_certificate, target_host, target_port, timeout)
+        except Exception as exc:
+            raise RunFailure(f"TLS 证书检查失败：{target_host}:{target_port} {exc}") from exc
+        if int(result["days_remaining"]) < int(warn_days):
+            raise RunFailure(f"TLS 证书即将到期：剩余 {result['days_remaining']} 天，阈值 {warn_days} 天")
+        self.log(f"TLS 证书有效：{target_host}:{target_port} 剩余 {result['days_remaining']} 天")
+        return result
+
+    def expect_heartbeat(self, key: str, max_age_seconds: int, require_ok: bool = True) -> dict[str, Any]:
+        from . import storage
+
+        heartbeat_key = resolve_text(key, self.settings).strip()
+        heartbeat = storage.get_heartbeat(heartbeat_key)
+        if not heartbeat:
+            raise RunFailure(f"未收到心跳：{heartbeat_key}")
+        received_at = datetime.fromisoformat(str(heartbeat["received_at"]))
+        age_seconds = int((datetime.now(received_at.tzinfo) - received_at).total_seconds())
+        if age_seconds > int(max_age_seconds):
+            raise RunFailure(f"心跳已过期：{heartbeat_key}，{age_seconds}s 前收到")
+        if require_ok and str(heartbeat.get("status") or "ok") != "ok":
+            message = str(heartbeat.get("message") or "心跳状态异常")
+            raise RunFailure(f"心跳失败：{heartbeat_key} {message}")
+        self.log(f"心跳正常：{heartbeat_key}，{age_seconds}s 前收到")
+        return heartbeat
+
     async def new_page(self) -> Any:
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
-            raise RunFailure("Playwright 未安装，请先安装后再执行 UI 探活") from exc
+            raise RunnerEnvironmentFailure("Playwright 未安装，请先安装后再执行 UI 探活") from exc
 
         if self._playwright is None:
-            self._playwright = await async_playwright().start()
-            browser_type_name = str(self.settings.get("browser_type") or "chromium")
-            browser_type = getattr(self._playwright, browser_type_name, None)
-            if browser_type is None:
-                raise RunFailure(f"不支持的浏览器类型：{browser_type_name}")
+            try:
+                self._playwright = await async_playwright().start()
+                browser_type_name = str(self.settings.get("browser_type") or "chromium")
+                browser_type = getattr(self._playwright, browser_type_name, None)
+                if browser_type is None:
+                    raise RunnerEnvironmentFailure(f"不支持的浏览器类型：{browser_type_name}")
 
-            proxy_url = str(self.settings.get("browser_proxy") or "").strip()
-            launch_options: dict[str, Any] = {
-                "headless": bool(self.settings.get("browser_headless", True)),
-            }
-            if proxy_url:
-                launch_options["proxy"] = {"server": proxy_url}
+                proxy_url = resolve_text(self.settings.get("browser_proxy") or "", self.settings).strip()
+                launch_options: dict[str, Any] = {
+                    "headless": bool(self.settings.get("browser_headless", True)),
+                }
+                if proxy_url:
+                    launch_options["proxy"] = {"server": proxy_url}
 
-            self._browser = await browser_type.launch(**launch_options)
-            self._browser_context = await self._browser.new_context(**self._browser_context_options())
-            await self._browser_context.tracing.start(screenshots=True, snapshots=True, sources=True)
-            self._trace_started = True
+                self._browser = await browser_type.launch(**launch_options)
+                raw_version = getattr(self._browser, "version", "")
+                if callable(raw_version):
+                    raw_version = raw_version()
+                self.browser_version = " ".join(
+                    part for part in (browser_type_name, str(raw_version or "").strip()) if part
+                )
+                self._browser_context = await self._browser.new_context(**self._browser_context_options())
+                await self._browser_context.tracing.start(screenshots=True, snapshots=True, sources=True)
+                self._trace_started = True
+            except RunnerEnvironmentFailure:
+                raise
+            except Exception as exc:
+                raise RunnerEnvironmentFailure(f"浏览器环境启动失败：{exc}") from exc
 
         page = await self._browser_context.new_page()
         page.set_default_timeout(self.timeout_ms)
@@ -171,6 +250,21 @@ class RunContext:
     def assert_status(self, response: httpx.Response, expected: int) -> None:
         if response.status_code != expected:
             raise RunFailure(f"HTTP 状态码不匹配：期望 {expected}，实际 {response.status_code}")
+
+    def assert_body_contains(self, response: httpx.Response, text: str) -> None:
+        expected = resolve_text(text, self.settings)
+        if expected not in response.text:
+            raise RunFailure(f"响应内容未包含：{expected}")
+
+    def assert_url_contains(self, response: httpx.Response, text: str) -> None:
+        expected = resolve_text(text, self.settings)
+        url = str(response.url)
+        if expected not in url:
+            raise RunFailure(f"最终 URL 未包含：{expected}，实际 {url}")
+
+    def assert_redirect_occurred(self, response: httpx.Response) -> None:
+        if not response.history:
+            raise RunFailure("未发生 HTTP 跳转")
 
     def assert_json_schema(self, data: Any, schema: dict[str, Any]) -> None:
         try:
@@ -225,12 +319,15 @@ class RunContext:
         body_text = response.text
         if not include_body and len(body_text) > 5000:
             body_text = body_text[:5000] + "\n... 响应体已截断，完整内容见产物。"
-        return {
+        return mask_data(
+            {
             "status_code": response.status_code,
             "url": str(response.url),
             "headers": dict(response.headers),
             "body": body_text,
-        }
+            },
+            self.settings,
+        )
 
     def _capture_console(self, message: Any) -> None:
         message_type = str(getattr(message, "type", "") or "")

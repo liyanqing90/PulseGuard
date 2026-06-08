@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Empty, Space, Statistic, Table } from "antd";
+import { Alert, App, Button, Card, Empty, Space, Statistic, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   AlertTriangle,
@@ -13,8 +13,8 @@ import {
   ShieldCheck,
   Zap
 } from "lucide-react";
-import { useEffect, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import {
   BatchRunActions,
@@ -23,10 +23,10 @@ import {
   batchRunNotificationType,
   summarizeBatchRuns
 } from "../components/BatchRunAlert";
-import { RunDetailDrawer } from "../components/RunDetailDrawer";
-import { RunStatusBadge } from "../components/StatusBadge";
-import type { CheckType, Overview, Run, SettingsValues } from "../types";
-import { checkListPath, formatDate, formatDuration, intervalLabel } from "../utils";
+import type { CheckType, Overview, OverviewTrend, Run, SettingsValues } from "../types";
+import { checkListPath, formatDate, formatDuration, intervalLabel, runStatusLabel, runStatusTagColor } from "../utils";
+
+const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
 
 export function OverviewPage() {
   const { message } = App.useApp();
@@ -105,6 +105,7 @@ export function OverviewPage() {
   }
 
   const hasIncident = Boolean((overview?.failing_count || 0) > 0);
+  const trends = overview?.trends || [];
 
   const columns: ColumnsType<Run> = [
     { title: "时间", dataIndex: "started_at", render: (value: string) => formatDate(value), width: 180 },
@@ -118,7 +119,8 @@ export function OverviewPage() {
         </Button>
       )
     },
-    { title: "状态", dataIndex: "status", render: (_, run) => <RunStatusBadge status={run.status} />, width: 100 },
+    { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 100 },
+    { title: "归因", dataIndex: "failure_kind", render: (_, run) => failureKindTag(run), width: 90 },
     { title: "耗时", dataIndex: "duration_ms", render: (value: number | null) => formatDuration(value), width: 110 },
     { title: "错误摘要", dataIndex: "error_message", ellipsis: true },
     { title: "连续失败", dataIndex: "consecutive_failures", render: (value?: number) => value || "-", width: 110 },
@@ -154,9 +156,9 @@ export function OverviewPage() {
           <Button icon={<Play size={16} />} loading={batchRunning === "api"} onClick={() => runAll("api")}>
             执行全部 API
           </Button>
-          <Link to="/settings">
-            <Button icon={<Settings2 size={16} />}>告警设置</Button>
-          </Link>
+          <Button icon={<Settings2 size={16} />} onClick={() => navigate("/settings")}>
+            告警设置
+          </Button>
         </Space>
       </section>
 
@@ -213,12 +215,20 @@ export function OverviewPage() {
         </Card>
       </section>
 
+      {trends.length > 0 && (
+        <section className="trend-grid">
+          {trends.map((trend) => (
+            <TrendCard key={trend.key} trend={trend} />
+          ))}
+        </section>
+      )}
+
       <Card
         title="失败现场"
         extra={
-          <Link to="/runs">
-            <Button icon={<History size={16} />}>执行历史</Button>
-          </Link>
+          <Button icon={<History size={16} />} onClick={() => navigate("/runs")}>
+            执行历史
+          </Button>
         }
       >
         <Table
@@ -244,16 +254,58 @@ export function OverviewPage() {
         />
       </Card>
 
-      <RunDetailDrawer
-        runId={detailRunId}
-        onClose={() => setDetailRunId(null)}
-        returnTo={`${location.pathname}${location.search}`}
-        onRerun={async (run) => {
-          const latest = await api.rerun(run.id);
-          setDetailRunId(latest.id);
-          await load();
-        }}
-      />
+      {detailRunId && (
+        <Suspense fallback={null}>
+          <RunDetailDrawer
+            runId={detailRunId}
+            onClose={() => setDetailRunId(null)}
+            returnTo={`${location.pathname}${location.search}`}
+            onRerun={async (run) => {
+              const latest = await api.rerun(run.id);
+              setDetailRunId(latest.id);
+              await load();
+            }}
+          />
+        </Suspense>
+      )}
+    </div>
+  );
+}
+
+function failureKindTag(run: Run) {
+  if (run.failure_kind === "target") return <Tag color="red">目标</Tag>;
+  if (run.failure_kind === "runner") return <Tag color="orange">Runner</Tag>;
+  return <span>-</span>;
+}
+
+function TrendCard({ trend }: { trend: OverviewTrend }) {
+  const successRate = formatSuccessRate(trend.success_rate);
+  return (
+    <Card className="trend-card">
+      <div className="trend-card-header">
+        <strong>{trend.label}</strong>
+        <span>{trend.runs} 次运行</span>
+      </div>
+      <div className="trend-card-body">
+        <Statistic title="成功率" value={successRate} />
+        <Statistic title="失败次数" value={trend.failure_count} />
+        <TrendMeta label="P50 耗时" value={formatDuration(trend.duration_p50_ms)} />
+        <TrendMeta label="P95 耗时" value={formatDuration(trend.duration_p95_ms)} />
+      </div>
+    </Card>
+  );
+}
+
+function formatSuccessRate(value: number | null | undefined): string {
+  if (value == null) return "-";
+  return `${value.toLocaleString("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`;
+}
+
+function TrendMeta({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="trend-meta">
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }

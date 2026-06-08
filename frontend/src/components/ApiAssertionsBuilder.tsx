@@ -29,6 +29,7 @@ import {
 import { prepareApiInspectPayload, type BodyEditorMode } from "../checkPayload";
 import {
   buildJsonPathTree,
+  buildJsonPathTreeFromOptions,
   flattenJsonPathTree,
   jsonLength,
   jsonLiteral,
@@ -70,12 +71,26 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
   const [error, setError] = useState<string | null>(null);
   const assertions = useMemo(() => parseApiAssertions(value), [value]);
   const parsedBody = useMemo(() => (inspectResult?.json_valid ? parseJsonValue(inspectResult.body) : { valid: false as const, value: null }), [inspectResult]);
-  const tree = useMemo(() => (parsedBody.valid ? buildJsonPathTree(parsedBody.value) : []), [parsedBody]);
+  const pathTree = useMemo(() => (inspectResult?.json_valid ? buildJsonPathTreeFromOptions(inspectResult.json_paths) : []), [inspectResult]);
+  const bodyTree = useMemo(() => (parsedBody.valid ? buildJsonPathTree(parsedBody.value) : []), [parsedBody]);
+  const tree = pathTree.length ? pathTree : bodyTree;
   const flatNodes = useMemo(() => flattenJsonPathTree(tree), [tree]);
   const selectedNode = useMemo(() => {
-    if (!parsedBody.valid || !selectedPath) return null;
+    if (!selectedPath) return null;
     const knownNode = flatNodes.find((node) => node.path === selectedPath);
-    if (knownNode) return knownNode;
+    if (knownNode) {
+      if (!parsedBody.valid) return knownNode;
+      const resolved = readJsonPath(parsedBody.value, selectedPath);
+      if (!resolved.exists) return knownNode;
+      return {
+        ...knownNode,
+        type: jsonValueType(resolved.value),
+        preview: knownNode.preview || jsonPreview(resolved.value),
+        length: knownNode.length ?? jsonLength(resolved.value),
+        value: resolved.value
+      } satisfies JsonPathNode;
+    }
+    if (!parsedBody.valid) return null;
     const resolved = readJsonPath(parsedBody.value, selectedPath);
     if (!resolved.exists) return null;
     return {
@@ -96,6 +111,11 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
     [flatNodes]
   );
   const treeData = useMemo<TreeProps["treeData"]>(() => tree.map(toTreeNode), [tree]);
+  const selectedBaselineRuleTypes = useMemo(() => (selectedNode ? baselineRuleTypesForNode(selectedNode) : []), [selectedNode]);
+  const selectedBaselineNewCount = useMemo(
+    () => (selectedNode ? selectedBaselineRuleTypes.filter((type) => !hasFieldAssertion(assertions, type, selectedNode.path)).length : 0),
+    [assertions, selectedBaselineRuleTypes, selectedNode]
+  );
 
   function commit(next: ApiAssertion[]) {
     onChange(serializeApiAssertions(next));
@@ -114,6 +134,17 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
     commit([...assertions, createApiAssertion(type, path || firstSelectablePath(flatNodes), seed)]);
   }
 
+  function addBaselineFieldAssertions(node: JsonPathNode) {
+    const next = [...assertions];
+    baselineRuleTypesForNode(node).forEach((type) => {
+      if (hasFieldAssertion(next, type, node.path)) return;
+      next.push(createApiAssertion(type, node.path, seedFromSelectedNode(type, node)));
+    });
+    if (next.length !== assertions.length) {
+      commit(next);
+    }
+  }
+
   async function inspect() {
     setInspecting(true);
     setError(null);
@@ -122,10 +153,15 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
       const result = await api.inspectApi(payload);
       setInspectResult(result);
       if (result.json_valid) {
-        const parsed = parseJsonValue(result.body);
-        if (parsed.valid) {
-          const nodes = flattenJsonPathTree(buildJsonPathTree(parsed.value));
-          setSelectedPath(firstSelectablePath(nodes));
+        const pathNodes = flattenJsonPathTree(buildJsonPathTreeFromOptions(result.json_paths));
+        if (pathNodes.length) {
+          setSelectedPath(firstSelectablePath(pathNodes));
+        } else {
+          const parsed = parseJsonValue(result.body);
+          if (parsed.valid) {
+            const nodes = flattenJsonPathTree(buildJsonPathTree(parsed.value));
+            setSelectedPath(firstSelectablePath(nodes));
+          }
         }
       } else {
         setSelectedPath("");
@@ -142,7 +178,12 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
       title: "启用",
       width: 70,
       render: (_, assertion) => (
-        <Switch size="small" checked={assertion.enabled} onChange={(enabled) => updateAssertion(assertion.id, { enabled })} />
+        <Switch
+          size="small"
+          aria-label={`${API_ASSERTION_LABELS[assertion.type]} 校验项启用状态`}
+          checked={assertion.enabled}
+          onChange={(enabled) => updateAssertion(assertion.id, { enabled })}
+        />
       )
     },
     {
@@ -255,6 +296,17 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
                 </div>
               </div>
               <Space wrap className="api-selected-actions">
+                <Tooltip title="生成字段存在、类型、非空和长度基础规则">
+                  <Button
+                    type="primary"
+                    size="small"
+                    icon={<CopyPlus size={14} />}
+                    disabled={selectedBaselineNewCount === 0}
+                    onClick={() => addBaselineFieldAssertions(selectedNode)}
+                  >
+                    一键生成基础规则
+                  </Button>
+                </Tooltip>
                 {SELECTED_FIELD_ACTIONS.map((item) => (
                   <Tooltip
                     key={item.type}
@@ -404,6 +456,21 @@ function toTreeNode(node: JsonPathNode): NonNullable<TreeProps["treeData"]>[numb
 
 function firstSelectablePath(nodes: JsonPathNode[]): string {
   return nodes.find((node) => node.path !== "$")?.path || nodes[0]?.path || "";
+}
+
+function baselineRuleTypesForNode(node: JsonPathNode): ApiAssertionType[] {
+  const types: ApiAssertionType[] = ["json_path_exists", "json_path_type"];
+  if (node.type !== "null") {
+    types.push("json_path_not_empty");
+  }
+  if (node.length !== null) {
+    types.push("json_path_length");
+  }
+  return types;
+}
+
+function hasFieldAssertion(assertions: ApiAssertion[], type: ApiAssertionType, path: string): boolean {
+  return assertions.some((assertion) => assertion.type === type && assertion.path === path);
 }
 
 function seedFromSelectedNode(type: ApiAssertionType, node: JsonPathNode | null): Partial<ApiAssertion> {

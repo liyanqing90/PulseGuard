@@ -7,6 +7,7 @@ from typing import Any
 
 from .context import RunContext, RunFailure
 from .ui_scan_script import UI_SCAN_SCRIPT
+from .variables import mask_data, mask_text, resolve_data, resolve_text
 from .viewport import browser_context_options, viewport_for_mode
 
 
@@ -26,17 +27,18 @@ UI_ASSERTION_TYPES = {
 SELECTOR_ASSERTION_TYPES = {"element_visible", "element_hidden", "element_not_empty", "element_count"}
 TEXT_ASSERTION_TYPES = {"text_present", "text_absent", "title_contains", "url_contains"}
 COUNT_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte"}
+SELECTOR_STABILITY_LEVELS = {"high", "medium", "low"}
 ASSERTION_WAIT_MIN_MS = 500
 ASSERTION_WAIT_MAX_MS = 1500
 
 
-async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any], ctx: RunContext | None = None, setup_func: Any | None = None) -> dict[str, Any]:
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
         raise RunFailure("Playwright 未安装，请先安装后再扫描页面") from exc
 
-    entry_url = str(payload.get("entry_url") or "").strip()
+    entry_url = resolve_text(payload.get("entry_url") or "", settings).strip()
     timeout_ms = int(payload.get("timeout_ms") or 15000)
     if not entry_url:
         raise ValueError("页面 URL 不能为空")
@@ -51,7 +53,7 @@ async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any]) -> 
             raise ValueError(f"不支持的浏览器类型：{browser_type_name}")
 
         launch_options: dict[str, Any] = {"headless": bool(settings.get("browser_headless", True))}
-        proxy_url = str(settings.get("browser_proxy") or "").strip()
+        proxy_url = resolve_text(settings.get("browser_proxy") or "", settings).strip()
         if proxy_url:
             launch_options["proxy"] = {"server": proxy_url}
 
@@ -61,18 +63,28 @@ async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any]) -> 
         context = await browser.new_context(**context_options)
         page = await context.new_page()
         page.set_default_timeout(timeout_ms)
-        await page.goto(entry_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        if setup_func is not None:
+            if ctx is None:
+                raise RunFailure("扫描前置脚本缺少运行上下文")
+            ctx.log("执行 UI 扫描前置脚本")
+            await setup_func(ctx, page)
+            if _page_is_closed(page):
+                raise RunFailure("前置脚本关闭了扫描页面")
+            ctx.log("UI 扫描前置脚本完成")
+
+        await _goto_ui_page(page, entry_url, timeout_ms, "页面扫描加载超时")
         await _prepare_full_page(page)
 
         candidates = await page.evaluate(UI_SCAN_SCRIPT)
         screenshot = await page.screenshot(type="jpeg", quality=72, full_page=True)
         return {
             "title": await page.title(),
-            "url": page.url,
+            "url": mask_text(page.url, settings),
             "viewport": candidates.get("viewport") or viewport,
             "page_size": candidates.get("page_size") or candidates.get("viewport") or viewport,
-            "candidates": candidates.get("candidates") or [],
+            "candidates": mask_data(candidates.get("candidates") or [], settings),
             "screenshot": f"data:image/jpeg;base64,{base64.b64encode(screenshot).decode('ascii')}",
+            "logs": mask_text("\n".join(ctx.logs), settings) if ctx else "",
         }
     finally:
         if context:
@@ -105,6 +117,7 @@ def normalize_ui_assertions(raw: str | None) -> list[dict[str, Any]]:
         }
         if assertion_type in SELECTOR_ASSERTION_TYPES:
             assertion["selector"] = _required_string(item.get("selector"), "选择器")
+            _copy_selector_metadata(assertion, item)
         if assertion_type in TEXT_ASSERTION_TYPES:
             assertion["expected_text"] = _required_string(item.get("expected_text"), "预期文本")
         if assertion_type == "element_count":
@@ -118,8 +131,110 @@ def has_enabled_ui_assertions(raw: str | None) -> bool:
     return any(assertion.get("enabled", True) for assertion in normalize_ui_assertions(raw))
 
 
+async def inspect_ui_selector_rules(raw: str | None, page: Any, settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    resolved_settings = settings or {}
+    assertions = [resolve_data(item, resolved_settings) for item in normalize_ui_assertions(raw)]
+    results: list[dict[str, Any]] = []
+    for assertion in assertions:
+        assertion_type = assertion["type"]
+        if assertion_type not in SELECTOR_ASSERTION_TYPES:
+            continue
+        result = {
+            "id": assertion["id"],
+            "type": assertion_type,
+            "selector": assertion["selector"],
+            "status": "ok",
+            "count": None,
+            "message": "",
+        }
+        if not assertion.get("enabled", True):
+            result.update({"status": "disabled", "message": "规则已停用，未检测"})
+            results.append(result)
+            continue
+        try:
+            count = int(await page.locator(assertion["selector"]).count())
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            lowered = message.lower()
+            status = "invalid_selector" if "selector" in lowered or "parse" in lowered or "unexpected" in lowered else "error"
+            result.update({"status": status, "message": f"selector 无法解析：{message}" if status == "invalid_selector" else f"检测失败：{message}"})
+            results.append(result)
+            continue
+
+        result["count"] = count
+        if count == 0:
+            result.update({"status": "missing", "message": "selector 当前未匹配到元素"})
+        elif assertion_type != "element_count" and count > 1:
+            result.update({"status": "multiple", "message": f"selector 当前匹配 {count} 个元素"})
+        else:
+            result["message"] = "selector 当前匹配正常"
+        results.append(result)
+    return results
+
+
+async def inspect_ui_rule_selectors(payload: dict[str, Any], settings: dict[str, Any], ctx: RunContext | None = None, setup_func: Any | None = None) -> dict[str, Any]:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RunFailure("Playwright 未安装，请先安装后再检测规则") from exc
+
+    entry_url = resolve_text(payload.get("entry_url") or "", settings).strip()
+    timeout_ms = int(payload.get("timeout_ms") or 15000)
+    if not entry_url:
+        raise ValueError("页面 URL 不能为空")
+
+    playwright = await async_playwright().start()
+    browser = None
+    context = None
+    try:
+        browser_type_name = str(settings.get("browser_type") or "chromium")
+        browser_type = getattr(playwright, browser_type_name, None)
+        if browser_type is None:
+            raise ValueError(f"不支持的浏览器类型：{browser_type_name}")
+
+        launch_options: dict[str, Any] = {"headless": bool(settings.get("browser_headless", True))}
+        proxy_url = resolve_text(settings.get("browser_proxy") or "", settings).strip()
+        if proxy_url:
+            launch_options["proxy"] = {"server": proxy_url}
+
+        browser = await browser_type.launch(**launch_options)
+        viewport = viewport_for_mode(payload.get("viewport_mode"), settings, payload.get("viewport_width"), payload.get("viewport_height"))
+        context_options = browser_context_options(payload.get("viewport_mode"), viewport)
+        context = await browser.new_context(**context_options)
+        page = await context.new_page()
+        page.set_default_timeout(timeout_ms)
+        if setup_func is not None:
+            if ctx is None:
+                raise RunFailure("规则检测前置脚本缺少运行上下文")
+            ctx.log("执行 UI 规则检测前置脚本")
+            await setup_func(ctx, page)
+            if _page_is_closed(page):
+                raise RunFailure("前置脚本关闭了规则检测页面")
+            ctx.log("UI 规则检测前置脚本完成")
+
+        await _goto_ui_page(page, entry_url, timeout_ms, "规则检测页面加载超时")
+        await _prepare_full_page(page)
+        results = await inspect_ui_selector_rules(payload.get("assertions_json"), page, settings)
+        return {
+            "title": await page.title(),
+            "url": mask_text(page.url, settings),
+            "results": mask_data(results, settings),
+            "logs": mask_text("\n".join(ctx.logs), settings) if ctx else "",
+        }
+    finally:
+        if context:
+            await context.close()
+        if browser:
+            await browser.close()
+        await playwright.stop()
+
+
 async def run_structured_ui_check(ctx: RunContext, setup_func: Any | None = None) -> None:
-    assertions = [item for item in normalize_ui_assertions(ctx.check.get("assertions_json")) if item.get("enabled", True)]
+    assertions = [
+        resolve_data(item, ctx.settings)
+        for item in normalize_ui_assertions(ctx.check.get("assertions_json"))
+        if item.get("enabled", True)
+    ]
     if not assertions:
         raise RunFailure("请至少启用一个 UI 校验项")
 
@@ -359,6 +474,23 @@ def _required_string(value: Any, label: str) -> str:
     if len(text) > 1000:
         raise ValueError(f"{label}过长")
     return text
+
+
+def _copy_selector_metadata(assertion: dict[str, Any], item: dict[str, Any]) -> None:
+    selector_type = str(item.get("selector_type") or "").strip()
+    selector_stability = str(item.get("selector_stability") or "").strip()
+    selector_score = item.get("selector_score")
+    if selector_type:
+        assertion["selector_type"] = selector_type[:80]
+    if selector_stability in SELECTOR_STABILITY_LEVELS:
+        assertion["selector_stability"] = selector_stability
+    if isinstance(selector_score, bool):
+        return
+    try:
+        score = float(selector_score)
+    except (TypeError, ValueError):
+        return
+    assertion["selector_score"] = int(score) if score.is_integer() else score
 
 
 def _bounded_int(value: Any, minimum: int, maximum: int, label: str) -> int:

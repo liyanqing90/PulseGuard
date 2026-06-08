@@ -1,8 +1,12 @@
-import { Alert, App, Button, Card, Empty, Form, Input, InputNumber, Popconfirm, Select, Skeleton, Space, Statistic, Switch, Tabs, Tag, Tooltip } from "antd";
+import { Alert, App, Button, Card, Drawer, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Skeleton, Space, Statistic, Switch, Tabs, Tag, Tooltip, Upload } from "antd";
+import type { UploadProps } from "antd";
 import {
   BellRing,
   CheckCircle2,
+  Clipboard,
   Database,
+  Download,
+  FileJson2,
   KeyRound,
   Monitor,
   Plus,
@@ -11,16 +15,29 @@ import {
   Send,
   ShieldCheck,
   Trash2,
+  UploadCloud,
   Zap
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api";
 import { StructuredViewer } from "../components/StructuredViewer";
-import type { AlertPreview, AlertPreviewChannel, NotificationChannel, SettingsValues, WebhookType } from "../types";
+import type {
+  AlertTagPolicy,
+  AlertPreview,
+  AlertPreviewChannel,
+  ConfigBundle,
+  ConfigExportFile,
+  ConfigImportPreview,
+  ConfigImportSummary,
+  EnvironmentVariable,
+  NotificationChannel,
+  SettingsValues,
+  WebhookType
+} from "../types";
 import { dirtyTagColor, enabledTagColor } from "../utils";
 
-type SettingsTab = "alerts" | "runtime" | "browser" | "retention";
+type SettingsTab = "alerts" | "runtime" | "browser" | "variables" | "retention" | "access" | "config";
 
 const CHANNEL_OPTIONS: Array<{ label: string; value: WebhookType }> = [
   { label: "飞书", value: "feishu" },
@@ -49,6 +66,19 @@ const CHANNEL_GUIDES: Record<WebhookType, { label: string; expectedHost: string;
   }
 };
 
+const VARIABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const CONFIG_SUMMARY_ITEMS: Array<{ key: keyof ConfigImportSummary; label: string }> = [
+  { key: "checks", label: "任务" },
+  { key: "ui_checks", label: "UI 任务" },
+  { key: "api_checks", label: "API 任务" },
+  { key: "settings", label: "设置项" },
+  { key: "conflicts", label: "冲突" },
+  { key: "notification_channels", label: "通知渠道" },
+  { key: "environment_variables", label: "环境变量" },
+  { key: "variables", label: "变量" }
+];
+
 export function SettingsPage() {
   const { message } = App.useApp();
   const [settings, setSettings] = useState<SettingsValues | null>(null);
@@ -60,6 +90,17 @@ export function SettingsPage() {
   const [alertPreview, setAlertPreview] = useState<AlertPreview | null>(null);
   const [newChannelType, setNewChannelType] = useState<WebhookType>("feishu");
   const [activeTab, setActiveTab] = useState<SettingsTab>("alerts");
+  const [exportingConfig, setExportingConfig] = useState(false);
+  const [importDrawerOpen, setImportDrawerOpen] = useState(false);
+  const [importBundle, setImportBundle] = useState<ConfigBundle | null>(null);
+  const [importFileName, setImportFileName] = useState("");
+  const [importPreview, setImportPreview] = useState<ConfigImportPreview | null>(null);
+  const [importPreviewing, setImportPreviewing] = useState(false);
+  const [importingConfig, setImportingConfig] = useState(false);
+  const [importConfirmOpen, setImportConfirmOpen] = useState(false);
+  const [readOnlyTokenDraft, setReadOnlyTokenDraft] = useState("");
+  const [savingReadOnlyToken, setSavingReadOnlyToken] = useState(false);
+  const [savingMaintenance, setSavingMaintenance] = useState(false);
 
   useEffect(() => {
     api
@@ -112,6 +153,71 @@ export function SettingsPage() {
     });
   }
 
+  function updateAlertTagPolicy(policyId: string, patch: Partial<AlertTagPolicy>) {
+    setAlertPreview(null);
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        alert_tag_policies: current.alert_tag_policies.map((policy) => (policy.id === policyId ? { ...policy, ...patch } : policy))
+      };
+    });
+  }
+
+  function addAlertTagPolicy() {
+    setAlertPreview(null);
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        alert_tag_policies: [...current.alert_tag_policies, createAlertTagPolicy(current)]
+      };
+    });
+  }
+
+  function removeAlertTagPolicy(policyId: string) {
+    setAlertPreview(null);
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        alert_tag_policies: current.alert_tag_policies.filter((policy) => policy.id !== policyId)
+      };
+    });
+  }
+
+  function updateEnvironmentVariable(variableId: string, patch: Partial<EnvironmentVariable>) {
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        environment_variables: current.environment_variables.map((variable) =>
+          variable.id === variableId ? { ...variable, ...patch } : variable
+        )
+      };
+    });
+  }
+
+  function addEnvironmentVariable() {
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        environment_variables: [...current.environment_variables, createEnvironmentVariable()]
+      };
+    });
+  }
+
+  function removeEnvironmentVariable(variableId: string) {
+    setSettings((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        environment_variables: current.environment_variables.filter((variable) => variable.id !== variableId)
+      };
+    });
+  }
+
   function buildPayload(scope: SettingsTab = activeTab): Partial<SettingsValues> {
     if (!settings) return {};
     if (scope === "alerts") {
@@ -120,6 +226,7 @@ export function SettingsPage() {
         alert_detail_base_url: settings.alert_detail_base_url.trim(),
         alert_cooldown_minutes: settings.alert_cooldown_minutes,
         recovery_notification: settings.recovery_notification,
+        alert_tag_policies: settings.alert_tag_policies.map(toPayloadAlertTagPolicy),
         notification_channels: settings.notification_channels.map(toPayloadChannel)
       };
     }
@@ -131,7 +238,10 @@ export function SettingsPage() {
         max_concurrency: settings.max_concurrency,
         max_ui_concurrency: settings.max_ui_concurrency,
         max_queue_size: settings.max_queue_size,
-        max_task_runtime_seconds: settings.max_task_runtime_seconds
+        max_task_runtime_seconds: settings.max_task_runtime_seconds,
+        local_runner_name: (settings.local_runner_name || "").trim(),
+        local_runner_address: (settings.local_runner_address || "").trim(),
+        local_runner_region: (settings.local_runner_region || "").trim()
       };
     }
     if (scope === "browser") {
@@ -140,6 +250,11 @@ export function SettingsPage() {
         browser_type: settings.browser_type,
         browser_proxy: settings.browser_proxy,
         browser_viewport: settings.browser_viewport
+      };
+    }
+    if (scope === "variables") {
+      return {
+        environment_variables: settings.environment_variables.map(toPayloadEnvironmentVariable)
       };
     }
     return {
@@ -163,6 +278,71 @@ export function SettingsPage() {
       message.error((err as Error).message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function saveReadOnlyToken() {
+    const nextToken = readOnlyTokenDraft.trim();
+    if (!nextToken) {
+      message.error("请输入新的只读访问令牌");
+      return;
+    }
+    setSavingReadOnlyToken(true);
+    try {
+      const values = await api.updateSettings({ read_only_token: nextToken });
+      setSettings(cloneSettings(values));
+      setSavedSettings(cloneSettings(values));
+      setReadOnlyTokenDraft("");
+      message.success("只读访问令牌已更新");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setSavingReadOnlyToken(false);
+    }
+  }
+
+  async function clearReadOnlyToken() {
+    setSavingReadOnlyToken(true);
+    try {
+      const values = await api.updateSettings({ read_only_token: "" });
+      setSettings(cloneSettings(values));
+      setSavedSettings(cloneSettings(values));
+      setReadOnlyTokenDraft("");
+      message.success("只读访问令牌已清空");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setSavingReadOnlyToken(false);
+    }
+  }
+
+  async function saveMaintenanceAnnouncement() {
+    if (!settings) return;
+    setSavingMaintenance(true);
+    try {
+      const values = await api.updateSettings({
+        maintenance_enabled: Boolean(settings.maintenance_enabled),
+        maintenance_title: (settings.maintenance_title || "").trim(),
+        maintenance_message: (settings.maintenance_message || "").trim(),
+        maintenance_starts_at: (settings.maintenance_starts_at || "").trim(),
+        maintenance_ends_at: (settings.maintenance_ends_at || "").trim()
+      });
+      setSettings(cloneSettings(values));
+      setSavedSettings(cloneSettings(values));
+      message.success("维护公告已保存");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setSavingMaintenance(false);
+    }
+  }
+
+  async function copyAccessValue(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      message.success("已复制地址");
+    } catch {
+      message.error("复制失败");
     }
   }
 
@@ -192,6 +372,90 @@ export function SettingsPage() {
     }
   }
 
+  async function exportConfig() {
+    setExportingConfig(true);
+    try {
+      const file = await api.exportConfig();
+      triggerConfigDownload(file);
+      message.success("已导出脱敏配置");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setExportingConfig(false);
+    }
+  }
+
+  async function loadImportFile(file: File) {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as unknown;
+      if (!isConfigBundle(parsed)) {
+        message.error("配置文件必须是 JSON 对象");
+        return;
+      }
+      setImportBundle(parsed);
+      setImportFileName(file.name);
+      setImportPreview(null);
+      setImportConfirmOpen(false);
+      message.success("已载入配置文件");
+    } catch {
+      setImportBundle(null);
+      setImportFileName("");
+      setImportPreview(null);
+      message.error("配置文件不是有效 JSON");
+    }
+  }
+
+  async function previewConfigImport() {
+    if (!importBundle) return;
+    setImportPreviewing(true);
+    try {
+      const preview = await api.previewConfigImport(importBundle);
+      setImportPreview(preview);
+      if (configImportPreviewAllowsApply(preview)) {
+        message.success("预检通过");
+      } else {
+        message.error("预检未通过");
+      }
+    } catch (err) {
+      setImportPreview(null);
+      message.error((err as Error).message);
+    } finally {
+      setImportPreviewing(false);
+    }
+  }
+
+  async function applyConfigImport() {
+    if (!importBundle || !importPreview || !configImportPreviewAllowsApply(importPreview) || hasUnsavedChanges) return;
+    setImportingConfig(true);
+    try {
+      const result = await api.importConfig(importBundle);
+      setImportConfirmOpen(false);
+      setImportDrawerOpen(false);
+      resetImportDraft();
+      try {
+        const values = await api.settings();
+        setSettings(cloneSettings(values));
+        setSavedSettings(cloneSettings(values));
+        setAlertPreview(null);
+        message.success(result.message || "配置已导入");
+      } catch (refreshErr) {
+        message.warning(`配置已导入，但刷新设置失败：${(refreshErr as Error).message}`);
+      }
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setImportingConfig(false);
+    }
+  }
+
+  function resetImportDraft() {
+    setImportBundle(null);
+    setImportFileName("");
+    setImportPreview(null);
+    setImportConfirmOpen(false);
+  }
+
   function resetDraft() {
     if (!savedSettings) return;
     setSettings(cloneSettings(savedSettings));
@@ -208,20 +472,33 @@ export function SettingsPage() {
   }
 
   const blockingError = firstBlockingError(settings.notification_channels);
+  const alertTagPolicyError = firstAlertTagPolicyError(settings.alert_tag_policies);
+  const variableBlockingError = firstVariableBlockingError(settings.environment_variables);
   const readyChannels = readyNotificationChannels(settings.notification_channels);
   const hasUnsavedChanges = Boolean(savedSettings && settingsChanged(settings, savedSettings));
-  const activeTabChanged = Boolean(savedSettings && settingsTabChanged(settings, savedSettings, activeTab));
+  const settingsTabCanSave = activeTab !== "config" && activeTab !== "access";
+  const activeTabChanged = Boolean(savedSettings && settingsTabCanSave && settingsTabChanged(settings, savedSettings, activeTab));
   const alertSettingsChanged = Boolean(savedSettings && settingsTabChanged(settings, savedSettings, "alerts"));
-  const activeTabBlockingError = activeTab === "alerts" ? blockingError : "";
+  const activeTabBlockingError = activeTab === "alerts" ? blockingError || alertTagPolicyError : activeTab === "variables" ? variableBlockingError : "";
   const saveDisabledReason = activeTabBlockingError || (!activeTabChanged ? "当前页没有需要保存的更改" : "");
   const testDisabledReason =
     blockingError || (readyChannels.length === 0 ? "至少配置一个启用且填写 URL 的通知渠道后再发送测试" : "");
   const previewDisabledReason = settings.notification_channels.length === 0 ? "先添加通知渠道后再预检" : blockingError;
   const enabledChannelCount = settings.notification_channels.filter((channel) => channel.enabled).length;
+  const importApplyDisabledReason = configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
+  const importUploadProps: UploadProps = {
+    accept: "application/json,.json",
+    maxCount: 1,
+    showUploadList: false,
+    beforeUpload: (file) => {
+      void loadImportFile(file as File);
+      return Upload.LIST_IGNORE;
+    }
+  };
 
   return (
     <div className="page-content settings-page">
-      <section className="settings-hero">
+      <section className="settings-command-bar">
         <div>
           <div className="settings-title-row">
             <h2>运行与告警控制台</h2>
@@ -237,7 +514,7 @@ export function SettingsPage() {
           {activeTab === "alerts" && (
             <TestAlertButton loading={testing} disabledReason={testDisabledReason} usesDraft={alertSettingsChanged} onClick={testAlert} />
           )}
-          <SaveSettingsButton loading={saving} disabledReason={saveDisabledReason} onClick={() => save()} />
+          {settingsTabCanSave && <SaveSettingsButton loading={saving} disabledReason={saveDisabledReason} onClick={() => save()} />}
         </Space>
       </section>
 
@@ -263,12 +540,16 @@ export function SettingsPage() {
       <Tabs
         activeKey={activeTab}
         className="settings-tabs"
+        moreIcon={<span className="settings-tabs-more">更多</span>}
         onChange={(key) => setActiveTab(key as SettingsTab)}
         items={[
           { key: "alerts", label: "告警通知" },
           { key: "runtime", label: "执行参数" },
           { key: "browser", label: "浏览器" },
-          { key: "retention", label: "数据保留" }
+          { key: "variables", label: "变量占位符" },
+          { key: "retention", label: "数据保留" },
+          { key: "access", label: "访问出口" },
+          { key: "config", label: "配置迁移" }
         ]}
       />
 
@@ -278,10 +559,10 @@ export function SettingsPage() {
         <SettingsPanel title="公共告警策略" icon={<BellRing size={18} />} accent className="settings-panel-wide">
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <Form.Item label="启用告警">
-              <Switch checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
+              <Switch aria-label="启用告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
             </Form.Item>
             <Form.Item label="恢复通知">
-              <Switch checked={settings.recovery_notification} onChange={(value) => update("recovery_notification", value)} />
+              <Switch aria-label="恢复通知" checked={settings.recovery_notification} onChange={(value) => update("recovery_notification", value)} />
             </Form.Item>
             <NumberItem
               label="失败冷却时间"
@@ -307,6 +588,31 @@ export function SettingsPage() {
               </div>
             </Form.Item>
           </Form>
+        </SettingsPanel>
+
+        <SettingsPanel title="标签告警策略" icon={<BellRing size={18} />} className="settings-panel-wide">
+          <div className="channel-toolbar">
+            <Button icon={<Plus size={16} />} onClick={addAlertTagPolicy}>
+              添加标签策略
+            </Button>
+          </div>
+          {settings.alert_tag_policies.length === 0 ? (
+            <Empty description="暂无标签告警策略" />
+          ) : (
+            <div className="notification-channel-list">
+              {settings.alert_tag_policies.map((policy, index) => (
+                <AlertTagPolicyEditor
+                  key={policy.id}
+                  policy={policy}
+                  index={index}
+                  channels={settings.notification_channels}
+                  policies={settings.alert_tag_policies}
+                  onPatch={(patch) => updateAlertTagPolicy(policy.id, patch)}
+                  onRemove={() => removeAlertTagPolicy(policy.id)}
+                />
+              ))}
+            </div>
+          )}
         </SettingsPanel>
 
         <SettingsPanel title="通知渠道" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
@@ -360,6 +666,33 @@ export function SettingsPage() {
             <NumberItem label="默认 UI 超时" value={settings.default_ui_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_ui_timeout_ms", value)} />
             <NumberItem label="默认 API 超时" value={settings.default_api_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_api_timeout_ms", value)} />
             <NumberItem label="单任务最大运行时长" value={settings.max_task_runtime_seconds} min={1} max={600} suffix="秒" onChange={(value) => update("max_task_runtime_seconds", value)} />
+            <Form.Item label="Runner 名称">
+              <Input
+                name="local-runner-name"
+                value={settings.local_runner_name || ""}
+                onChange={(event) => update("local_runner_name", event.target.value)}
+                placeholder="local"
+                autoComplete="off"
+              />
+            </Form.Item>
+            <Form.Item label="Runner 地址">
+              <Input
+                name="local-runner-address"
+                value={settings.local_runner_address || ""}
+                onChange={(event) => update("local_runner_address", event.target.value)}
+                placeholder="127.0.0.1"
+                autoComplete="off"
+              />
+            </Form.Item>
+            <Form.Item label="Runner 网络区域">
+              <Input
+                name="local-runner-region"
+                value={settings.local_runner_region || ""}
+                onChange={(event) => update("local_runner_region", event.target.value)}
+                placeholder="local"
+                autoComplete="off"
+              />
+            </Form.Item>
           </Form>
         </SettingsPanel>
         )}
@@ -368,7 +701,7 @@ export function SettingsPage() {
         <SettingsPanel title="浏览器设置" icon={<Monitor size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <Form.Item label="Headless">
-              <Switch checked={settings.browser_headless} onChange={(value) => update("browser_headless", value)} />
+              <Switch aria-label="浏览器 Headless 模式" checked={settings.browser_headless} onChange={(value) => update("browser_headless", value)} />
             </Form.Item>
             <Form.Item label="浏览器类型">
               <Select
@@ -403,6 +736,32 @@ export function SettingsPage() {
         </SettingsPanel>
         )}
 
+        {activeTab === "variables" && (
+        <SettingsPanel title="环境变量" icon={<KeyRound size={18} />} className="settings-panel-wide">
+          <div className="variable-toolbar">
+            <Button icon={<Plus size={16} />} onClick={addEnvironmentVariable}>
+              添加变量
+            </Button>
+          </div>
+          {settings.environment_variables.length === 0 ? (
+            <Empty description="暂无环境变量" />
+          ) : (
+            <div className="environment-variable-list">
+              {settings.environment_variables.map((variable, index) => (
+                <EnvironmentVariableEditor
+                  key={variable.id}
+                  variable={variable}
+                  variables={settings.environment_variables}
+                  index={index}
+                  onPatch={(patch) => updateEnvironmentVariable(variable.id, patch)}
+                  onRemove={() => removeEnvironmentVariable(variable.id)}
+                />
+              ))}
+            </div>
+          )}
+        </SettingsPanel>
+        )}
+
         {activeTab === "retention" && (
         <SettingsPanel title="数据保留" icon={<Database size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
@@ -413,8 +772,476 @@ export function SettingsPage() {
           </Form>
         </SettingsPanel>
         )}
+
+        {activeTab === "access" && (
+          <>
+            <SettingsPanel title="只读访问令牌" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
+              <Form layout="vertical" className="settings-form-grid" autoComplete="off">
+                <Form.Item label="令牌状态">
+                  <Tag color={settings.read_only_token_set ? "success" : "default"}>
+                    {settings.read_only_token_set ? "已配置" : "未配置"}
+                  </Tag>
+                </Form.Item>
+                <Form.Item label="新令牌">
+                  <Input.Password
+                    value={readOnlyTokenDraft}
+                    placeholder="输入新令牌，保存后不会回显明文"
+                    onChange={(event) => setReadOnlyTokenDraft(event.target.value)}
+                  />
+                </Form.Item>
+              </Form>
+              <Space wrap>
+                <Button
+                  icon={<Save size={16} />}
+                  loading={savingReadOnlyToken}
+                  disabled={!readOnlyTokenDraft.trim()}
+                  onClick={saveReadOnlyToken}
+                >
+                  保存新令牌
+                </Button>
+                <Popconfirm
+                  title="清空只读访问令牌"
+                  description="清空后只读快照接口会拒绝访问。"
+                  okText="清空"
+                  cancelText="取消"
+                  onConfirm={clearReadOnlyToken}
+                >
+                  <Button danger icon={<Trash2 size={16} />} loading={savingReadOnlyToken} disabled={!settings.read_only_token_set}>
+                    清空令牌
+                  </Button>
+                </Popconfirm>
+                <Button icon={<Clipboard size={16} />} onClick={() => copyAccessValue("/api/read-only/snapshot")}>
+                  复制快照地址
+                </Button>
+                <Button icon={<Clipboard size={16} />} onClick={() => copyAccessValue("/api/metrics")}>
+                  复制指标地址
+                </Button>
+                <Button icon={<Clipboard size={16} />} onClick={() => copyAccessValue("/api/status-page")}>
+                  复制状态页接口
+                </Button>
+              </Space>
+            </SettingsPanel>
+
+            <SettingsPanel title="维护公告" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
+              <Form layout="vertical" className="settings-form-grid" autoComplete="off">
+                <Form.Item label="启用公告">
+                  <Switch aria-label="启用维护公告" checked={Boolean(settings.maintenance_enabled)} onChange={(value) => update("maintenance_enabled", value)} />
+                </Form.Item>
+                <Form.Item label="标题">
+                  <Input value={settings.maintenance_title || ""} onChange={(event) => update("maintenance_title", event.target.value)} />
+                </Form.Item>
+                <Form.Item label="开始时间">
+                  <Input value={settings.maintenance_starts_at || ""} onChange={(event) => update("maintenance_starts_at", event.target.value)} placeholder="2026-06-08T22:00:00+08:00" />
+                </Form.Item>
+                <Form.Item label="结束时间">
+                  <Input value={settings.maintenance_ends_at || ""} onChange={(event) => update("maintenance_ends_at", event.target.value)} placeholder="2026-06-08T23:00:00+08:00" />
+                </Form.Item>
+                <Form.Item label="公告内容" className="span-2">
+                  <Input.TextArea
+                    value={settings.maintenance_message || ""}
+                    rows={4}
+                    onChange={(event) => update("maintenance_message", event.target.value)}
+                  />
+                </Form.Item>
+              </Form>
+              <Button icon={<Save size={16} />} loading={savingMaintenance} onClick={saveMaintenanceAnnouncement}>
+                保存维护公告
+              </Button>
+            </SettingsPanel>
+          </>
+        )}
+
+        {activeTab === "config" && (
+        <ConfigTransferPanel
+          exporting={exportingConfig}
+          uploadProps={importUploadProps}
+          drawerOpen={importDrawerOpen}
+          fileName={importFileName}
+          hasImportBundle={Boolean(importBundle)}
+          preview={importPreview}
+          previewing={importPreviewing}
+          importing={importingConfig}
+          applyDisabledReason={importApplyDisabledReason}
+          hasUnsavedChanges={hasUnsavedChanges}
+          onExport={exportConfig}
+          onOpenImport={() => setImportDrawerOpen(true)}
+          onCloseImport={() => setImportDrawerOpen(false)}
+          onResetImport={resetImportDraft}
+          onPreviewImport={previewConfigImport}
+          onRequestApply={() => setImportConfirmOpen(true)}
+        />
+        )}
       </section>
+
+      <Modal
+        title="应用导入"
+        open={importConfirmOpen}
+        okText="应用导入"
+        cancelText="取消"
+        okButtonProps={{ danger: true, disabled: Boolean(importApplyDisabledReason) }}
+        confirmLoading={importingConfig}
+        onOk={applyConfigImport}
+        onCancel={() => setImportConfirmOpen(false)}
+      >
+        <div className="config-import-confirm">
+          <Alert type="warning" message="导入会应用预检范围内的配置" showIcon />
+          {importFileName && (
+            <div className="config-import-file">
+              <span>文件</span>
+              <strong>{importFileName}</strong>
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
+  );
+}
+
+function ConfigTransferPanel({
+  exporting,
+  uploadProps,
+  drawerOpen,
+  fileName,
+  hasImportBundle,
+  preview,
+  previewing,
+  importing,
+  applyDisabledReason,
+  hasUnsavedChanges,
+  onExport,
+  onOpenImport,
+  onCloseImport,
+  onResetImport,
+  onPreviewImport,
+  onRequestApply
+}: {
+  exporting: boolean;
+  uploadProps: UploadProps;
+  drawerOpen: boolean;
+  fileName: string;
+  hasImportBundle: boolean;
+  preview: ConfigImportPreview | null;
+  previewing: boolean;
+  importing: boolean;
+  applyDisabledReason: string;
+  hasUnsavedChanges: boolean;
+  onExport: () => void;
+  onOpenImport: () => void;
+  onCloseImport: () => void;
+  onResetImport: () => void;
+  onPreviewImport: () => void;
+  onRequestApply: () => void;
+}) {
+  const canResetImport = hasImportBundle || Boolean(preview);
+
+  return (
+    <SettingsPanel title="配置导入导出" icon={<FileJson2 size={18} />} className="settings-panel-wide">
+      <div className="config-transfer-grid">
+        <section className="config-transfer-block">
+          <div className="config-transfer-heading">
+            <strong>导出配置</strong>
+            <Tag color="blue">默认脱敏</Tag>
+          </div>
+          <span className="config-transfer-meta">任务、告警、运行参数、浏览器和保留策略</span>
+          <Button icon={<Download size={16} />} loading={exporting} onClick={onExport}>
+            导出 JSON
+          </Button>
+        </section>
+
+        <section className="config-transfer-block">
+          <div className="config-transfer-heading">
+            <strong>导入配置</strong>
+            <Tag color={preview ? (configImportPreviewAllowsApply(preview) ? "success" : "error") : "default"}>
+              {preview ? (configImportPreviewAllowsApply(preview) ? "预检通过" : "预检未通过") : "未预检"}
+            </Tag>
+          </div>
+          <span className="config-transfer-meta">选择 JSON 后先预检，预检通过后应用导入</span>
+          <Button icon={<UploadCloud size={16} />} onClick={onOpenImport}>
+            导入 JSON
+          </Button>
+        </section>
+      </div>
+
+      <Drawer
+        title="导入配置"
+        open={drawerOpen}
+        width={720}
+        destroyOnClose={false}
+        closable={!importing}
+        maskClosable={!importing}
+        onClose={onCloseImport}
+        extra={
+          <Button icon={<RotateCcw size={15} />} disabled={!canResetImport || importing} onClick={onResetImport}>
+            清空
+          </Button>
+        }
+        footer={
+          <Space className="drawer-footer-actions" wrap>
+            <Button disabled={importing} onClick={onCloseImport}>
+              关闭
+            </Button>
+            <Tooltip title={applyDisabledReason || "应用预检通过的配置"}>
+              <span className="tooltip-button-wrapper">
+                <Button
+                  type="primary"
+                  danger
+                  icon={<CheckCircle2 size={16} />}
+                  disabled={Boolean(applyDisabledReason)}
+                  loading={importing}
+                  onClick={onRequestApply}
+                >
+                  应用导入
+                </Button>
+              </span>
+            </Tooltip>
+          </Space>
+        }
+      >
+        <div className="config-import-flow">
+          {hasUnsavedChanges && (
+            <Alert type="warning" message="当前存在未保存设置草稿，应用导入前需要保存或撤销。" showIcon />
+          )}
+
+          <Upload.Dragger {...uploadProps} className="config-upload">
+            <p className="config-upload-icon">
+              <UploadCloud size={28} />
+            </p>
+            <p className="ant-upload-text">选择配置 JSON</p>
+            <p className="ant-upload-hint">{fileName ? `已选择：${fileName}` : "预检前不会写入配置"}</p>
+          </Upload.Dragger>
+
+          <div className="config-import-actions">
+            {hasImportBundle && <Tag color="processing">{fileName || "已载入配置"}</Tag>}
+            <Button icon={<ShieldCheck size={16} />} loading={previewing} disabled={!hasImportBundle || importing} onClick={onPreviewImport}>
+              预检导入
+            </Button>
+          </div>
+
+          {preview && <ConfigImportPreviewResult preview={preview} />}
+        </div>
+      </Drawer>
+    </SettingsPanel>
+  );
+}
+
+function ConfigImportPreviewResult({ preview }: { preview: ConfigImportPreview }) {
+  const errors = configImportIssueMessages(preview, "error");
+  const warnings = configImportIssueMessages(preview, "warning");
+  const summaryItems = configImportSummaryItems(preview);
+  const canApply = configImportPreviewAllowsApply(preview);
+
+  return (
+    <section className="config-preview-result">
+      <Alert type={canApply ? "success" : "error"} message={canApply ? "预检通过" : "预检未通过"} showIcon />
+
+      {summaryItems.length > 0 && (
+        <div className="config-preview-summary">
+          {summaryItems.map((item) => (
+            <div key={item.label} className="config-preview-summary-item">
+              <small>{item.label}</small>
+              <strong>{item.value}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {errors.length > 0 && <ConfigImportIssueList title="错误" tone="error" messages={errors} />}
+      {warnings.length > 0 && <ConfigImportIssueList title="警告" tone="warning" messages={warnings} />}
+    </section>
+  );
+}
+
+function ConfigImportIssueList({ title, tone, messages }: { title: string; tone: "error" | "warning"; messages: string[] }) {
+  return (
+    <section className={`config-import-issues config-import-issues-${tone}`}>
+      <strong>{title}</strong>
+      <ul>
+        {messages.map((item, index) => (
+          <li key={`${tone}-${index}`}>{item}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function EnvironmentVariableEditor({
+  variable,
+  variables,
+  index,
+  onPatch,
+  onRemove
+}: {
+  variable: EnvironmentVariable;
+  variables: EnvironmentVariable[];
+  index: number;
+  onPatch: (patch: Partial<EnvironmentVariable>) => void;
+  onRemove: () => void;
+}) {
+  const nameError = environmentVariableNameError(variable, variables);
+  const status = environmentVariableValueStatus(variable);
+  const displayName = variable.name.trim() || `变量 ${index + 1}`;
+  const canClearSavedSecret = variable.secret && Boolean(variable.value_set) && !variable.value_clear;
+
+  return (
+    <section className={`environment-variable-card ${status.color === "success" ? "environment-variable-ready" : ""}`}>
+      <div className="environment-variable-header">
+        <div className="environment-variable-title">
+          <strong>{displayName}</strong>
+          <span>{variable.name.trim() ? `\${${variable.name.trim()}}` : "等待填写变量名"}</span>
+        </div>
+        <Space size={8} wrap>
+          <Tag color={variable.secret ? "processing" : "default"}>{variable.secret ? "密钥" : "明文"}</Tag>
+          <Tag color={status.color}>{status.label}</Tag>
+          <Popconfirm title="删除环境变量" description="删除后保存设置才会生效。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={onRemove}>
+            <Tooltip title="删除变量">
+              <Button danger aria-label="删除环境变量" icon={<Trash2 size={15} />} />
+            </Tooltip>
+          </Popconfirm>
+        </Space>
+      </div>
+
+      <Form layout="vertical" className="environment-variable-grid" autoComplete="off">
+        <Form.Item label="变量名" validateStatus={nameError ? "error" : undefined} help={nameError || "使用 NAME 或 SERVICE_TOKEN 格式"}>
+          <Input
+            name={`environment-variable-name-${variable.id}`}
+            value={variable.name}
+            onChange={(event) => onPatch({ name: event.target.value })}
+            placeholder="SERVICE_TOKEN"
+            autoComplete="off"
+            status={nameError ? "error" : undefined}
+          />
+        </Form.Item>
+        <Form.Item label="密钥变量">
+          <Switch
+            aria-label={`${displayName} 是否作为密钥变量`}
+            checked={variable.secret}
+            onChange={(secret) => onPatch({ secret, value_clear: secret ? variable.value_clear : false })}
+          />
+        </Form.Item>
+        <Form.Item
+          label={
+            <Space size={8}>
+              <span>变量值</span>
+              {variable.secret && variable.value_set && !variable.value && !variable.value_clear && <Tag color="success">已配置</Tag>}
+              {variable.secret && variable.value && <Tag color="processing">{variable.value_set ? "待替换" : "待保存"}</Tag>}
+              {variable.value_clear && <Tag color="warning">待清空</Tag>}
+            </Space>
+          }
+          className="span-2"
+          help={environmentVariableValueHelp(variable)}
+        >
+          <Space.Compact className="environment-variable-value-row">
+            {variable.secret ? (
+              <Input.Password
+                name={`environment-variable-value-${variable.id}`}
+                value={variable.value}
+                onChange={(event) => onPatch({ value: event.target.value, value_clear: false })}
+                placeholder={variable.value_set ? "输入新值可替换已保存密钥" : "输入变量值"}
+                autoComplete="new-password"
+                prefix={<KeyRound size={15} />}
+              />
+            ) : (
+              <Input
+                name={`environment-variable-value-${variable.id}`}
+                value={variable.value}
+                onChange={(event) => onPatch({ value: event.target.value, value_clear: false })}
+                placeholder="变量值"
+                autoComplete="off"
+              />
+            )}
+            {canClearSavedSecret && (
+              <Popconfirm
+                title="清空已保存密钥"
+                description="保存设置后，该变量的已保存密钥值会被清空。"
+                okText="清空"
+                cancelText="取消"
+                okButtonProps={{ danger: true }}
+                onConfirm={() => onPatch({ value: "", value_clear: true })}
+              >
+                <Tooltip title="清空已保存密钥">
+                  <Button danger aria-label="清空已保存密钥" icon={<Trash2 size={15} />} />
+                </Tooltip>
+              </Popconfirm>
+            )}
+            {variable.value_clear && (
+              <Tooltip title="撤销清空密钥">
+                <Button aria-label="撤销清空密钥" icon={<RotateCcw size={15} />} onClick={() => onPatch({ value_clear: false })} />
+              </Tooltip>
+            )}
+          </Space.Compact>
+        </Form.Item>
+      </Form>
+    </section>
+  );
+}
+
+function AlertTagPolicyEditor({
+  policy,
+  index,
+  channels,
+  policies,
+  onPatch,
+  onRemove
+}: {
+  policy: AlertTagPolicy;
+  index: number;
+  channels: NotificationChannel[];
+  policies: AlertTagPolicy[];
+  onPatch: (patch: Partial<AlertTagPolicy>) => void;
+  onRemove: () => void;
+}) {
+  const tagError = alertTagPolicyTagError(policy, policies);
+  return (
+    <section className={`notification-channel-card ${policy.enabled && !tagError ? "notification-channel-ready" : ""}`}>
+      <div className="notification-channel-header">
+        <div className="notification-channel-title">
+          <strong>{policy.name.trim() || `标签策略 ${index + 1}`}</strong>
+          <span>{policy.enabled ? (tagError || "匹配标签后覆盖全局告警策略") : "已停用"}</span>
+        </div>
+        <Space size={8}>
+          <Tag color={policy.enabled && !tagError ? "success" : "default"}>{policy.enabled ? "启用" : "停用"}</Tag>
+          <Switch aria-label="标签告警策略启用状态" checked={policy.enabled} onChange={(enabled) => onPatch({ enabled })} />
+          <Popconfirm title="删除标签策略？" okText="删除" cancelText="取消" onConfirm={onRemove}>
+            <Button icon={<Trash2 size={16} />} danger />
+          </Popconfirm>
+        </Space>
+      </div>
+      <Form layout="vertical" className="notification-channel-grid" autoComplete="off">
+        <Form.Item label="策略名称">
+          <Input value={policy.name} onChange={(event) => onPatch({ name: event.target.value })} autoComplete="off" />
+        </Form.Item>
+        <Form.Item label="匹配标签" required validateStatus={tagError ? "error" : undefined} help={tagError || undefined}>
+          <Input value={policy.tag} onChange={(event) => onPatch({ tag: event.target.value })} autoComplete="off" />
+        </Form.Item>
+        <Form.Item label="通知渠道" className="span-2">
+          <Select
+            mode="multiple"
+            value={policy.notification_channel_ids || []}
+            onChange={(value) => onPatch({ notification_channel_ids: value })}
+            options={channels.map((channel) => ({
+              label: channel.name || channelTypeLabel(channel.type),
+              value: channel.id,
+              disabled: !channel.enabled
+            }))}
+          />
+        </Form.Item>
+        <NumberItem
+          label="失败冷却时间"
+          value={policy.alert_cooldown_minutes ?? 30}
+          min={1}
+          max={1440}
+          suffix="分钟"
+          onChange={(value) => onPatch({ alert_cooldown_minutes: value })}
+        />
+        <Form.Item label="恢复通知">
+          <Switch
+            aria-label="标签恢复通知"
+            checked={policy.recovery_notification ?? true}
+            onChange={(recovery_notification) => onPatch({ recovery_notification })}
+          />
+        </Form.Item>
+      </Form>
+    </section>
   );
 }
 
@@ -448,7 +1275,7 @@ function NotificationChannelEditor({
     <section className={`notification-channel-card ${ready ? "notification-channel-ready" : ""}`}>
       <div className="notification-channel-header">
         <div className="notification-channel-title">
-          <Switch checked={channel.enabled} onChange={(value) => onPatch({ enabled: value })} />
+          <Switch aria-label={`${channel.name.trim() || CHANNEL_GUIDES[channel.type].label} 渠道启用状态`} checked={channel.enabled} onChange={(value) => onPatch({ enabled: value })} />
           <div>
             <strong>{channel.name.trim() || `${guide.label}渠道 ${index + 1}`}</strong>
             <span>{channel.enabled ? channelStatusText(channel, ready) : "已停用"}</span>
@@ -458,7 +1285,7 @@ function NotificationChannelEditor({
           <Tag color={ready ? "success" : channel.enabled ? "warning" : "default"}>{ready ? "可发送" : channel.enabled ? "待配置" : "停用"}</Tag>
           <Popconfirm title="删除通知渠道" description="删除后保存设置才会生效。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={onRemove}>
             <Tooltip title="删除渠道">
-              <Button danger icon={<Trash2 size={15} />} />
+              <Button danger aria-label="删除通知渠道" icon={<Trash2 size={15} />} />
             </Tooltip>
           </Popconfirm>
         </Space>
@@ -478,13 +1305,13 @@ function NotificationChannelEditor({
           <Select value={channel.type} onChange={(value) => changeType(value)} options={CHANNEL_OPTIONS} />
         </Form.Item>
         <Form.Item label="Webhook URL" className="span-2" validateStatus={urlError ? "error" : hostHint ? "warning" : undefined} help={urlError || hostHint || guide.webhookHint}>
-          <Input
+          <Input.Password
             name={`notification-channel-webhook-${channel.id}`}
             value={channel.webhook_url}
             onChange={(event) => onPatch({ webhook_url: event.target.value })}
             placeholder="https://…"
             status={urlError ? "error" : hostHint ? "warning" : undefined}
-            autoComplete="off"
+            autoComplete="new-password"
           />
         </Form.Item>
         {channel.type === "dingtalk" && (
@@ -519,13 +1346,13 @@ function NotificationChannelEditor({
                   onConfirm={() => onPatch({ dingtalk_secret: "", dingtalk_secret_set: false, dingtalk_secret_clear: true })}
                 >
                   <Tooltip title="清除已保存密钥">
-                    <Button danger icon={<Trash2 size={15} />} />
+                    <Button danger aria-label="清除已保存密钥" icon={<Trash2 size={15} />} />
                   </Tooltip>
                 </Popconfirm>
               )}
               {channel.dingtalk_secret_clear && (
                 <Tooltip title="撤销清除密钥">
-                  <Button icon={<RotateCcw size={15} />} onClick={() => onPatch({ dingtalk_secret_clear: false, dingtalk_secret_set: true })} />
+                  <Button aria-label="撤销清除密钥" icon={<RotateCcw size={15} />} onClick={() => onPatch({ dingtalk_secret_clear: false, dingtalk_secret_set: true })} />
                 </Tooltip>
               )}
             </Space.Compact>
@@ -705,6 +1532,90 @@ function NumberItem({
   );
 }
 
+function triggerConfigDownload(file: ConfigExportFile) {
+  const url = URL.createObjectURL(file.blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = safeDownloadFilename(file.filename);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function safeDownloadFilename(filename: string): string {
+  const safe = filename.trim().replace(/[\\/:*?"<>|]+/g, "-");
+  return safe || "pulseguard-config.json";
+}
+
+function isConfigBundle(value: unknown): value is ConfigBundle {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function configImportApplyDisabledReason(
+  bundle: ConfigBundle | null,
+  preview: ConfigImportPreview | null,
+  hasUnsavedChanges: boolean
+): string {
+  if (!bundle) return "先选择配置 JSON";
+  if (!preview) return "先完成导入预检";
+  if (!configImportPreviewAllowsApply(preview)) return "预检未通过，不能应用导入";
+  if (hasUnsavedChanges) return "先保存或撤销当前设置草稿";
+  return "";
+}
+
+function configImportPreviewAllowsApply(preview: ConfigImportPreview): boolean {
+  return preview.valid !== false && preview.ok !== false && configImportIssueMessages(preview, "error").length === 0;
+}
+
+function configImportIssueMessages(preview: ConfigImportPreview, severity: "error" | "warning"): string[] {
+  const direct = issueMessagesFromUnknown(severity === "error" ? preview.errors : preview.warnings);
+  const fromIssues = Array.isArray(preview.issues)
+    ? preview.issues
+        .filter((item) => configIssueMatchesSeverity(item, severity))
+        .map(configIssueMessage)
+        .filter(Boolean)
+    : [];
+  return Array.from(new Set([...direct, ...fromIssues])).slice(0, 20);
+}
+
+function configIssueMatchesSeverity(issue: unknown, severity: "error" | "warning"): boolean {
+  if (typeof issue === "string") return severity === "error";
+  if (!issue || typeof issue !== "object") return severity === "error";
+  const issueSeverity = "severity" in issue && typeof issue.severity === "string" ? issue.severity : "";
+  if (severity === "warning") return issueSeverity === "warning";
+  return !issueSeverity || issueSeverity === "error";
+}
+
+function issueMessagesFromUnknown(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(configIssueMessage).filter(Boolean);
+}
+
+function configIssueMessage(issue: unknown): string {
+  if (typeof issue === "string") return issue.trim();
+  if (!issue || typeof issue !== "object" || !("message" in issue)) return "";
+  return typeof issue.message === "string" ? issue.message.trim() : "";
+}
+
+function configImportSummaryItems(preview: ConfigImportPreview): Array<{ label: string; value: string }> {
+  const summary = configSummarySource(preview);
+  if (!summary) return [];
+  return CONFIG_SUMMARY_ITEMS.map((item) => {
+    const value = summary[item.key];
+    if (typeof value !== "number" && typeof value !== "string") return null;
+    return { label: item.label, value: String(value) };
+  }).filter((item): item is { label: string; value: string } => Boolean(item));
+}
+
+function configSummarySource(preview: ConfigImportPreview): ConfigImportSummary | null {
+  const summary = preview.summary && typeof preview.summary === "object" ? preview.summary : {};
+  const counts = preview.counts && typeof preview.counts === "object" ? preview.counts : {};
+  const merged = { ...summary, ...counts };
+  if (Object.keys(merged).length > 0) return merged;
+  return null;
+}
+
 function createChannel(type: WebhookType): NotificationChannel {
   return {
     id: `channel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -713,6 +1624,41 @@ function createChannel(type: WebhookType): NotificationChannel {
     enabled: true,
     webhook_url: "",
     dingtalk_secret: ""
+  };
+}
+
+function createAlertTagPolicy(settings: SettingsValues): AlertTagPolicy {
+  return {
+    id: `tag-policy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: "",
+    tag: "",
+    enabled: true,
+    alert_cooldown_minutes: settings.alert_cooldown_minutes,
+    recovery_notification: settings.recovery_notification,
+    notification_channel_ids: settings.notification_channels.filter((channel) => channel.enabled).map((channel) => channel.id)
+  };
+}
+
+function createEnvironmentVariable(): EnvironmentVariable {
+  return {
+    id: `variable-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: "",
+    value: "",
+    secret: false,
+    value_set: false,
+    value_clear: false
+  };
+}
+
+function toPayloadAlertTagPolicy(policy: AlertTagPolicy): AlertTagPolicy {
+  return {
+    id: policy.id,
+    name: policy.name.trim(),
+    tag: policy.tag.trim(),
+    enabled: policy.enabled,
+    alert_cooldown_minutes: Math.max(1, Math.min(1440, Number(policy.alert_cooldown_minutes || 1))),
+    recovery_notification: Boolean(policy.recovery_notification),
+    notification_channel_ids: Array.from(new Set((policy.notification_channel_ids || []).map((id) => id.trim()).filter(Boolean)))
   };
 }
 
@@ -733,12 +1679,80 @@ function toPayloadChannel(channel: NotificationChannel): NotificationChannel {
   return payload;
 }
 
+function toPayloadEnvironmentVariable(variable: EnvironmentVariable): EnvironmentVariable {
+  const payload: EnvironmentVariable = {
+    id: variable.id,
+    name: variable.name.trim(),
+    value: variable.value.trim(),
+    secret: variable.secret
+  };
+  if (variable.secret && variable.value_clear) {
+    payload.value_clear = true;
+  }
+  return payload;
+}
+
 function firstBlockingError(channels: NotificationChannel[]): string {
   for (const channel of channels) {
     const error = channelUrlError(channel) || channelSecretError(channel);
     if (error) return error;
   }
   return "";
+}
+
+function firstAlertTagPolicyError(policies: AlertTagPolicy[]): string {
+  for (const policy of policies) {
+    const error = alertTagPolicyTagError(policy, policies);
+    if (error) return error;
+  }
+  return "";
+}
+
+function alertTagPolicyTagError(policy: AlertTagPolicy, policies: AlertTagPolicy[]): string {
+  const tag = policy.tag.trim();
+  if (!tag) return "标签告警策略标签不能为空";
+  if (tag.includes(",")) return "标签告警策略标签不能包含逗号";
+  const duplicate = policies.some((candidate) => candidate.id !== policy.id && candidate.tag.trim().toLowerCase() === tag.toLowerCase());
+  if (duplicate) return "标签告警策略标签不能重复";
+  return "";
+}
+
+function firstVariableBlockingError(variables: EnvironmentVariable[]): string {
+  for (const variable of variables) {
+    const error = environmentVariableNameError(variable, variables);
+    if (error) return error;
+  }
+  return "";
+}
+
+function environmentVariableNameError(variable: EnvironmentVariable, variables: EnvironmentVariable[]): string {
+  const name = variable.name.trim();
+  if (!name) return "变量名称不能为空";
+  if (!VARIABLE_NAME_PATTERN.test(name)) return "变量名称必须使用 NAME 或 SERVICE_TOKEN 格式";
+  const duplicate = variables.some((candidate) => candidate.id !== variable.id && candidate.name.trim() === name);
+  if (duplicate) return "变量名称不能重复";
+  return "";
+}
+
+function environmentVariableValueStatus(variable: EnvironmentVariable): { label: string; color: "default" | "success" | "warning" | "processing" } {
+  if (variable.value_clear) return { label: "待清空", color: "warning" };
+  if (variable.secret && variable.value.trim()) {
+    return { label: variable.value_set ? "待替换" : "待保存", color: "processing" };
+  }
+  if (variable.secret && variable.value_set) return { label: "已配置", color: "success" };
+  if (variable.value.trim()) return { label: "已配置", color: "success" };
+  return { label: "未配置", color: "default" };
+}
+
+function environmentVariableValueHelp(variable: EnvironmentVariable): string {
+  if (variable.secret) {
+    if (variable.value_clear) return "保存后清空已保存密钥";
+    if (variable.value_set && !variable.value) return "留空会保留已保存密钥，输入新值会替换";
+    return "保存后不会在设置页回显";
+  }
+  if (variable.value_set && !variable.value) return "切换为明文后需要重新输入值，否则保存为空";
+  const placeholder = variable.name.trim() || "NAME";
+  return `使用 \${${placeholder}} 引用该变量`;
 }
 
 function readyNotificationChannels(channels: NotificationChannel[]) {
@@ -813,6 +1827,15 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     alert_detail_base_url: values.alert_detail_base_url,
     alert_cooldown_minutes: values.alert_cooldown_minutes,
     recovery_notification: values.recovery_notification,
+    alert_tag_policies: (values.alert_tag_policies || []).map((policy) => ({
+      id: policy.id,
+      name: policy.name,
+      tag: policy.tag,
+      enabled: Boolean(policy.enabled),
+      alert_cooldown_minutes: policy.alert_cooldown_minutes ?? null,
+      recovery_notification: policy.recovery_notification ?? null,
+      notification_channel_ids: policy.notification_channel_ids || []
+    })),
     notification_channels: values.notification_channels.map((channel) => ({
       id: channel.id,
       name: channel.name,
@@ -831,7 +1854,10 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     max_concurrency: values.max_concurrency,
     max_ui_concurrency: values.max_ui_concurrency,
     max_queue_size: values.max_queue_size,
-    max_task_runtime_seconds: values.max_task_runtime_seconds
+    max_task_runtime_seconds: values.max_task_runtime_seconds,
+    local_runner_name: values.local_runner_name || "",
+    local_runner_address: values.local_runner_address || "",
+    local_runner_region: values.local_runner_region || ""
   };
   const browser = {
     browser_headless: values.browser_headless,
@@ -839,19 +1865,70 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     browser_proxy: values.browser_proxy,
     browser_viewport: values.browser_viewport
   };
+  const variables = {
+    environment_variables: values.environment_variables.map((variable) => ({
+      id: variable.id,
+      name: variable.name,
+      value: variable.value || "",
+      secret: Boolean(variable.secret),
+      value_set: Boolean(variable.value_set),
+      value_clear: Boolean(variable.value_clear)
+    }))
+  };
   const retention = {
     run_retention_days: values.run_retention_days,
     screenshot_retention_days: values.screenshot_retention_days,
     trace_retention_days: values.trace_retention_days,
     response_retention_days: values.response_retention_days
   };
+  const access = {
+    read_only_token_set: Boolean(values.read_only_token_set),
+    maintenance_enabled: Boolean(values.maintenance_enabled),
+    maintenance_title: values.maintenance_title || "",
+    maintenance_message: values.maintenance_message || "",
+    maintenance_starts_at: values.maintenance_starts_at || "",
+    maintenance_ends_at: values.maintenance_ends_at || ""
+  };
   if (tab === "alerts") return alerts;
   if (tab === "runtime") return runtime;
   if (tab === "browser") return browser;
+  if (tab === "variables") return variables;
   if (tab === "retention") return retention;
-  return { alerts, runtime, browser, retention };
+  if (tab === "access") return access;
+  return { alerts, runtime, browser, variables, retention, access };
 }
 
 function cloneSettings(values: SettingsValues): SettingsValues {
-  return JSON.parse(JSON.stringify(values)) as SettingsValues;
+  const cloned = JSON.parse(JSON.stringify(values)) as SettingsValues;
+  return {
+    ...cloned,
+    read_only_token: "",
+    read_only_token_set: Boolean(cloned.read_only_token_set),
+    local_runner_name: cloned.local_runner_name || "local",
+    local_runner_address: cloned.local_runner_address || "127.0.0.1",
+    local_runner_region: cloned.local_runner_region || "local",
+    maintenance_enabled: Boolean(cloned.maintenance_enabled),
+    maintenance_title: cloned.maintenance_title || "",
+    maintenance_message: cloned.maintenance_message || "",
+    maintenance_starts_at: cloned.maintenance_starts_at || "",
+    maintenance_ends_at: cloned.maintenance_ends_at || "",
+    notification_channels: cloned.notification_channels || [],
+    alert_tag_policies: (cloned.alert_tag_policies || []).map((policy) => ({
+      id: policy.id,
+      name: policy.name || "",
+      tag: policy.tag || "",
+      enabled: Boolean(policy.enabled),
+      alert_cooldown_minutes: policy.alert_cooldown_minutes,
+      recovery_notification: policy.recovery_notification,
+      notification_channel_ids: policy.notification_channel_ids || []
+    })),
+    environment_variables: (cloned.environment_variables || []).map((variable) => ({
+      id: variable.id,
+      name: variable.name || "",
+      value: variable.value || "",
+      secret: Boolean(variable.secret),
+      value_set: Boolean(variable.value_set),
+      value_clear: Boolean(variable.value_clear)
+    }))
+  };
 }

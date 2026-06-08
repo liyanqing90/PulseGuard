@@ -2,8 +2,24 @@ export type CheckType = "ui" | "api";
 export type ViewportMode = "web" | "h5";
 export type RunStatus = "pending" | "running" | "ok" | "failed" | "timeout" | "skipped";
 export type NotificationStatus = "disabled" | "not_required" | "suppressed" | "sent" | "failed";
+export type FailureKind = "none" | "target" | "runner" | string;
 export type TaskSurfaceStatus = "ok" | "failed" | "never" | "disabled";
 export type WebhookType = "feishu" | "wecom" | "dingtalk";
+export type ConfigBundle = Record<string, unknown>;
+export type CheckBatchAction = "enable" | "disable" | "run" | "update_interval";
+export interface AlertPolicy {
+  alert_cooldown_minutes?: number;
+  recovery_notification?: boolean;
+  notification_channel_ids?: string[];
+}
+
+export interface AlertTagPolicy extends AlertPolicy {
+  id: string;
+  name: string;
+  tag: string;
+  enabled: boolean;
+}
+
 export type ApiAssertionType =
   | "status_code"
   | "response_time"
@@ -15,6 +31,7 @@ export type ApiAssertionType =
   | "json_path_length";
 export type ApiJsonValueType = "string" | "number" | "boolean" | "object" | "array" | "null";
 export type ApiLengthOperator = "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
+export type SelectorStability = "high" | "medium" | "low";
 export type UiAssertionType =
   | "element_visible"
   | "element_hidden"
@@ -46,6 +63,9 @@ export interface UiAssertion {
   type: UiAssertionType;
   enabled: boolean;
   selector?: string;
+  selector_type?: string;
+  selector_stability?: SelectorStability;
+  selector_score?: number;
   expected_text?: string;
   operator?: UiCountOperator;
   expected_count?: number;
@@ -53,7 +73,7 @@ export interface UiAssertion {
 
 export interface ApiJsonPathOption {
   path: string;
-  type: string;
+  type: ApiJsonValueType;
   preview: string;
   length?: number | null;
 }
@@ -83,13 +103,36 @@ export interface UiInspectPayload {
   viewport_mode: "web" | "h5";
   viewport_width: number;
   viewport_height: number;
+  setup_script: string;
+}
+
+export type UiRuleInspectStatus = "ok" | "missing" | "multiple" | "invalid_selector" | "disabled" | "error";
+
+export interface UiRuleInspectPayload extends UiInspectPayload {
+  assertions_json: string;
+}
+
+export interface UiRuleInspectItem {
+  id: string;
+  type: UiAssertionType;
+  selector: string;
+  status: UiRuleInspectStatus;
+  count?: number | null;
+  message: string;
+}
+
+export interface UiRuleInspectResult {
+  title: string;
+  url: string;
+  results: UiRuleInspectItem[];
+  logs?: string;
 }
 
 export interface UiElementCandidate {
   name?: string;
   selector: string;
   selector_type?: string;
-  stability?: "high" | "medium" | "low";
+  stability?: SelectorStability;
   score?: number;
   text: string;
   tag: string;
@@ -134,6 +177,7 @@ export interface Check {
   setup_script: string;
   script: string;
   tags: string;
+  alert_policy_json: string;
   created_at: string;
   updated_at: string;
   current_status?: "ok" | "failed" | null;
@@ -144,6 +188,108 @@ export interface Check {
   last_run_id?: number | null;
   last_error?: string | null;
   last_duration_ms?: number | null;
+}
+
+export interface CheckBatchPayload {
+  action: CheckBatchAction;
+  type: CheckType;
+  tag?: string;
+  expected_count?: number;
+  interval_seconds?: number;
+}
+
+export interface CheckBatchResult {
+  matched: number;
+  changed: number;
+  ids: number[];
+  runs: Run[];
+}
+
+export interface AuditEvent {
+  id: number;
+  action: string;
+  entity_type: string;
+  entity_id?: string | null;
+  entity_name: string;
+  summary: string;
+  payload: unknown;
+  created_at: string;
+}
+
+export interface CheckVersion {
+  id: number;
+  check_id: number;
+  action: string;
+  snapshot: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface RunArchive {
+  id: number;
+  archive_date: string;
+  check_type: CheckType;
+  status: RunStatus;
+  run_count: number;
+  duration_sum_ms: number;
+  duration_sample_count: number;
+  last_run_at?: string | null;
+  updated_at: string;
+}
+
+export interface ProbeRunner {
+  runner_id: string;
+  name: string;
+  address: string;
+  network_region: string;
+  browser_version: string;
+  status: "ok" | "warning" | "offline" | string;
+  metadata: Record<string, unknown>;
+  last_seen_at: string;
+  updated_at: string;
+}
+
+export interface StatusPageSnapshot {
+  generated_at: string;
+  summary: {
+    checks_total: number;
+    checks_enabled: number;
+    checks_failing: number;
+    runs_today: number;
+  };
+  maintenance: {
+    enabled: boolean;
+    title: string;
+    message: string;
+    starts_at: string;
+    ends_at: string;
+  };
+  checks: StatusPageCheck[];
+  recent_incidents: StatusPageIncident[];
+}
+
+export interface StatusPageCheck {
+  id: number;
+  name: string;
+  type: CheckType;
+  enabled: boolean;
+  tags: string;
+  status: TaskSurfaceStatus | RunStatus | string;
+  last_run_at?: string | null;
+  last_error?: string | null;
+}
+
+export interface StatusPageIncident {
+  id: number;
+  check_id: number;
+  check_name: string;
+  check_type: CheckType;
+  status: RunStatus;
+  started_at: string;
+  duration_ms?: number | null;
+  failure_kind?: FailureKind | null;
+  runner_name?: string | null;
+  runner_region?: string | null;
+  error_message?: string | null;
 }
 
 export interface Run {
@@ -163,12 +309,74 @@ export interface Run {
   response_path?: string | null;
   request_snapshot?: string | null;
   response_snapshot?: string | null;
+  runner_name?: string | null;
+  runner_address?: string | null;
+  runner_region?: string | null;
+  runner_browser_version?: string | null;
+  failure_kind?: FailureKind | null;
   notification_status?: NotificationStatus | null;
   notification_channel?: "feishu" | "wecom" | "dingtalk" | string | null;
   notification_error?: string | null;
   notification_sent_at?: string | null;
   created_at: string;
   consecutive_failures?: number;
+}
+
+export interface RunComparison {
+  available: boolean;
+  message: string;
+  current_run?: RunComparisonRun | null;
+  baseline_run?: RunComparisonRun | null;
+  fields: RunComparisonField[];
+  assertions: RunComparisonAssertion[];
+}
+
+export interface RunFailureSummary {
+  run_id: number;
+  check_id: number;
+  check_name: string;
+  status: RunStatus | string;
+  failure_kind: FailureKind;
+  summary: string;
+  error_message: string;
+  signals: Array<{ label: string; value: unknown }>;
+  next_steps: string[];
+}
+
+export interface RunComparisonRun {
+  id: number;
+  check_id: number;
+  check_name: string;
+  check_type: CheckType;
+  status: RunStatus;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_ms?: number | null;
+}
+
+export interface RunComparisonField {
+  key: string;
+  label: string;
+  current: unknown;
+  baseline: unknown;
+  changed: boolean;
+}
+
+export interface RunComparisonAssertion {
+  key: string;
+  rule: string;
+  path?: string | null;
+  current_status?: string | null;
+  baseline_status?: string | null;
+  current_actual?: unknown;
+  baseline_actual?: unknown;
+  current_operator?: string | null;
+  baseline_operator?: string | null;
+  current_expected?: unknown;
+  baseline_expected?: unknown;
+  current_message?: string | null;
+  baseline_message?: string | null;
+  changed: boolean;
 }
 
 export interface Overview {
@@ -179,6 +387,17 @@ export interface Overview {
   latest_run: Run | null;
   latest_recovered: { name: string; type: CheckType; last_success_at: string } | null;
   recent_failures: Run[];
+  trends: OverviewTrend[];
+}
+
+export interface OverviewTrend {
+  key: "24h" | "7d" | string;
+  label: string;
+  runs: number;
+  success_rate?: number | null;
+  failure_count: number;
+  duration_p50_ms?: number | null;
+  duration_p95_ms?: number | null;
 }
 
 export interface SettingsValues {
@@ -192,6 +411,8 @@ export interface SettingsValues {
   alerts_enabled: boolean;
   alert_detail_base_url: string;
   notification_channels: NotificationChannel[];
+  alert_tag_policies: AlertTagPolicy[];
+  environment_variables: EnvironmentVariable[];
   alert_cooldown_minutes: number;
   recovery_notification: boolean;
   browser_headless: boolean;
@@ -202,6 +423,16 @@ export interface SettingsValues {
   screenshot_retention_days: number;
   trace_retention_days: number;
   response_retention_days: number;
+  read_only_token?: string;
+  read_only_token_set?: boolean;
+  local_runner_name?: string;
+  local_runner_address?: string;
+  local_runner_region?: string;
+  maintenance_enabled?: boolean;
+  maintenance_title?: string;
+  maintenance_message?: string;
+  maintenance_starts_at?: string;
+  maintenance_ends_at?: string;
 }
 
 export interface RuntimeStatus {
@@ -235,6 +466,15 @@ export interface NotificationChannel {
   dingtalk_secret_clear?: boolean;
 }
 
+export interface EnvironmentVariable {
+  id: string;
+  name: string;
+  value: string;
+  secret: boolean;
+  value_set?: boolean;
+  value_clear?: boolean;
+}
+
 export interface AlertPreview {
   channels: AlertPreviewChannel[];
   message_text: string;
@@ -254,6 +494,46 @@ export interface AlertPreviewChannel {
   };
   signing_enabled: boolean;
   payload: unknown;
+}
+
+export interface ConfigExportFile {
+  blob: Blob;
+  filename: string;
+}
+
+export interface ConfigImportIssue {
+  message?: string;
+  severity?: "error" | "warning" | "info" | string;
+}
+
+export interface ConfigImportPreview {
+  valid?: boolean;
+  ok?: boolean;
+  summary?: ConfigImportSummary;
+  counts?: ConfigImportSummary;
+  errors?: Array<ConfigImportIssue | string>;
+  warnings?: Array<ConfigImportIssue | string>;
+  issues?: Array<ConfigImportIssue | string>;
+  [key: string]: unknown;
+}
+
+export interface ConfigImportResult {
+  ok?: boolean;
+  message?: string;
+  summary?: ConfigImportSummary;
+  [key: string]: unknown;
+}
+
+export interface ConfigImportSummary {
+  checks?: number;
+  ui_checks?: number;
+  api_checks?: number;
+  settings?: number;
+  conflicts?: number;
+  notification_channels?: number;
+  environment_variables?: number;
+  variables?: number;
+  [key: string]: unknown;
 }
 
 export type CheckPayload = Omit<

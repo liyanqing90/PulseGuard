@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 import httpx
 
-from backend.app.api_assertions import extract_json_paths, find_json_path, normalize_api_assertions
+from backend.app.api_assertions import extract_json_paths, find_json_path, normalize_api_assertions, run_structured_api_check
 from backend.app.api_assertions import _evaluate_assertion
 
 
@@ -16,6 +17,17 @@ class ApiAssertionTests(unittest.TestCase):
         self.assertIn("$.data.id", path_values)
         self.assertIn("$.data.items[0].name", path_values)
         self.assertIn("$.ok", path_values)
+
+    def test_extract_json_paths_returns_metadata_for_frontend_rule_generation(self) -> None:
+        paths = extract_json_paths({"items": [{"name": "first"}], "meta.info": {"tags": ["a", "b"]}})
+        by_path = {item["path"]: item for item in paths}
+
+        self.assertEqual(by_path["$.items"]["type"], "array")
+        self.assertEqual(by_path["$.items"]["length"], 1)
+        self.assertEqual(by_path["$.items[0].name"]["type"], "string")
+        self.assertEqual(by_path["$.items[0].name"]["length"], 5)
+        self.assertEqual(by_path['$["meta.info"].tags']["type"], "array")
+        self.assertEqual(by_path['$["meta.info"].tags']["length"], 2)
 
     def test_find_json_path_supports_bracket_keys(self) -> None:
         exists, value = find_json_path({"a.b": {"value": 1}}, '$["a.b"].value')
@@ -59,6 +71,38 @@ class ApiAssertionTests(unittest.TestCase):
         assertion = normalize_api_assertions('[{"type":"json_path_length","path":"$.count","operator":"gte","expected_length":1}]')[0]
 
         self.assertEqual(_evaluate_assertion(assertion, response, 20, {"count": 3}, True), "JSON 字段不支持长度校验：$.count")
+
+
+    def test_structured_api_assertions_resolve_variable_placeholders(self) -> None:
+        ctx = FakeApiContext(
+            {
+                "assertions_json": '[{"type":"json_path_equals","path":"$.state","expected_value":"${EXPECTED_STATE}"}]',
+            },
+            {"environment_variables": [{"id": "state", "name": "EXPECTED_STATE", "value": "active", "secret": False}]},
+            httpx.Response(200, json={"state": "active"}),
+        )
+
+        asyncio.run(run_structured_api_check(ctx))  # type: ignore[arg-type]
+
+        self.assertEqual(ctx.response_snapshot["assertions"][0]["status"], "ok")
+
+
+class FakeApiContext:
+    def __init__(self, check: dict[str, str], settings: dict[str, object], response: httpx.Response) -> None:
+        self.check = check
+        self.settings = settings
+        self._response = response
+        self.response_snapshot: dict[str, object] | None = None
+        self.logs: list[str] = []
+
+    async def request(self) -> httpx.Response:
+        return self._response
+
+    def log(self, message: object) -> None:
+        self.logs.append(str(message))
+
+    def save_response(self, response: httpx.Response) -> None:
+        self.response_snapshot = {"status_code": response.status_code, "body": response.text}
 
 
 if __name__ == "__main__":

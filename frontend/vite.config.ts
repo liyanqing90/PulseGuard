@@ -1,6 +1,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const devApiTarget = process.env.VITE_DEV_API_TARGET || "http://127.0.0.1:8787";
+
 export default defineConfig({
   plugins: [react()],
   build: {
@@ -16,8 +18,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "^/api(/|$)": "http://127.0.0.1:8787",
-      "^/artifacts(/|$)": "http://127.0.0.1:8787"
+      "^/api(/|$)": devApiTarget,
+      "^/artifacts(/|$)": devApiTarget
     }
   }
 });

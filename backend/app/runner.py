@@ -15,7 +15,8 @@ from .api_assertions import has_enabled_api_assertions, run_structured_api_check
 from .ui_assertions import has_enabled_ui_assertions, run_structured_ui_check
 from . import notifier, storage
 from .artifacts import ArtifactStore
-from .context import RunContext, RunFailure
+from .context import RunContext, RunFailure, RunnerEnvironmentFailure
+from .variables import mask_data, mask_text
 
 
 @dataclass
@@ -106,8 +107,76 @@ class CheckRunner:
     async def inspect_ui(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .ui_assertions import inspect_ui_page
 
-        async with self._ui_limiter.slot():
-            return await inspect_ui_page(payload, storage.get_settings())
+        settings = storage.get_settings()
+        ctx = RunContext(
+            {
+                "id": 0,
+                "name": "页面扫描",
+                "type": "ui",
+                "entry_url": payload.get("entry_url") or "",
+                "timeout_ms": payload.get("timeout_ms") or settings.get("default_ui_timeout_ms", 15000),
+                "viewport_mode": payload.get("viewport_mode") or "web",
+                "setup_script": payload.get("setup_script") or "",
+                "method": "",
+                "headers_json": "{}",
+                "body": "",
+            },
+            0,
+            settings,
+            self.artifacts,
+        )
+        setup_func = None
+        try:
+            setup_script = str(payload.get("setup_script") or "")
+            if setup_script.strip():
+                setup_func = self._load_check_function(
+                    setup_script,
+                    ctx,
+                    function_name="setup",
+                    expected_signature="async def setup(ctx, page)",
+                    script_label="前置脚本",
+                )
+            async with self._ui_limiter.slot():
+                return await inspect_ui_page(payload, settings, ctx=ctx, setup_func=setup_func)
+        finally:
+            await ctx.close(False)
+
+    async def inspect_ui_rules(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .ui_assertions import inspect_ui_rule_selectors
+
+        settings = storage.get_settings()
+        ctx = RunContext(
+            {
+                "id": 0,
+                "name": "规则检测",
+                "type": "ui",
+                "entry_url": payload.get("entry_url") or "",
+                "timeout_ms": payload.get("timeout_ms") or settings.get("default_ui_timeout_ms", 15000),
+                "viewport_mode": payload.get("viewport_mode") or "web",
+                "setup_script": payload.get("setup_script") or "",
+                "method": "",
+                "headers_json": "{}",
+                "body": "",
+            },
+            0,
+            settings,
+            self.artifacts,
+        )
+        setup_func = None
+        try:
+            setup_script = str(payload.get("setup_script") or "")
+            if setup_script.strip():
+                setup_func = self._load_check_function(
+                    setup_script,
+                    ctx,
+                    function_name="setup",
+                    expected_signature="async def setup(ctx, page)",
+                    script_label="前置脚本",
+                )
+            async with self._ui_limiter.slot():
+                return await inspect_ui_rule_selectors(payload, settings, ctx=ctx, setup_func=setup_func)
+        finally:
+            await ctx.close(False)
 
     def runtime_status(self) -> dict[str, Any]:
         global_slots = self._global_limiter.snapshot()
@@ -150,7 +219,8 @@ class CheckRunner:
             if self._queued_jobs >= self._queue_limit:
                 return self._create_skipped_run(check, "执行队列已满，本次已跳过", record_status=record_status)
 
-            run = storage.create_run(check, "pending")
+            settings = storage.get_settings()
+            run = storage.create_run(self._with_runner_metadata(check, settings, failure_kind="none"), "pending")
             job = RunJob(
                 check=check,
                 trigger=trigger,
@@ -216,16 +286,18 @@ class CheckRunner:
         notify: bool = True,
     ) -> dict[str, Any]:
         settings = storage.get_settings()
-        ctx = RunContext(check, run_id, settings, self.artifacts)
+        ctx: RunContext | None = None
         started = datetime.now().astimezone()
         status = "ok"
         error_message: str | None = None
         error_stack: str | None = None
-
-        ctx.log(f"触发方式：{trigger}")
-        ctx.log(f"任务入口：{check.get('entry_url')}")
+        failure_kind = "none"
 
         try:
+            ctx = RunContext(check, run_id, settings, self.artifacts)
+            ctx.log(f"触发方式：{trigger}")
+            ctx.log(f"任务入口：{check.get('entry_url')}")
+
             max_runtime_seconds = int(settings.get("max_task_runtime_seconds", 60))
             timeout_seconds = min(
                 int(check.get("timeout_ms") or 15000) / 1000,
@@ -255,54 +327,72 @@ class CheckRunner:
             status = "skipped"
             error_message = "执行被取消，可能是服务关闭或运行设置刷新"
             error_stack = None
+            failure_kind = "runner"
         except asyncio.TimeoutError as exc:
             status = "timeout"
             error_message = str(exc).strip() or f"执行超过超时限制：{check.get('timeout_ms')}ms"
             error_stack = traceback.format_exc()
+            failure_kind = "target"
+        except RunnerEnvironmentFailure as exc:
+            status = "failed"
+            error_message = str(exc)
+            error_stack = traceback.format_exc()
+            failure_kind = "runner"
         except RunFailure as exc:
             status = "failed"
             error_message = str(exc)
             error_stack = traceback.format_exc()
+            failure_kind = "target"
         except AssertionError as exc:
             status = "failed"
             error_message = str(exc) or "断言失败"
             error_stack = traceback.format_exc()
+            failure_kind = "target"
         except Exception as exc:
             status = "failed"
             error_message = str(exc) or exc.__class__.__name__
             error_stack = traceback.format_exc()
+            failure_kind = "runner"
         finally:
             failed = status in {"failed", "timeout"}
-            try:
-                await ctx.close(failed)
-            except Exception as exc:
-                if status == "ok":
-                    status = "failed"
-                    error_message = f"运行清理失败：{exc}"
-                    error_stack = traceback.format_exc()
-                else:
-                    ctx.log(f"运行清理失败：{exc}")
+            if ctx is not None:
+                try:
+                    await ctx.close(failed)
+                except Exception as exc:
+                    if status == "ok":
+                        status = "failed"
+                        error_message = f"运行清理失败：{exc}"
+                        error_stack = traceback.format_exc()
+                        failure_kind = "runner"
+                    else:
+                        ctx.log(f"运行清理失败：{exc}")
 
         finished = datetime.now().astimezone()
         duration_ms = int((finished - started).total_seconds() * 1000)
+        safe_error_message = mask_text(error_message, settings) if error_message is not None else None
+        safe_error_stack = mask_text(error_stack, settings) if error_stack is not None else None
+        safe_logs = mask_text("\n".join(ctx.logs) if ctx else "", settings)
+        safe_request_snapshot = mask_data(ctx.request_snapshot, settings) if ctx and ctx.request_snapshot else None
+        safe_response_snapshot = mask_data(ctx.response_snapshot, settings) if ctx and ctx.response_snapshot else None
         finished_run = storage.finish_run(
             run_id,
             {
                 "status": status,
                 "finished_at": finished.isoformat(timespec="seconds"),
                 "duration_ms": duration_ms,
-                "error_message": error_message,
-                "error_stack": error_stack,
-                "logs": "\n".join(ctx.logs),
-                "screenshot_path": ctx.screenshot_path,
-                "trace_path": ctx.trace_path,
-                "response_path": ctx.response_path,
-                "request_snapshot": json.dumps(ctx.request_snapshot, ensure_ascii=False)
-                if ctx.request_snapshot
+                "error_message": safe_error_message,
+                "error_stack": safe_error_stack,
+                "logs": safe_logs,
+                "screenshot_path": ctx.screenshot_path if ctx else None,
+                "trace_path": ctx.trace_path if ctx else None,
+                "response_path": ctx.response_path if ctx else None,
+                "request_snapshot": json.dumps(safe_request_snapshot, ensure_ascii=False)
+                if safe_request_snapshot
                 else None,
-                "response_snapshot": json.dumps(ctx.response_snapshot, ensure_ascii=False)
-                if ctx.response_snapshot
+                "response_snapshot": json.dumps(safe_response_snapshot, ensure_ascii=False)
+                if safe_response_snapshot
                 else None,
+                **self._runner_metadata(settings, ctx=ctx, failure_kind=failure_kind),
             },
         )
         if finished_run is None:
@@ -319,7 +409,8 @@ class CheckRunner:
         return storage.get_run(run_id) or finished_run
 
     def _create_skipped_run(self, check: dict[str, Any], message: str, record_status: bool = True) -> dict[str, Any]:
-        run = storage.create_run(check, "skipped", message)
+        settings = storage.get_settings()
+        run = storage.create_run(self._with_runner_metadata(check, settings, failure_kind="runner"), "skipped", message)
         if not record_status:
             storage.update_run_notification(int(run["id"]), "not_required", channel=None, error=None, sent_at=None)
             return storage.get_run(int(run["id"])) or run
@@ -339,6 +430,9 @@ class CheckRunner:
         message: str,
         error_stack: str | None = None,
     ) -> dict[str, Any]:
+        settings = storage.get_settings()
+        safe_message = mask_text(message, settings)
+        safe_error_stack = mask_text(error_stack, settings) if error_stack is not None else None
         finished = datetime.now().astimezone()
         run = storage.finish_run(
             job.run_id,
@@ -346,18 +440,42 @@ class CheckRunner:
                 "status": status,
                 "finished_at": finished.isoformat(timespec="seconds"),
                 "duration_ms": 0,
-                "error_message": message,
-                "error_stack": error_stack,
-                "logs": message,
+                "error_message": safe_message,
+                "error_stack": safe_error_stack,
+                "logs": safe_message,
                 "screenshot_path": None,
                 "trace_path": None,
                 "response_path": None,
                 "request_snapshot": None,
                 "response_snapshot": None,
+                **self._runner_metadata(settings, failure_kind="runner"),
             },
         )
         storage.update_run_notification(job.run_id, "not_required", channel=None, error=None, sent_at=None)
-        return storage.get_run(job.run_id) or run or {"id": job.run_id, "status": status, "error_message": message}
+        return storage.get_run(job.run_id) or run or {"id": job.run_id, "status": status, "error_message": safe_message}
+
+    @staticmethod
+    def _runner_metadata(settings: dict[str, Any], ctx: RunContext | None = None, failure_kind: str = "none") -> dict[str, str]:
+        name = str(settings.get("local_runner_name") or "local").strip() or "local"
+        address = str(settings.get("local_runner_address") or "127.0.0.1").strip()
+        region = str(settings.get("local_runner_region") or "local").strip() or "local"
+        browser_version = str(getattr(ctx, "browser_version", None) or "").strip()
+        normalized_failure_kind = failure_kind if failure_kind in {"none", "target", "runner"} else "runner"
+        return {
+            "runner_name": name,
+            "runner_address": address,
+            "runner_region": region,
+            "runner_browser_version": browser_version,
+            "failure_kind": normalized_failure_kind,
+        }
+
+    def _with_runner_metadata(
+        self,
+        check: dict[str, Any],
+        settings: dict[str, Any],
+        failure_kind: str = "none",
+    ) -> dict[str, Any]:
+        return {**check, "_runner": self._runner_metadata(settings, failure_kind=failure_kind)}
 
     @staticmethod
     def _uses_browser(check: dict[str, Any]) -> bool:

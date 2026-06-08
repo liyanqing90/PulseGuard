@@ -1,7 +1,7 @@
 import { Alert, Button, Card, Collapse, Empty, Form, Input, InputNumber, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip } from "antd";
 import { ArrowLeft, Play, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import {
   checkToPayload,
@@ -23,6 +23,7 @@ import { dirtyTagColor } from "../utils";
 
 export function DebugPage() {
   const { type, checkId } = useParams();
+  const navigate = useNavigate();
   const checkType = type === "api" ? "api" : "ui";
   const id = Number(checkId);
   const [check, setCheck] = useState<Check | null>(null);
@@ -139,9 +140,9 @@ export function DebugPage() {
     <div className="debug-page">
       <Card>
         <div className="debug-header">
-          <Link to={checkType === "ui" ? "/ui-checks" : "/api-checks"}>
-            <Button icon={<ArrowLeft size={16} />}>返回</Button>
-          </Link>
+          <Button icon={<ArrowLeft size={16} />} onClick={() => navigate(checkType === "ui" ? "/ui-checks" : "/api-checks")}>
+            返回
+          </Button>
           <div>
             <h2>{check.name}</h2>
           </div>
@@ -198,7 +199,7 @@ export function DebugPage() {
             <Form.Item label="启用">
               <Space className="switch-line">
                 <span>{form.enabled ? "已启用" : "已禁用"}</span>
-                <Switch checked={form.enabled} onChange={(value) => patchForm({ enabled: value })} />
+                <Switch aria-label="调试任务启用状态" checked={form.enabled} onChange={(value) => patchForm({ enabled: value })} />
               </Space>
             </Form.Item>
           </Form>

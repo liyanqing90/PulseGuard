@@ -3,8 +3,8 @@ import { Play, Save } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { checkToPayload, detectBodyMode, normalizeCheckPayload, prepareCheckPayload, sameCheckPayload, type BodyEditorMode } from "../checkPayload";
-import { apiScriptTemplate, blankCheck } from "../defaults";
-import type { Check, CheckPayload, CheckType, Run } from "../types";
+import { apiScriptTemplate, blankCheck, checkFromTemplate, checkTemplatesForType } from "../defaults";
+import type { AlertPolicy, Check, CheckPayload, CheckType, NotificationChannel, Run } from "../types";
 import { dirtyTagColor } from "../utils";
 import { ApiAssertionsBuilder } from "./ApiAssertionsBuilder";
 import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
@@ -31,9 +31,14 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const [debugRun, setDebugRun] = useState<Run | null>(null);
   const [debugSnapshot, setDebugSnapshot] = useState<CheckPayload | null>(null);
   const [bodyMode, setBodyMode] = useState<BodyEditorMode>("json");
+  const [notificationChannels, setNotificationChannels] = useState<NotificationChannel[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState(() => checkTemplatesForType(type)[0]?.id || "");
 
+  const templates = useMemo(() => checkTemplatesForType(type), [type]);
   const isDirty = useMemo(() => !sameCheckPayload(form, baseline), [baseline, form]);
   const debugStale = useMemo(() => Boolean(debugRun && debugSnapshot && !sameCheckPayload(form, debugSnapshot)), [debugRun, debugSnapshot, form]);
+  const alertPolicy = useMemo(() => parseCheckAlertPolicy(form.alert_policy_json), [form.alert_policy_json]);
+  const alertPolicyMode = useMemo(() => (hasAlertPolicyOverrides(alertPolicy) ? "custom" : "inherit"), [alertPolicy]);
   const running = Boolean(runningMode);
 
   useEffect(() => {
@@ -46,7 +51,16 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     setForm(next);
     setBaseline(normalizeCheckPayload(next));
     setBodyMode(detectBodyMode(next.body));
+    setSelectedTemplateId(checkTemplatesForType(type)[0]?.id || "");
   }, [check, open, type]);
+
+  useEffect(() => {
+    if (!open) return;
+    api
+      .settings()
+      .then((values) => setNotificationChannels(values.notification_channels || []))
+      .catch(() => setNotificationChannels([]));
+  }, [open]);
 
   async function save(): Promise<Check> {
     setSaving(true);
@@ -112,6 +126,29 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
 
   function patchForm(values: Partial<CheckPayload>) {
     setForm((current) => ({ ...current, ...values }));
+  }
+
+  function applySelectedTemplate() {
+    const next = checkFromTemplate(type, selectedTemplateId);
+    if (!next) return;
+    setError(null);
+    setDebugRun(null);
+    setDebugSnapshot(null);
+    setForm(next);
+    setBodyMode(detectBodyMode(next.body));
+  }
+
+  function patchAlertPolicy(patch: Partial<AlertPolicy>) {
+    patchForm({ alert_policy_json: serializeCheckAlertPolicy({ ...alertPolicy, ...patch }) });
+  }
+
+  function setAlertPolicyMode(mode: "inherit" | "custom") {
+    if (mode === "inherit") {
+      patchForm({ alert_policy_json: "{}" });
+      return;
+    }
+    if (hasAlertPolicyOverrides(alertPolicy)) return;
+    patchForm({ alert_policy_json: serializeCheckAlertPolicy(defaultAlertPolicy(notificationChannels)) });
   }
 
   function requestClose() {
@@ -189,6 +226,21 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     >
       <Space orientation="vertical" size={16} className="drawer-stack">
         <Form layout="vertical">
+          {!activeCheck && templates.length > 0 && (
+            <div className="task-template-picker">
+              <Form.Item label="任务模板" className="task-template-select">
+                <Select
+                  value={selectedTemplateId || undefined}
+                  onChange={setSelectedTemplateId}
+                  options={templates.map((template) => ({ label: template.label, value: template.id }))}
+                />
+              </Form.Item>
+              <Button onClick={applySelectedTemplate} disabled={!selectedTemplateId}>
+                应用模板
+              </Button>
+            </div>
+          )}
+
           <div className="field-grid two">
             <Form.Item label="名称" required>
               <Input name="check-name" value={form.name} onChange={(event) => patchForm({ name: event.target.value })} autoComplete="off" />
@@ -236,11 +288,67 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             <Form.Item label="启用">
               <Space className="switch-line">
                 <span>{form.enabled ? "已启用" : "已禁用"}</span>
-                <Switch checked={form.enabled} onChange={(checked) => patchForm({ enabled: checked })} />
+                <Switch aria-label="任务启用状态" checked={form.enabled} onChange={(checked) => patchForm({ enabled: checked })} />
               </Space>
             </Form.Item>
           </div>
         </Form>
+
+        <Collapse
+          className="advanced-script-collapse"
+          items={[
+            {
+              key: "alert-policy",
+              label: "告警策略",
+              children: (
+                <Form layout="vertical" className="settings-form-grid" autoComplete="off">
+                  <Form.Item label="策略来源">
+                    <Segmented
+                      value={alertPolicyMode}
+                      onChange={(value) => setAlertPolicyMode(value as "inherit" | "custom")}
+                      options={[
+                        { label: "继承全局", value: "inherit" },
+                        { label: "自定义", value: "custom" }
+                      ]}
+                    />
+                  </Form.Item>
+                  {alertPolicyMode === "custom" && (
+                    <>
+                      <Form.Item label="通知渠道" className="span-2">
+                        <Select
+                          mode="multiple"
+                          value={alertPolicy.notification_channel_ids || []}
+                          onChange={(value) => patchAlertPolicy({ notification_channel_ids: value })}
+                          options={notificationChannels.map((channel) => ({
+                            label: channel.name || channel.type,
+                            value: channel.id,
+                            disabled: !channel.enabled
+                          }))}
+                        />
+                      </Form.Item>
+                      <Form.Item label="失败冷却时间">
+                        <InputNumber
+                          min={1}
+                          max={1440}
+                          value={alertPolicy.alert_cooldown_minutes ?? 30}
+                          suffix="分钟"
+                          onChange={(value) => patchAlertPolicy({ alert_cooldown_minutes: Number(value || 1) })}
+                        />
+                      </Form.Item>
+                      <Form.Item label="恢复通知">
+                        <Switch
+                          aria-label="任务恢复通知"
+                          checked={alertPolicy.recovery_notification ?? true}
+                          onChange={(value) => patchAlertPolicy({ recovery_notification: value })}
+                        />
+                      </Form.Item>
+                    </>
+                  )}
+                </Form>
+              )
+            }
+          ]}
+        />
 
         {type === "api" && (
           <>
@@ -337,4 +445,50 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
       </Space>
     </Drawer>
   );
+}
+
+function parseCheckAlertPolicy(value?: string | null): AlertPolicy {
+  if (!value?.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const policy = parsed as AlertPolicy;
+    return {
+      ...(typeof policy.alert_cooldown_minutes === "number" ? { alert_cooldown_minutes: policy.alert_cooldown_minutes } : {}),
+      ...(typeof policy.recovery_notification === "boolean" ? { recovery_notification: policy.recovery_notification } : {}),
+      ...(Array.isArray(policy.notification_channel_ids) ? { notification_channel_ids: policy.notification_channel_ids.map(String) } : {})
+    };
+  } catch {
+    return {};
+  }
+}
+
+function serializeCheckAlertPolicy(policy: AlertPolicy): string {
+  const normalized: AlertPolicy = {};
+  if (typeof policy.alert_cooldown_minutes === "number" && Number.isFinite(policy.alert_cooldown_minutes)) {
+    normalized.alert_cooldown_minutes = Math.max(1, Math.min(1440, Math.round(policy.alert_cooldown_minutes)));
+  }
+  if (typeof policy.recovery_notification === "boolean") {
+    normalized.recovery_notification = policy.recovery_notification;
+  }
+  if (Array.isArray(policy.notification_channel_ids)) {
+    normalized.notification_channel_ids = Array.from(new Set(policy.notification_channel_ids.map((item) => String(item || "").trim()).filter(Boolean)));
+  }
+  return JSON.stringify(normalized);
+}
+
+function hasAlertPolicyOverrides(policy: AlertPolicy): boolean {
+  return (
+    typeof policy.alert_cooldown_minutes === "number" ||
+    typeof policy.recovery_notification === "boolean" ||
+    Array.isArray(policy.notification_channel_ids)
+  );
+}
+
+function defaultAlertPolicy(channels: NotificationChannel[]): AlertPolicy {
+  return {
+    alert_cooldown_minutes: 30,
+    recovery_notification: true,
+    notification_channel_ids: channels.filter((channel) => channel.enabled).map((channel) => channel.id)
+  };
 }

@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from backend.app.runner import CheckRunner
+from backend.app.runner import CheckRunner, RunFailure, RunnerEnvironmentFailure
 
 
 class DraftRunnerTests(unittest.TestCase):
@@ -87,6 +87,112 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(result, finished_run)
         run_structured_api_check.assert_awaited_once()
         maybe_notify.assert_awaited_once()
+
+    def test_target_failure_records_runner_metadata_and_failure_kind(self) -> None:
+        check = {
+            "id": 17,
+            "name": "Runner metadata API",
+            "type": "api",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/health",
+            "method": "GET",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"status_code","expected_status":200}]',
+            "script": "",
+            "tags": "",
+        }
+        settings = {
+            "max_task_runtime_seconds": 60,
+            "browser_type": "chromium",
+            "browser_headless": True,
+            "local_runner_name": "office-runner",
+            "local_runner_address": "10.0.0.8",
+            "local_runner_region": "office-lan",
+        }
+        created_run = {"id": 170, "status": "running"}
+        finished_run = {"id": 170, "check_id": 17, "status": "failed"}
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
+            "backend.app.runner.storage.get_settings",
+            return_value=settings,
+        ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch(
+            "backend.app.runner.storage.finish_run", return_value=finished_run
+        ) as finish_run, patch(
+            "backend.app.runner.storage.get_run", return_value=finished_run
+        ), patch(
+            "backend.app.runner.storage.update_check_status", return_value={"current_status": "failed", "previous_status": None}
+        ), patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ), patch(
+            "backend.app.runner.run_structured_api_check", new_callable=AsyncMock, side_effect=RunFailure("target failed")
+        ):
+            runner = CheckRunner()
+            result = asyncio.run(runner.run_check(17))
+
+        self.assertEqual(result, finished_run)
+        finish_payload = finish_run.call_args.args[1]
+        self.assertEqual(finish_payload["status"], "failed")
+        self.assertEqual(finish_payload["failure_kind"], "target")
+        self.assertEqual(finish_payload["runner_name"], "office-runner")
+        self.assertEqual(finish_payload["runner_address"], "10.0.0.8")
+        self.assertEqual(finish_payload["runner_region"], "office-lan")
+        self.assertEqual(finish_payload["runner_browser_version"], "")
+
+    def test_runner_environment_failure_records_runner_failure_kind(self) -> None:
+        check = {
+            "id": 18,
+            "name": "Runner browser failure",
+            "type": "ui",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com",
+            "method": "",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"title_contains","expected_text":"Example"}]',
+            "script": "",
+            "tags": "",
+        }
+        settings = {
+            "max_task_runtime_seconds": 60,
+            "browser_type": "chromium",
+            "browser_headless": True,
+            "local_runner_name": "office-runner",
+            "local_runner_address": "10.0.0.8",
+            "local_runner_region": "office-lan",
+        }
+        created_run = {"id": 180, "status": "running"}
+        finished_run = {"id": 180, "check_id": 18, "status": "failed"}
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
+            "backend.app.runner.storage.get_settings",
+            return_value=settings,
+        ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch(
+            "backend.app.runner.storage.finish_run", return_value=finished_run
+        ) as finish_run, patch(
+            "backend.app.runner.storage.get_run", return_value=finished_run
+        ), patch(
+            "backend.app.runner.storage.update_check_status", return_value={"current_status": "failed", "previous_status": None}
+        ), patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ), patch(
+            "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RunnerEnvironmentFailure("browser failed")
+        ):
+            runner = CheckRunner()
+            result = asyncio.run(runner.run_check(18))
+
+        self.assertEqual(result, finished_run)
+        finish_payload = finish_run.call_args.args[1]
+        self.assertEqual(finish_payload["status"], "failed")
+        self.assertEqual(finish_payload["failure_kind"], "runner")
 
     def test_structured_ui_check_runs_without_loading_user_script(self) -> None:
         check = {
@@ -174,6 +280,47 @@ class DraftRunnerTests(unittest.TestCase):
         load_check_function.assert_called_once()
         self.assertEqual(load_check_function.call_args.kwargs["function_name"], "setup")
         self.assertIs(run_structured_ui_check.call_args.kwargs["setup_func"], setup_func)
+
+    def test_ui_inspect_loads_setup_script_for_scan(self) -> None:
+        setup_func = AsyncMock()
+        settings = {
+            "max_concurrency": 2,
+            "max_ui_concurrency": 1,
+            "max_queue_size": 50,
+            "max_task_runtime_seconds": 60,
+            "default_ui_timeout_ms": 15000,
+            "browser_type": "chromium",
+            "browser_headless": True,
+        }
+        payload = {
+            "type": "ui",
+            "entry_url": "https://example.com/dashboard",
+            "timeout_ms": 15000,
+            "viewport_mode": "web",
+            "setup_script": "async def setup(ctx, page):\n    ctx.log('scan setup')\n",
+        }
+        inspect_result = {"title": "Dashboard", "url": "https://example.com/dashboard", "candidates": [], "screenshot": ""}
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch.object(
+            CheckRunner, "_max_ui_concurrency", return_value=1
+        ), patch.object(
+            CheckRunner, "_max_queue_size", return_value=50
+        ), patch(
+            "backend.app.runner.storage.get_settings", return_value=settings
+        ), patch(
+            "backend.app.ui_assertions.inspect_ui_page", new_callable=AsyncMock, return_value=inspect_result
+        ) as inspect_ui_page, patch.object(
+            CheckRunner, "_load_check_function", return_value=setup_func
+        ) as load_check_function:
+            runner = CheckRunner()
+            result = asyncio.run(runner.inspect_ui(payload))
+
+        self.assertEqual(result, inspect_result)
+        load_check_function.assert_called_once()
+        self.assertEqual(load_check_function.call_args.kwargs["function_name"], "setup")
+        inspect_ui_page.assert_awaited_once()
+        self.assertIs(inspect_ui_page.call_args.kwargs["setup_func"], setup_func)
+        self.assertEqual(inspect_ui_page.call_args.kwargs["ctx"].entry_url, payload["entry_url"])
 
 
 class RunnerQueueTests(unittest.TestCase):

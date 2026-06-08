@@ -63,6 +63,7 @@ function normalizeUiAssertion(item: unknown): UiAssertion | null {
   };
   if (["element_visible", "element_hidden", "element_not_empty", "element_count"].includes(type)) {
     assertion.selector = source.selector || "";
+    applySelectorMetadata(assertion, source);
   }
   if (["text_present", "text_absent", "title_contains", "url_contains"].includes(type)) {
     assertion.expected_text = source.expected_text || "";
@@ -72,4 +73,17 @@ function normalizeUiAssertion(item: unknown): UiAssertion | null {
     assertion.expected_count = Number(source.expected_count ?? 1);
   }
   return assertion;
+}
+
+function applySelectorMetadata(assertion: UiAssertion, source: Partial<UiAssertion>) {
+  const selectorType = typeof source.selector_type === "string" ? source.selector_type.trim() : "";
+  const selectorStability = normalizeSelectorStability(source.selector_stability);
+  const selectorScore = Number(source.selector_score);
+  if (selectorType) assertion.selector_type = selectorType;
+  if (selectorStability) assertion.selector_stability = selectorStability;
+  if (Number.isFinite(selectorScore)) assertion.selector_score = selectorScore;
+}
+
+function normalizeSelectorStability(value: unknown): UiAssertion["selector_stability"] | undefined {
+  return value === "high" || value === "medium" || value === "low" ? value : undefined;
 }

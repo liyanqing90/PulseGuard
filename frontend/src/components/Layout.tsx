@@ -1,5 +1,5 @@
 import { Menu, Typography } from "antd";
-import { Activity, History, LayoutDashboard, MonitorCheck, PlugZap, Settings } from "lucide-react";
+import { Activity, History, LayoutDashboard, MonitorCheck, PlugZap, ScrollText, Settings, ShieldCheck } from "lucide-react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
 const { Text, Title } = Typography;
@@ -9,6 +9,8 @@ const navItems = [
   { to: "/ui-checks", label: "UI 监控", icon: <MonitorCheck size={16} /> },
   { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> },
   { to: "/runs", label: "执行历史", icon: <History size={16} /> },
+  { to: "/status", label: "内网状态", icon: <ShieldCheck size={16} /> },
+  { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> },
   { to: "/settings", label: "系统设置", icon: <Settings size={16} /> }
 ];
 
@@ -17,6 +19,8 @@ const titles: Record<string, string> = {
   "/ui-checks": "UI 监控",
   "/api-checks": "接口监控",
   "/runs": "执行历史",
+  "/status": "内网状态",
+  "/operations": "运维审计",
   "/settings": "系统设置"
 };
 

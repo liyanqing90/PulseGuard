@@ -1,7 +1,7 @@
 import { Alert, Button, Card, Skeleton } from "antd";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { RunDetailContent } from "../components/RunDetailContent";
 import type { Run } from "../types";
@@ -50,9 +50,9 @@ export function RunDetailPage() {
     <div className="page-content run-detail-page">
       <Card>
         <div className="run-detail-header">
-          <Link to={returnTo}>
-            <Button icon={<ArrowLeft size={16} />}>{returnTo.startsWith("/runs") ? "返回历史" : "返回来源"}</Button>
-          </Link>
+          <Button icon={<ArrowLeft size={16} />} onClick={() => navigate(returnTo)}>
+            {returnTo.startsWith("/runs") ? "返回历史" : "返回来源"}
+          </Button>
           <div>
             <h2>{run?.check_name || `运行记录 #${id}`}</h2>
           </div>

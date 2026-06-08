@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from .context import RunContext, RunFailure
+from .variables import mask_data, mask_text, resolve_data, resolve_text
 
 
 ASSERTION_TYPES = {
@@ -76,7 +77,11 @@ def has_enabled_api_assertions(raw: str | None) -> bool:
 
 
 async def run_structured_api_check(ctx: RunContext) -> None:
-    assertions = [item for item in normalize_api_assertions(ctx.check.get("assertions_json")) if item.get("enabled", True)]
+    assertions = [
+        resolve_data(item, ctx.settings)
+        for item in normalize_api_assertions(ctx.check.get("assertions_json"))
+        if item.get("enabled", True)
+    ]
     if not assertions:
         raise RunFailure("请至少添加一个启用的接口校验项")
 
@@ -114,15 +119,16 @@ async def run_structured_api_check(ctx: RunContext) -> None:
         raise RunFailure("；".join(errors))
 
 
-async def inspect_api_response(config: dict[str, Any]) -> dict[str, Any]:
+async def inspect_api_response(config: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings = settings or {}
     method = str(config.get("method") or "GET").upper()
-    url = str(config.get("entry_url") or "").strip()
+    url = resolve_text(config.get("entry_url") or "", settings).strip()
     if not url:
         raise ValueError("目标 URL 不能为空")
 
     timeout_ms = int(config.get("timeout_ms") or 10000)
-    headers = _parse_headers(config.get("headers_json") or "{}")
-    request_kwargs = _configured_body_kwargs(config.get("body") or "")
+    headers = _parse_headers(resolve_text(config.get("headers_json") or "{}", settings))
+    request_kwargs = _configured_body_kwargs(resolve_text(config.get("body") or "", settings))
     if headers:
         request_kwargs["headers"] = headers
 
@@ -144,10 +150,10 @@ async def inspect_api_response(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "status_code": response.status_code,
         "duration_ms": elapsed_ms,
-        "headers": dict(response.headers),
-        "body": body_preview,
+        "headers": mask_data(dict(response.headers), settings),
+        "body": mask_text(body_preview, settings),
         "json_valid": json_valid,
-        "json_paths": extract_json_paths(json_value) if json_valid else [],
+        "json_paths": mask_data(extract_json_paths(json_value), settings) if json_valid else [],
     }
 
 

@@ -38,8 +38,12 @@ class FakePage:
         self.url = "https://example.com/dashboard" if url == "https://example.com" else url
 
     def locator(self, selector: str) -> FakeLocator:
+        if selector == ".invalid":
+            raise ValueError("selector parse failed")
         if selector == ".missing":
             return FakeLocator(visible=False, count=0)
+        if selector == ".many":
+            return FakeLocator(visible=True, count=3)
         if selector == ".items":
             return FakeLocator(visible=True, count=3)
         return FakeLocator()
@@ -57,6 +61,11 @@ class FakePage:
 class FakeContext:
     def __init__(self, assertions_json: str) -> None:
         self.check = {"assertions_json": assertions_json}
+        self.settings = {
+            "environment_variables": [
+                {"id": "title", "name": "EXPECTED_TITLE", "value": "PulseGuard", "secret": False}
+            ]
+        }
         self.entry_url = "https://example.com"
         self.viewport_mode = "web"
         self.timeout_ms = 1000
@@ -76,6 +85,52 @@ class UiAssertionTests(unittest.TestCase):
     def test_normalize_ui_assertions_requires_selector_for_element_rules(self) -> None:
         with self.assertRaisesRegex(ValueError, "选择器不能为空"):
             ui_assertions.normalize_ui_assertions('[{"type":"element_visible"}]')
+
+    def test_normalize_ui_assertions_preserves_selector_metadata(self) -> None:
+        normalized = ui_assertions.normalize_ui_assertions(
+            """
+            [{
+              "type":"element_visible",
+              "selector":"#submit",
+              "selector_type":"role",
+              "selector_stability":"low",
+              "selector_score":72.5
+            }]
+            """
+        )
+
+        self.assertEqual(normalized[0]["selector_type"], "role")
+        self.assertEqual(normalized[0]["selector_stability"], "low")
+        self.assertEqual(normalized[0]["selector_score"], 72.5)
+
+    def test_inspect_ui_selector_rules_reports_selector_health(self) -> None:
+        page = FakePage()
+
+        results = asyncio.run(
+            ui_assertions.inspect_ui_selector_rules(
+                """
+                [
+                  {"id":"ok","type":"element_visible","selector":"#app"},
+                  {"id":"missing","type":"element_visible","selector":".missing"},
+                  {"id":"multiple","type":"element_not_empty","selector":".many"},
+                  {"id":"count","type":"element_count","selector":".many","operator":"gte","expected_count":2},
+                  {"id":"invalid","type":"element_visible","selector":".invalid"},
+                  {"id":"disabled","type":"element_visible","selector":"#app","enabled":false},
+                  {"id":"text","type":"title_contains","expected_text":"PulseGuard"}
+                ]
+                """,
+                page,
+            )
+        )
+
+        statuses = {item["id"]: item["status"] for item in results}
+        self.assertEqual(statuses["ok"], "ok")
+        self.assertEqual(statuses["missing"], "missing")
+        self.assertEqual(statuses["multiple"], "multiple")
+        self.assertEqual(statuses["count"], "ok")
+        self.assertEqual(statuses["invalid"], "invalid_selector")
+        self.assertEqual(statuses["disabled"], "disabled")
+        self.assertNotIn("text", statuses)
 
     def test_structured_ui_check_records_results_and_passes(self) -> None:
         ctx = FakeContext(
@@ -108,7 +163,7 @@ class UiAssertionTests(unittest.TestCase):
         self.assertEqual(ctx.response_snapshot["assertions"][0]["status"], "failed")
 
     def test_setup_script_runs_on_same_page_before_assertions(self) -> None:
-        ctx = FakeContext('[{"type":"title_contains","expected_text":"PulseGuard"}]')
+        ctx = FakeContext('[{"type":"title_contains","expected_text":"${EXPECTED_TITLE}"}]')
         seen: dict[str, object] = {}
 
         async def setup(setup_ctx: FakeContext, page: FakePage) -> None:

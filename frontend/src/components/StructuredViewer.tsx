@@ -1,8 +1,8 @@
-import JsonView from "@uiw/react-json-view";
-import { Empty, Segmented } from "antd";
-import { useMemo, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { Empty, Segmented, Skeleton } from "antd";
+import { lazy, Suspense, useMemo, useState } from "react";
+
+const JsonTreeViewer = lazy(() => import("./JsonTreeViewer").then((module) => ({ default: module.JsonTreeViewer })));
+const MarkdownViewer = lazy(() => import("./MarkdownViewer").then((module) => ({ default: module.MarkdownViewer })));
 
 type ViewerMode = "auto" | "json" | "markdown" | "text";
 
@@ -49,7 +49,9 @@ function renderValue(parsed: ParsedValue, mode: Exclude<ViewerMode, "auto">) {
     }
     return (
       <div className="json-view-shell">
-        <JsonView value={asJsonObject(parsed.jsonValue)} collapsed={false} displayDataTypes={false} shortenTextAfterLength={0} />
+        <Suspense fallback={<ViewerLoading />}>
+          <JsonTreeViewer value={asJsonObject(parsed.jsonValue)} />
+        </Suspense>
       </div>
     );
   }
@@ -57,7 +59,9 @@ function renderValue(parsed: ParsedValue, mode: Exclude<ViewerMode, "auto">) {
   if (mode === "markdown") {
     return (
       <div className="markdown-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{parsed.text}</ReactMarkdown>
+        <Suspense fallback={<ViewerLoading />}>
+          <MarkdownViewer value={parsed.text} />
+        </Suspense>
       </div>
     );
   }
@@ -123,6 +127,14 @@ function parseViewerValue(value: unknown): ParsedValue {
       detectedMode: looksLikeMarkdown(text) ? "markdown" : "text"
     };
   }
+}
+
+function ViewerLoading() {
+  return (
+    <div className="structured-viewer-loading">
+      <Skeleton active paragraph={{ rows: 3 }} title={false} />
+    </div>
+  );
 }
 
 function looksLikeMarkdown(text: string): boolean {

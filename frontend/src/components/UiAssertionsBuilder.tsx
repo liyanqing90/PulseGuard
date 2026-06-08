@@ -19,7 +19,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { api } from "../api";
-import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult } from "../types";
+import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult, UiRuleInspectItem, UiRuleInspectResult } from "../types";
 import { createUiAssertion, parseUiAssertions, serializeUiAssertions, UI_ASSERTION_LABELS } from "../uiAssertions";
 import { VIEWPORT_PRESETS } from "./ViewportModeControl";
 
@@ -72,6 +72,7 @@ interface Props {
 
 export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   const { message } = App.useApp();
+  const [modal, modalContextHolder] = Modal.useModal();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [inspectResult, setInspectResult] = useState<UiInspectResult | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<UiElementCandidate | null>(null);
@@ -80,11 +81,18 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   const [candidateQuery, setCandidateQuery] = useState("");
   const [inspecting, setInspecting] = useState(false);
   const [inspectError, setInspectError] = useState<string | null>(null);
+  const [ruleInspecting, setRuleInspecting] = useState(false);
+  const [ruleInspectResult, setRuleInspectResult] = useState<UiRuleInspectResult | null>(null);
   const candidateItemRefs = useRef<Map<string, HTMLElement>>(new Map());
   const previewScrollRef = useRef<HTMLDivElement | null>(null);
   const previewStageRef = useRef<HTMLDivElement | null>(null);
   const assertions = useMemo(() => parseUiAssertions(value), [value]);
   const enabledCount = assertions.filter((item) => item.enabled).length;
+  const selectorRuleCount = assertions.filter(isSelectorAssertion).length;
+  const ruleInspectionById = useMemo(
+    () => new Map((ruleInspectResult?.results || []).map((result) => [result.id, result])),
+    [ruleInspectResult]
+  );
   const filteredCandidates = useMemo(() => {
     if (!inspectResult) return [];
     const query = candidateQuery.trim().toLowerCase();
@@ -130,6 +138,10 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     setSelectedCandidate(null);
     setPickerSelections({});
   }, [viewportMode]);
+
+  useEffect(() => {
+    setRuleInspectResult(null);
+  }, [check.entry_url, check.setup_script, check.timeout_ms, value, viewportMode]);
 
   function commit(next: UiAssertion[]) {
     onChange(serializeUiAssertions(next));
@@ -192,6 +204,9 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     } else {
       assertion.selector = candidate.selector;
     }
+    if (assertion.selector) {
+      applyCandidateSelectorMetadata(assertion, candidate);
+    }
     return assertion;
   }
 
@@ -213,17 +228,47 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     if (!inspectResult || pendingRuleCount === 0) return;
     const candidateMap = new Map(inspectResult.candidates.map((candidate) => [candidateKey(candidate), candidate]));
     const nextAssertions: UiAssertion[] = [];
+    const lowStabilityCandidates = new Map<string, UiElementCandidate>();
     Object.entries(pickerSelections).forEach(([key, selection]) => {
       const candidate = candidateMap.get(key);
       if (!candidate) return;
       CANDIDATE_RULE_OPTIONS.forEach((option) => {
-        if (selection[option.type]) nextAssertions.push(buildCandidateAssertion(candidate, option.type));
+        if (!selection[option.type]) return;
+        if (candidate.stability === "low" && option.type !== "text_present") {
+          lowStabilityCandidates.set(key, candidate);
+        }
+        nextAssertions.push(buildCandidateAssertion(candidate, option.type));
       });
     });
     if (!nextAssertions.length) return;
-    commit([...assertions, ...nextAssertions]);
-    setPickerSelections({});
-    setPickerOpen(false);
+    const persist = () => {
+      commit([...assertions, ...nextAssertions]);
+      setPickerSelections({});
+      setPickerOpen(false);
+    };
+    if (lowStabilityCandidates.size) {
+      const candidates = Array.from(lowStabilityCandidates.values()).slice(0, 4);
+      modal.confirm({
+        title: "低稳定性 selector",
+        content: (
+          <div className="ui-selector-warning">
+            <p>以下 selector 页面结构变化时更容易失效，建议优先选择 testid、role 或更稳定的元素。</p>
+            <ul>
+              {candidates.map((candidate) => (
+                <li key={candidateKey(candidate)} title={candidate.selector}>
+                  {candidateDisplayName(candidate)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ),
+        okText: "继续保存",
+        cancelText: "返回调整",
+        onOk: persist
+      });
+      return;
+    }
+    persist();
   }
 
   function updateAssertion(id: string, patch: Partial<UiAssertion>) {
@@ -260,7 +305,8 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         timeout_ms: check.timeout_ms,
         viewport_mode: viewportMode,
         viewport_width: currentPreset.width,
-        viewport_height: currentPreset.height
+        viewport_height: currentPreset.height,
+        setup_script: check.setup_script || ""
       });
       setInspectResult(result);
       setCandidateSelectionSource("scan");
@@ -273,6 +319,43 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       message.error(nextError);
     } finally {
       setInspecting(false);
+    }
+  }
+
+  async function inspectRules() {
+    const entryUrl = check.entry_url.trim();
+    if (!entryUrl) {
+      message.warning("请先填写页面 URL");
+      return;
+    }
+    if (!selectorRuleCount) {
+      message.warning("当前没有可检测的 selector 规则");
+      return;
+    }
+    setRuleInspecting(true);
+    try {
+      const result = await api.inspectUiRules({
+        type: "ui",
+        entry_url: entryUrl,
+        timeout_ms: check.timeout_ms,
+        viewport_mode: viewportMode,
+        viewport_width: currentPreset.width,
+        viewport_height: currentPreset.height,
+        setup_script: check.setup_script || "",
+        assertions_json: serializeUiAssertions(assertions)
+      });
+      setRuleInspectResult(result);
+      const abnormal = result.results.filter((item) => item.status !== "ok" && item.status !== "disabled");
+      if (abnormal.length) {
+        message.warning(`检测完成，${abnormal.length} 条 selector 需要关注`);
+      } else {
+        message.success("检测完成，selector 匹配正常");
+      }
+    } catch (err) {
+      const nextError = (err as Error).message;
+      message.error(nextError);
+    } finally {
+      setRuleInspecting(false);
     }
   }
 
@@ -294,7 +377,12 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       dataIndex: "enabled",
       width: 64,
       render: (_, assertion) => (
-        <Switch size="small" checked={assertion.enabled} onChange={(enabled) => updateAssertion(assertion.id, { enabled })} />
+        <Switch
+          size="small"
+          aria-label={`${UI_ASSERTION_LABELS[assertion.type]} 规则启用状态`}
+          checked={assertion.enabled}
+          onChange={(enabled) => updateAssertion(assertion.id, { enabled })}
+        />
       )
     },
     {
@@ -306,7 +394,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
     {
       title: "规则",
       dataIndex: "selector",
-      render: (_, assertion) => renderRuleEditor(assertion, updateAssertion)
+      render: (_, assertion) => renderRuleEditor(assertion, updateAssertion, ruleInspectionById.get(assertion.id))
     },
     {
       title: "操作",
@@ -314,7 +402,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       align: "center",
       render: (_, assertion) => (
         <Tooltip title="删除规则">
-          <Button size="small" danger icon={<Trash2 size={15} />} onClick={() => removeAssertion(assertion.id)} />
+          <Button size="small" danger aria-label="删除规则" icon={<Trash2 size={15} />} onClick={() => removeAssertion(assertion.id)} />
         </Tooltip>
       )
     }
@@ -322,6 +410,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
 
   return (
     <section className="ui-assertions-panel">
+      {modalContextHolder}
       <div className="section-title ui-assertions-header">
         <div>
           <h3>UI 校验</h3>
@@ -330,6 +419,9 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
         <Space wrap>
           <Button icon={<MousePointer2 size={15} />} onClick={openPicker}>
             选择元素
+          </Button>
+          <Button icon={<ScanSearch size={15} />} onClick={() => void inspectRules()} loading={ruleInspecting} disabled={!selectorRuleCount}>
+            检测规则
           </Button>
           <Button icon={<Plus size={15} />} onClick={() => addAssertion("title_contains")}>
             添加标题校验
@@ -355,6 +447,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
           columns={columns}
           dataSource={assertions}
           className="ui-assertions-table"
+          scroll={{ x: 720 }}
         />
       )}
 
@@ -546,7 +639,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
   );
 }
 
-function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Partial<UiAssertion>) => void) {
+function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Partial<UiAssertion>) => void, ruleInspection?: UiRuleInspectItem) {
   if (["element_visible", "element_hidden", "element_not_empty"].includes(assertion.type)) {
     return (
       <Space className="ui-assertion-rule" wrap>
@@ -555,6 +648,8 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
           placeholder="CSS / text= / role= Playwright 选择器…"
           onChange={(event) => update(assertion.id, { selector: event.target.value })}
         />
+        {renderSelectorMetadata(assertion)}
+        {renderRuleInspection(ruleInspection)}
       </Space>
     );
   }
@@ -577,6 +672,8 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
           placeholder="CSS / text= / role= Playwright 选择器…"
           onChange={(event) => update(assertion.id, { selector: event.target.value })}
         />
+        {renderSelectorMetadata(assertion)}
+        {renderRuleInspection(ruleInspection)}
         <Select
           value={assertion.operator || "eq"}
           className="ui-assertion-operator"
@@ -592,6 +689,49 @@ function renderRuleEditor(assertion: UiAssertion, update: (id: string, patch: Pa
     );
   }
   return <Tag color="success">无需配置</Tag>;
+}
+
+function renderRuleInspection(result?: UiRuleInspectItem) {
+  if (!result) return null;
+  const meta = ruleInspectionMeta(result);
+  return (
+    <Tooltip title={result.message || meta.tooltip}>
+      <Tag color={meta.color}>{meta.label}</Tag>
+    </Tooltip>
+  );
+}
+
+function ruleInspectionMeta(result: UiRuleInspectItem): { label: string; color: string; tooltip: string } {
+  if (result.status === "ok") {
+    return { label: typeof result.count === "number" ? `匹配 ${result.count}` : "匹配正常", color: "success", tooltip: "selector 当前匹配正常" };
+  }
+  if (result.status === "missing") return { label: "未匹配", color: "warning", tooltip: "selector 当前未匹配到元素" };
+  if (result.status === "multiple") return { label: `匹配 ${result.count ?? "多"} 个`, color: "warning", tooltip: "selector 当前匹配多个元素" };
+  if (result.status === "invalid_selector") return { label: "选择器无效", color: "error", tooltip: "selector 无法解析" };
+  if (result.status === "disabled") return { label: "未检测", color: "default", tooltip: "规则已停用" };
+  return { label: "检测失败", color: "error", tooltip: "规则检测失败" };
+}
+
+function renderSelectorMetadata(assertion: UiAssertion) {
+  if (!assertion.selector_type && !assertion.selector_stability && typeof assertion.selector_score !== "number") return null;
+  const stability = assertion.selector_stability;
+  const label = stability ? `稳定性${stabilityLabel(stability)}` : "扫描来源";
+  const score = typeof assertion.selector_score === "number" ? `，评分 ${Math.round(assertion.selector_score)}` : "";
+  return (
+    <Tooltip title={`来源 ${assertion.selector_type || "未知"}${score}`}>
+      <Tag color={candidateStabilityColor(stability)}>{label}</Tag>
+    </Tooltip>
+  );
+}
+
+function isSelectorAssertion(assertion: UiAssertion): boolean {
+  return ["element_visible", "element_hidden", "element_not_empty", "element_count"].includes(assertion.type);
+}
+
+function applyCandidateSelectorMetadata(assertion: UiAssertion, candidate: UiElementCandidate) {
+  if (candidate.selector_type) assertion.selector_type = candidate.selector_type;
+  if (candidate.stability) assertion.selector_stability = candidate.stability;
+  if (typeof candidate.score === "number") assertion.selector_score = candidate.score;
 }
 
 function candidateStabilityColor(stability: UiElementCandidate["stability"]) {

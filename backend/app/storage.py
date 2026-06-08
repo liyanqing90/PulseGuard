@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -12,9 +13,11 @@ from .artifacts import cleanup_old_artifacts
 from .config import DB_PATH, ensure_runtime_dirs
 from .defaults import DEFAULT_SETTINGS, DEMO_CHECKS
 from .schemas import normalize_settings_values
+from .variables import is_sensitive_variable_name
 
 
 _LOCK = threading.RLock()
+_TAG_SPLIT_PATTERN = re.compile(r"[,\s]+")
 
 
 def now_iso() -> str:
@@ -47,6 +50,7 @@ def init_db() -> None:
                 setup_script TEXT NOT NULL DEFAULT '',
                 script TEXT NOT NULL,
                 tags TEXT,
+                alert_policy_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -68,6 +72,11 @@ def init_db() -> None:
                 response_path TEXT,
                 request_snapshot TEXT,
                 response_snapshot TEXT,
+                runner_name TEXT,
+                runner_address TEXT,
+                runner_region TEXT,
+                runner_browser_version TEXT,
+                failure_kind TEXT,
                 notification_status TEXT,
                 notification_channel TEXT,
                 notification_error TEXT,
@@ -94,10 +103,67 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS heartbeats (
+                key TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'ok',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                received_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                entity_name TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS check_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                check_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS run_archives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_date TEXT NOT NULL,
+                check_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                duration_sum_ms INTEGER NOT NULL DEFAULT 0,
+                duration_sample_count INTEGER NOT NULL DEFAULT 0,
+                last_run_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(archive_date, check_type, status)
+            );
+
+            CREATE TABLE IF NOT EXISTS probe_runners (
+                runner_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL DEFAULT '',
+                network_region TEXT NOT NULL DEFAULT 'local',
+                browser_version TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'ok',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_checks_type ON checks(type);
             CREATE INDEX IF NOT EXISTS idx_runs_check_id ON runs(check_id);
             CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_runs_type_status ON runs(check_type, status);
+            CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_check_versions_check_id ON check_versions(check_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_run_archives_date ON run_archives(archive_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_probe_runners_region ON probe_runners(network_region, status);
             """
         )
         _ensure_check_columns(conn)
@@ -130,6 +196,18 @@ def list_checks(check_type: str | None = None, enabled_only: bool = False) -> li
         return [_normalize_check(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def check_tag_set(tags: str | None) -> set[str]:
+    return {item.strip().lower() for item in _TAG_SPLIT_PATTERN.split(tags or "") if item.strip()}
+
+
+def select_checks_for_batch(check_type: str | None = None, tag: str | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
+    checks = list_checks(check_type, enabled_only=enabled_only)
+    normalized_tag = (tag or "").strip().lower()
+    if not normalized_tag:
+        return checks
+    return [check for check in checks if normalized_tag in check_tag_set(check.get("tags"))]
+
+
 def get_check(check_id: int) -> dict[str, Any] | None:
     with _LOCK, _connect() as conn:
         row = conn.execute(
@@ -154,8 +232,8 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO checks (
                 name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
-                headers_json, body, assertions_json, setup_script, script, tags, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["name"].strip(),
@@ -172,6 +250,7 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
                 data.get("setup_script") or "",
                 data.get("script") or "",
                 data.get("tags") or "",
+                data.get("alert_policy_json") or "{}",
                 timestamp,
                 timestamp,
             ),
@@ -188,7 +267,7 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
             UPDATE checks
             SET name = ?, type = ?, enabled = ?, interval_seconds = ?, timeout_ms = ?,
                 entry_url = ?, viewport_mode = ?, method = ?, headers_json = ?, body = ?, assertions_json = ?, setup_script = ?,
-                script = ?, tags = ?, updated_at = ?
+                script = ?, tags = ?, alert_policy_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -206,6 +285,7 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("setup_script") or "",
                 data.get("script") or "",
                 data.get("tags") or "",
+                data.get("alert_policy_json") or "{}",
                 timestamp,
                 check_id,
             ),
@@ -233,11 +313,174 @@ def set_check_enabled(check_id: int, enabled: bool) -> dict[str, Any] | None:
     return get_check(check_id)
 
 
+def batch_set_check_enabled(check_ids: list[int], enabled: bool) -> int:
+    ids = _clean_check_ids(check_ids)
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            f"UPDATE checks SET enabled = ?, updated_at = ? WHERE id IN ({placeholders})",
+            [1 if enabled else 0, now_iso(), *ids],
+        )
+        return int(cursor.rowcount)
+
+
+def batch_update_check_interval(check_ids: list[int], interval_seconds: int) -> int:
+    ids = _clean_check_ids(check_ids)
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            f"UPDATE checks SET interval_seconds = ?, updated_at = ? WHERE id IN ({placeholders})",
+            [int(interval_seconds), now_iso(), *ids],
+        )
+        return int(cursor.rowcount)
+
+
+def _clean_check_ids(check_ids: list[int]) -> list[int]:
+    cleaned: list[int] = []
+    seen: set[int] = set()
+    for raw in check_ids:
+        check_id = int(raw)
+        if check_id <= 0 or check_id in seen:
+            continue
+        seen.add(check_id)
+        cleaned.append(check_id)
+    return cleaned
+
+
+def record_heartbeat(key: str, status: str = "ok", message: str = "", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    heartbeat_key = key.strip()
+    timestamp = now_iso()
+    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO heartbeats(key, status, message, payload_json, received_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                status = excluded.status,
+                message = excluded.message,
+                payload_json = excluded.payload_json,
+                received_at = excluded.received_at,
+                updated_at = excluded.updated_at
+            """,
+            (heartbeat_key, status, message, payload_json, timestamp, timestamp),
+        )
+    return get_heartbeat(heartbeat_key)  # type: ignore[return-value]
+
+
+def get_heartbeat(key: str) -> dict[str, Any] | None:
+    heartbeat_key = key.strip()
+    if not heartbeat_key:
+        return None
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM heartbeats WHERE key = ?", (heartbeat_key,)).fetchone()
+    return _normalize_heartbeat(row) if row else None
+
+
+def record_audit_event(
+    action: str,
+    entity_type: str,
+    entity_id: int | str | None = None,
+    entity_name: str = "",
+    summary: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO audit_events(action, entity_type, entity_id, entity_name, summary, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                action,
+                entity_type,
+                str(entity_id) if entity_id is not None else None,
+                entity_name,
+                summary,
+                json.dumps(payload or {}, ensure_ascii=False),
+                timestamp,
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+    return get_audit_event(event_id)  # type: ignore[return-value]
+
+
+def get_audit_event(event_id: int) -> dict[str, Any] | None:
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM audit_events WHERE id = ?", (event_id,)).fetchone()
+    return _normalize_audit_event(row) if row else None
+
+
+def list_audit_events(limit: int = 100) -> list[dict[str, Any]]:
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_events ORDER BY created_at DESC, id DESC LIMIT ?",
+            (max(1, min(500, int(limit))),),
+        ).fetchall()
+    return [_normalize_audit_event(row) for row in rows]
+
+
+def record_check_version(check: dict[str, Any], action: str) -> dict[str, Any]:
+    timestamp = now_iso()
+    check_id = int(check["id"])
+    snapshot = _check_snapshot(check)
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO check_versions(check_id, action, snapshot_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (check_id, action, json.dumps(snapshot, ensure_ascii=False), timestamp),
+        )
+        version_id = int(cursor.lastrowid)
+    return get_check_version(version_id)  # type: ignore[return-value]
+
+
+def get_check_version(version_id: int) -> dict[str, Any] | None:
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM check_versions WHERE id = ?", (version_id,)).fetchone()
+    return _normalize_check_version(row) if row else None
+
+
+def list_check_versions(check_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM check_versions
+            WHERE check_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (check_id, max(1, min(200, int(limit)))),
+        ).fetchall()
+    return [_normalize_check_version(row) for row in rows]
+
+
+def list_run_archives(limit: int = 90) -> list[dict[str, Any]]:
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM run_archives
+            ORDER BY archive_date DESC, check_type ASC, status ASC
+            LIMIT ?
+            """,
+            (max(1, min(365, int(limit))),),
+        ).fetchall()
+    return [_normalize_run_archive(row) for row in rows]
+
+
 def create_run(check: dict[str, Any], status: str = "running", error_message: str | None = None) -> dict[str, Any]:
     timestamp = now_iso()
     finished_at = timestamp if status == "skipped" else None
     duration_ms = 0 if status == "skipped" else None
     notification_status = "not_required" if status == "skipped" else None
+    runner = check.get("_runner") if isinstance(check.get("_runner"), dict) else {}
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
@@ -245,9 +488,10 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 check_id, check_name, check_type, status, started_at, finished_at,
                 duration_ms, error_message, error_stack, logs, screenshot_path,
                 trace_path, response_path, request_snapshot, response_snapshot,
+                runner_name, runner_address, runner_region, runner_browser_version, failure_kind,
                 notification_status, notification_channel, notification_error,
                 notification_sent_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(check["id"]),
@@ -265,6 +509,11 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 None,
                 None,
                 None,
+                runner.get("runner_name"),
+                runner.get("runner_address"),
+                runner.get("runner_region"),
+                runner.get("runner_browser_version"),
+                runner.get("failure_kind"),
                 notification_status,
                 None,
                 None,
@@ -303,7 +552,9 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
             UPDATE runs
             SET status = ?, finished_at = ?, duration_ms = ?, error_message = ?,
                 error_stack = ?, logs = ?, screenshot_path = ?, trace_path = ?,
-                response_path = ?, request_snapshot = ?, response_snapshot = ?
+                response_path = ?, request_snapshot = ?, response_snapshot = ?,
+                runner_name = ?, runner_address = ?, runner_region = ?,
+                runner_browser_version = ?, failure_kind = ?
             WHERE id = ?
             """,
             (
@@ -318,12 +569,75 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("response_path"),
                 data.get("request_snapshot"),
                 data.get("response_snapshot"),
+                data.get("runner_name"),
+                data.get("runner_address"),
+                data.get("runner_region"),
+                data.get("runner_browser_version"),
+                data.get("failure_kind"),
                 run_id,
             ),
         )
         if cursor.rowcount == 0:
             return None
     return get_run(run_id)
+
+
+def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
+    timestamp = now_iso()
+    runner_id = str(data.get("runner_id") or "").strip()
+    if not runner_id:
+        raise ValueError("Runner ID 不能为空")
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO probe_runners (
+                runner_id, name, address, network_region, browser_version,
+                status, metadata_json, last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(runner_id) DO UPDATE SET
+                name = excluded.name,
+                address = excluded.address,
+                network_region = excluded.network_region,
+                browser_version = excluded.browser_version,
+                status = excluded.status,
+                metadata_json = excluded.metadata_json,
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                runner_id,
+                str(data.get("name") or runner_id).strip(),
+                str(data.get("address") or "").strip(),
+                str(data.get("network_region") or "local").strip(),
+                str(data.get("browser_version") or "").strip(),
+                str(data.get("status") or "ok").strip(),
+                json.dumps(metadata, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+    return get_probe_runner(runner_id)  # type: ignore[return-value]
+
+
+def get_probe_runner(runner_id: str) -> dict[str, Any] | None:
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+    return _normalize_probe_runner(row) if row else None
+
+
+def list_probe_runners(limit: int = 100) -> list[dict[str, Any]]:
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM probe_runners
+            ORDER BY last_seen_at DESC, runner_id ASC
+            LIMIT ?
+            """,
+            (max(1, min(500, int(limit))),),
+        ).fetchall()
+    return [_normalize_probe_runner(row) for row in rows]
 
 
 def update_run_notification(
@@ -435,6 +749,27 @@ def get_run(run_id: int) -> dict[str, Any] | None:
     return _normalize_run(row) if row else None
 
 
+def get_previous_successful_run(run: dict[str, Any]) -> dict[str, Any] | None:
+    check_id = int(run.get("check_id") or 0)
+    run_id = int(run.get("id") or 0)
+    if check_id <= 0 or run_id <= 0:
+        return None
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM runs
+            WHERE check_id = ?
+              AND status = 'ok'
+              AND id < ?
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            """,
+            (check_id, run_id),
+        ).fetchone()
+    return _normalize_run(row) if row else None
+
+
 def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[dict[str, Any]]:
     filters = filters or {}
     clauses: list[str] = []
@@ -491,10 +826,17 @@ def get_settings() -> dict[str, Any]:
 
 def get_public_settings() -> dict[str, Any]:
     settings = get_settings()
+    settings["read_only_token_set"] = bool(settings.get("read_only_token"))
+    settings["read_only_token"] = ""
     settings["notification_channels"] = [
         _public_notification_channel(channel)
         for channel in settings.get("notification_channels", [])
         if isinstance(channel, dict)
+    ]
+    settings["environment_variables"] = [
+        _public_environment_variable(variable)
+        for variable in settings.get("environment_variables", [])
+        if isinstance(variable, dict)
     ]
     return settings
 
@@ -521,13 +863,24 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_settings_update_values(values: dict[str, Any]) -> dict[str, Any]:
-    return normalize_settings_values(_preserve_notification_channel_secrets(values))
+    values = _preserve_notification_channel_secrets(values)
+    values = _preserve_environment_variable_secrets(values)
+    return normalize_settings_values(values)
 
 
 def _public_notification_channel(channel: dict[str, Any]) -> dict[str, Any]:
     public = dict(channel)
     public["dingtalk_secret_set"] = bool(public.get("dingtalk_secret"))
     public["dingtalk_secret"] = ""
+    return public
+
+
+def _public_environment_variable(variable: dict[str, Any]) -> dict[str, Any]:
+    public = dict(variable)
+    public["value_set"] = bool(public.get("value"))
+    if public.get("secret") or is_sensitive_variable_name(str(public.get("name") or "")):
+        public["secret"] = True
+        public["value"] = ""
     return public
 
 
@@ -557,6 +910,36 @@ def _preserve_notification_channel_secrets(values: dict[str, Any]) -> dict[str, 
 
     next_values = dict(values)
     next_values["notification_channels"] = merged_channels
+    return next_values
+
+
+def _preserve_environment_variable_secrets(values: dict[str, Any]) -> dict[str, Any]:
+    variables = values.get("environment_variables")
+    if not isinstance(variables, list):
+        return values
+
+    current_variables = {
+        str(variable.get("id")): variable
+        for variable in get_settings().get("environment_variables", [])
+        if isinstance(variable, dict) and variable.get("id")
+    }
+    merged_variables: list[Any] = []
+    for raw_variable in variables:
+        if not isinstance(raw_variable, dict):
+            merged_variables.append(raw_variable)
+            continue
+
+        variable = dict(raw_variable)
+        variable_id = str(variable.get("id") or "")
+        has_new_value = bool(str(variable.get("value") or ""))
+        should_clear_value = bool(variable.pop("value_clear", False))
+        is_secret = bool(variable.get("secret", False)) or is_sensitive_variable_name(str(variable.get("name") or ""))
+        if is_secret and not has_new_value and not should_clear_value and variable_id in current_variables:
+            variable["value"] = current_variables[variable_id].get("value") or ""
+        merged_variables.append(variable)
+
+    next_values = dict(values)
+    next_values["environment_variables"] = merged_variables
     return next_values
 
 
@@ -603,6 +986,7 @@ def get_overview() -> dict[str, Any]:
             LIMIT 8
             """
         ).fetchall()
+        trends = _overview_trends(conn)
 
     return {
         "ui_count": ui_count,
@@ -612,7 +996,52 @@ def get_overview() -> dict[str, Any]:
         "latest_run": _normalize_run(latest_run) if latest_run else None,
         "latest_recovered": dict(recovered) if recovered else None,
         "recent_failures": [_normalize_run(row) for row in failures],
+        "trends": trends,
     }
+
+
+def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[str, Any]]:
+    now = now or datetime.now().astimezone()
+    periods = [
+        ("24h", "近 24h", now - timedelta(hours=24)),
+        ("7d", "近 7d", now - timedelta(days=7)),
+    ]
+    trends: list[dict[str, Any]] = []
+    for key, label, cutoff in periods:
+        rows = conn.execute(
+            """
+            SELECT status, duration_ms
+            FROM runs
+            WHERE check_id > 0
+              AND started_at >= ?
+              AND started_at <= ?
+              AND status IN ('ok', 'failed', 'timeout')
+            """,
+            (cutoff.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
+        ).fetchall()
+        total = len(rows)
+        successes = sum(1 for row in rows if row["status"] == "ok")
+        failures = sum(1 for row in rows if row["status"] in {"failed", "timeout"})
+        durations = sorted(int(row["duration_ms"]) for row in rows if row["duration_ms"] is not None)
+        trends.append(
+            {
+                "key": key,
+                "label": label,
+                "runs": total,
+                "success_rate": round((successes / total) * 100, 1) if total else None,
+                "failure_count": failures,
+                "duration_p50_ms": _percentile(durations, 0.5),
+                "duration_p95_ms": _percentile(durations, 0.95),
+            }
+        )
+    return trends
+
+
+def _percentile(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    index = max(0, min(len(values) - 1, int(len(values) * percentile + 0.999999) - 1))
+    return values[index]
 
 
 def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
@@ -620,6 +1049,7 @@ def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
     retention_days = int(settings.get("run_retention_days", 30))
     cutoff = (datetime.now().astimezone() - timedelta(days=retention_days)).isoformat(timespec="seconds")
     with _LOCK, _connect() as conn:
+        _archive_runs_before(conn, cutoff)
         expired_run_ids = [
             int(row["id"])
             for row in conn.execute("SELECT id FROM runs WHERE created_at < ?", (cutoff,)).fetchall()
@@ -639,6 +1069,56 @@ def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
             for column, paths in removed_artifacts.items():
                 _clear_artifact_paths(conn, column, paths)
     return removed_runs + removed_artifact_count
+
+
+def _archive_runs_before(conn: sqlite3.Connection, cutoff: str) -> None:
+    rows = conn.execute(
+        """
+        SELECT
+            substr(started_at, 1, 10) AS archive_date,
+            check_type,
+            status,
+            COUNT(*) AS run_count,
+            COALESCE(SUM(COALESCE(duration_ms, 0)), 0) AS duration_sum_ms,
+            SUM(CASE WHEN duration_ms IS NULL THEN 0 ELSE 1 END) AS duration_sample_count,
+            MAX(started_at) AS last_run_at
+        FROM runs
+        WHERE created_at < ?
+          AND check_id > 0
+          AND status IN ('ok', 'failed', 'timeout', 'skipped')
+        GROUP BY archive_date, check_type, status
+        """,
+        (cutoff,),
+    ).fetchall()
+    timestamp = now_iso()
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO run_archives (
+                archive_date, check_type, status, run_count, duration_sum_ms,
+                duration_sample_count, last_run_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(archive_date, check_type, status) DO UPDATE SET
+                run_count = run_archives.run_count + excluded.run_count,
+                duration_sum_ms = run_archives.duration_sum_ms + excluded.duration_sum_ms,
+                duration_sample_count = run_archives.duration_sample_count + excluded.duration_sample_count,
+                last_run_at = CASE
+                    WHEN excluded.last_run_at > COALESCE(run_archives.last_run_at, '') THEN excluded.last_run_at
+                    ELSE run_archives.last_run_at
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                row["archive_date"] or "",
+                row["check_type"] or "",
+                row["status"] or "",
+                int(row["run_count"] or 0),
+                int(row["duration_sum_ms"] or 0),
+                int(row["duration_sample_count"] or 0),
+                row["last_run_at"],
+                timestamp,
+            ),
+        )
 
 
 def _clear_artifact_paths(conn: sqlite3.Connection, column: str, paths: list[str]) -> None:
@@ -673,6 +1153,7 @@ def _ensure_check_columns(conn: sqlite3.Connection) -> None:
         "assertions_json": "TEXT",
         "viewport_mode": "TEXT NOT NULL DEFAULT 'web'",
         "setup_script": "TEXT NOT NULL DEFAULT ''",
+        "alert_policy_json": "TEXT NOT NULL DEFAULT '{}'",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -682,6 +1163,13 @@ def _ensure_check_columns(conn: sqlite3.Connection) -> None:
 def _ensure_run_columns(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
     columns = {
+        "request_snapshot": "TEXT",
+        "response_snapshot": "TEXT",
+        "runner_name": "TEXT",
+        "runner_address": "TEXT",
+        "runner_region": "TEXT",
+        "runner_browser_version": "TEXT",
+        "failure_kind": "TEXT",
         "notification_status": "TEXT",
         "notification_channel": "TEXT",
         "notification_error": "TEXT",
@@ -710,6 +1198,7 @@ def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
             finished_at = COALESCE(finished_at, ?),
             duration_ms = COALESCE(duration_ms, 0),
             error_message = COALESCE(error_message, '服务启动时发现任务未完成，已标记为中断'),
+            failure_kind = COALESCE(failure_kind, 'runner'),
             notification_status = COALESCE(notification_status, 'not_required')
         WHERE status IN ('pending', 'running')
         """,
@@ -727,8 +1216,8 @@ def _seed_demo_checks(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO checks (
                 name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
-                headers_json, body, assertions_json, setup_script, script, tags, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item["name"],
@@ -745,6 +1234,7 @@ def _seed_demo_checks(conn: sqlite3.Connection) -> None:
                 item.get("setup_script") or "",
                 item["script"],
                 item["tags"],
+                item.get("alert_policy_json") or "{}",
                 timestamp,
                 timestamp,
             ),
@@ -762,6 +1252,7 @@ def _normalize_check(row: sqlite3.Row) -> dict[str, Any]:
     data["setup_script"] = data.get("setup_script") or ""
     data["script"] = data.get("script") or ""
     data["tags"] = data.get("tags") or ""
+    data["alert_policy_json"] = data.get("alert_policy_json") or "{}"
     data["current_status"] = data.get("current_status")
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
     data["last_duration_ms"] = data.get("last_duration_ms")
@@ -772,4 +1263,84 @@ def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["duration_ms"] = data.get("duration_ms")
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
+    data["failure_kind"] = _normalize_failure_kind(data.get("failure_kind"), str(data.get("status") or ""))
     return data
+
+
+def _normalize_failure_kind(value: Any, status: str) -> str:
+    failure_kind = str(value or "").strip()
+    if failure_kind in {"none", "target", "runner"}:
+        return failure_kind
+    if status in {"failed", "timeout"}:
+        return "target"
+    if status == "skipped":
+        return "runner"
+    return "none"
+
+
+def _normalize_heartbeat(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        data["payload"] = json.loads(data.get("payload_json") or "{}")
+    except json.JSONDecodeError:
+        data["payload"] = {}
+    data.pop("payload_json", None)
+    return data
+
+
+def _normalize_audit_event(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        data["payload"] = json.loads(data.get("payload_json") or "{}")
+    except json.JSONDecodeError:
+        data["payload"] = {}
+    data.pop("payload_json", None)
+    return data
+
+
+def _normalize_check_version(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        data["snapshot"] = json.loads(data.get("snapshot_json") or "{}")
+    except json.JSONDecodeError:
+        data["snapshot"] = {}
+    data.pop("snapshot_json", None)
+    return data
+
+
+def _normalize_run_archive(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    for key in ("id", "run_count", "duration_sum_ms", "duration_sample_count"):
+        data[key] = int(data.get(key) or 0)
+    return data
+
+
+def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        data["metadata"] = json.loads(data.get("metadata_json") or "{}")
+    except json.JSONDecodeError:
+        data["metadata"] = {}
+    data.pop("metadata_json", None)
+    return data
+
+
+def _check_snapshot(check: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "name",
+        "type",
+        "enabled",
+        "interval_seconds",
+        "timeout_ms",
+        "entry_url",
+        "viewport_mode",
+        "method",
+        "headers_json",
+        "body",
+        "assertions_json",
+        "setup_script",
+        "script",
+        "tags",
+        "alert_policy_json",
+    )
+    return {field: check.get(field) for field in fields}

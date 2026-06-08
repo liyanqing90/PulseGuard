@@ -1,3 +1,5 @@
+import type { ApiJsonPathOption } from "./types";
+
 export type JsonValueType = "string" | "number" | "boolean" | "object" | "array" | "null";
 
 export interface JsonPathNode {
@@ -30,6 +32,53 @@ export function buildJsonPathTree(value: unknown): JsonPathNode[] {
       children: buildChildren(value, "$")
     }
   ];
+}
+
+export function buildJsonPathTreeFromOptions(options: ApiJsonPathOption[] | undefined): JsonPathNode[] {
+  const normalizedOptions = (options || []).filter((option) => option.path?.startsWith("$"));
+  if (!normalizedOptions.length) return [];
+
+  const root: JsonPathNode = {
+    key: "$",
+    path: "$",
+    type: inferRootType(normalizedOptions),
+    preview: "",
+    length: null,
+    value: undefined,
+    children: []
+  };
+  const nodes = new Map<string, JsonPathNode>([["$", root]]);
+
+  normalizedOptions.forEach((option) => {
+    const segments = parseJsonPath(option.path);
+    let parent = root;
+    let currentPath = "$";
+    segments.forEach((segment, index) => {
+      currentPath = appendPathSegment(currentPath, segment);
+      let current = nodes.get(currentPath);
+      if (!current) {
+        current = {
+          key: currentPath,
+          path: currentPath,
+          type: inferPathType(segments[index + 1]),
+          preview: "",
+          length: null,
+          value: undefined,
+          children: []
+        };
+        nodes.set(currentPath, current);
+        parent.children = [...(parent.children || []), current];
+      }
+      if (index === segments.length - 1) {
+        current.type = option.type;
+        current.preview = option.preview || "";
+        current.length = option.length ?? null;
+      }
+      parent = current;
+    });
+  });
+
+  return [root];
 }
 
 export function flattenJsonPathTree(nodes: JsonPathNode[]): JsonPathNode[] {
@@ -111,6 +160,19 @@ function node(key: string, path: string, value: unknown): JsonPathNode {
 function childPath(parentPath: string, key: string): string {
   if (/^[A-Za-z_$][\w$]*$/.test(key)) return `${parentPath}.${key}`;
   return `${parentPath}[${JSON.stringify(key)}]`;
+}
+
+function appendPathSegment(parentPath: string, segment: string | number): string {
+  if (typeof segment === "number") return `${parentPath}[${segment}]`;
+  return childPath(parentPath, segment);
+}
+
+function inferRootType(options: ApiJsonPathOption[]): JsonValueType {
+  return options.some((option) => option.path.startsWith("$[")) ? "array" : "object";
+}
+
+function inferPathType(nextSegment: string | number | undefined): JsonValueType {
+  return typeof nextSegment === "number" ? "array" : "object";
 }
 
 function parseJsonPath(path: string): Array<string | number> {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import json
 import time
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -12,6 +13,7 @@ import httpx
 
 from . import storage
 from .schemas import NOTIFICATION_STATUSES
+from .variables import mask_text, resolve_text
 
 
 class AlertDeliveryError(RuntimeError):
@@ -28,9 +30,10 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
         _record_notification(run, "disabled")
         return
 
-    channels = _notification_channels(settings, enabled_only=True, require_webhook=True)
+    alert_settings = _resolve_alert_settings(check, settings)
+    channels = _notification_channels(alert_settings, enabled_only=True, require_webhook=True)
     if not channels:
-        _record_notification(run, "disabled")
+        _record_notification(run, "disabled", error=alert_settings.get("_alert_policy_error"))
         return
 
     if run["status"] not in ALERTABLE_RUN_STATUSES:
@@ -52,18 +55,18 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
         else:
             should_send = _cooldown_elapsed(
                 transition.get("last_notified_at"),
-                int(settings.get("alert_cooldown_minutes", 30)),
+                int(alert_settings.get("alert_cooldown_minutes", 30)),
             )
-    elif current_status == "ok" and previous_status == "failed" and settings.get("recovery_notification", True):
+    elif current_status == "ok" and previous_status == "failed" and alert_settings.get("recovery_notification", True):
         should_send = True
         is_recovery = True
 
     channel_summary = _channels_summary(channels)
     if not should_send:
-        _record_notification(run, "suppressed", channel=channel_summary, error=_suppression_reason(transition, settings))
+        _record_notification(run, "suppressed", channel=channel_summary, error=_suppression_reason(transition, alert_settings))
         return
 
-    title, text = _format_message(check, run, transition, is_recovery, settings)
+    title, text = _format_message(check, run, transition, is_recovery, alert_settings)
     failures: list[tuple[str, Exception]] = []
     sent_channels: list[dict[str, Any]] = []
 
@@ -81,7 +84,7 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
             run,
             "failed",
             channel=channel_summary,
-            error=_delivery_error_summary(failures),
+            error=_delivery_error_summary(failures, settings),
             sent_at=sent_at,
         )
         if sent_at:
@@ -120,7 +123,7 @@ async def send_test_alert(settings: dict[str, Any]) -> None:
         except Exception as exc:
             failures.append((_channel_display_name(channel), exc))
     if failures:
-        raise AlertDeliveryError(_delivery_error_summary(failures))
+        raise AlertDeliveryError(_delivery_error_summary(failures, settings))
 
 
 def build_test_alert_preview(settings: dict[str, Any]) -> dict[str, Any]:
@@ -130,6 +133,55 @@ def build_test_alert_preview(settings: dict[str, Any]) -> dict[str, Any]:
         "channels": [_channel_preview(channel, title, text) for channel in channels],
         "message_text": text,
     }
+
+
+def _resolve_alert_settings(check: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    effective = dict(settings)
+    tag_policy = _matching_tag_policy(check, settings)
+    if tag_policy:
+        _apply_alert_policy(effective, tag_policy)
+    _apply_alert_policy(effective, _check_alert_policy(check))
+    return effective
+
+
+def _matching_tag_policy(check: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    check_tags = _check_tags(check.get("tags"))
+    if not check_tags:
+        return {}
+    for policy in settings.get("alert_tag_policies") or []:
+        if not isinstance(policy, dict) or not policy.get("enabled", True):
+            continue
+        if str(policy.get("tag") or "").strip().lower() in check_tags:
+            return policy
+    return {}
+
+
+def _check_alert_policy(check: dict[str, Any]) -> dict[str, Any]:
+    value = check.get("alert_policy_json")
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _apply_alert_policy(settings: dict[str, Any], policy: dict[str, Any]) -> None:
+    if "alert_cooldown_minutes" in policy:
+        settings["alert_cooldown_minutes"] = policy.get("alert_cooldown_minutes")
+    if "recovery_notification" in policy:
+        settings["recovery_notification"] = policy.get("recovery_notification")
+    if "notification_channel_ids" in policy:
+        settings["notification_channel_ids"] = policy.get("notification_channel_ids")
+
+
+def _check_tags(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    return {tag.strip().lower() for tag in value.split(",") if tag.strip()}
 
 
 async def send_webhook_alert(channel: dict[str, Any], title: str, text: str) -> None:
@@ -159,29 +211,41 @@ def _notification_channels(
     require_webhook: bool,
 ) -> list[dict[str, Any]]:
     channels: list[dict[str, Any]] = []
+    channel_ids = settings.get("notification_channel_ids")
+    selected_ids = {str(item) for item in channel_ids} if isinstance(channel_ids, list) else None
+    missing_ids = set(selected_ids or set())
     for raw_channel in settings.get("notification_channels") or []:
         if not isinstance(raw_channel, dict):
             continue
 
+        channel_id = str(raw_channel.get("id") or "")
+        if selected_ids is not None:
+            if channel_id not in selected_ids:
+                continue
+
         channel_type = _channel_type(raw_channel)
-        webhook_url = str(raw_channel.get("webhook_url") or "").strip()
+        webhook_url = resolve_text(raw_channel.get("webhook_url") or "", settings).strip()
         enabled = bool(raw_channel.get("enabled", True))
         if enabled_only and not enabled:
             continue
         if require_webhook and not webhook_url:
             continue
+        if selected_ids is not None:
+            missing_ids.discard(channel_id)
 
         channels.append(
             {
-                "id": str(raw_channel.get("id") or ""),
+                "id": channel_id,
                 "name": str(raw_channel.get("name") or _channel_type_label(channel_type)).strip()
                 or _channel_type_label(channel_type),
                 "type": channel_type,
                 "enabled": enabled,
                 "webhook_url": webhook_url,
-                "dingtalk_secret": str(raw_channel.get("dingtalk_secret") or "").strip(),
+                "dingtalk_secret": resolve_text(raw_channel.get("dingtalk_secret") or "", settings).strip(),
             }
         )
+    if selected_ids is not None and missing_ids:
+        settings["_alert_policy_error"] = f"告警策略引用的通知渠道不存在或不可用：{'、'.join(sorted(missing_ids))}"
     return channels
 
 
@@ -220,14 +284,14 @@ def _channels_summary(channels: list[dict[str, Any]]) -> str | None:
     return "、".join(_channel_display_name(channel) for channel in channels)
 
 
-def _delivery_error_summary(failures: list[tuple[str, Exception]]) -> str:
-    messages = [f"{name}：{_safe_error(exc)}" for name, exc in failures]
+def _delivery_error_summary(failures: list[tuple[str, Exception]], settings: dict[str, Any]) -> str:
+    messages = [f"{name}：{_safe_error(exc, settings)}" for name, exc in failures]
     return "；".join(messages)[:500]
 
 
-def _safe_error(exc: Exception) -> str:
+def _safe_error(exc: Exception, settings: dict[str, Any]) -> str:
     message = str(exc) or exc.__class__.__name__
-    return message[:500]
+    return mask_text(message, settings)[:500]
 
 
 def _test_alert_message() -> tuple[str, str]:
@@ -416,7 +480,7 @@ def _format_message(
     else:
         lines.extend(
             [
-                f"- 错误：{run.get('error_message') or '未提供错误摘要'}",
+                f"- 错误：{mask_text(run.get('error_message') or '未提供错误摘要', settings)}",
                 f"- 连续失败：{transition.get('consecutive_failures', 1)}",
                 f"- 耗时：{run.get('duration_ms') or 0}ms",
             ]

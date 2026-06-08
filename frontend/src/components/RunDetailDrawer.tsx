@@ -1,7 +1,7 @@
 import { Alert, Button, Drawer, Skeleton, Space } from "antd";
 import { ExternalLink, ListChecks, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { Run } from "../types";
 import { checkListPath } from "../utils";
@@ -15,6 +15,7 @@ interface Props {
 }
 
 export function RunDetailDrawer({ runId, onClose, onRerun, returnTo }: Props) {
+  const navigate = useNavigate();
   const [run, setRun] = useState<Run | null>(null);
   const [loading, setLoading] = useState(false);
   const [rerunning, setRerunning] = useState(false);
@@ -60,13 +61,13 @@ export function RunDetailDrawer({ runId, onClose, onRerun, returnTo }: Props) {
       extra={
         run ? (
           <Space wrap>
-            <Link to={runDetailPath(run.id, returnTo)}>
-              <Button icon={<ExternalLink size={16} />}>完整详情</Button>
-            </Link>
+            <Button icon={<ExternalLink size={16} />} onClick={() => navigate(runDetailPath(run.id, returnTo))}>
+              完整详情
+            </Button>
             {run.check_id > 0 && (
-              <Link to={checkListPath(run.check_type, run.check_id)}>
-                <Button icon={<ListChecks size={16} />}>定位任务</Button>
-              </Link>
+              <Button icon={<ListChecks size={16} />} onClick={() => navigate(checkListPath(run.check_type, run.check_id))}>
+                定位任务
+              </Button>
             )}
             {onRerun && run.check_id > 0 && (
               <Button icon={<RefreshCw size={16} />} onClick={handleRerun} loading={rerunning}>

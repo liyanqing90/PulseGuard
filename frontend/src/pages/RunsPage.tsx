@@ -1,20 +1,26 @@
-import { Alert, Button, DatePicker, Dropdown, Empty, Input, Pagination, Select, Skeleton, Space, Table, Tag } from "antd";
-import type { MenuProps } from "antd";
+import { Alert, Button, DatePicker, Empty, Input, Pagination, Select, Skeleton, Space, Table, Tag, Tooltip } from "antd";
+import type { PaginationProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import dayjs from "dayjs";
 import type { Dayjs } from "dayjs";
-import { Download, Eye, FilterX, RefreshCw, RotateCcw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Eye, FilterX, RefreshCw, RotateCcw } from "lucide-react";
+import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } from "react";
+import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { RunDetailDrawer } from "../components/RunDetailDrawer";
-import { RunStatusBadge } from "../components/StatusBadge";
 import type { CheckType, NotificationStatus, Run, RunStatus } from "../types";
-import { artifactHref, formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, notificationStatusTagColor, runStatusLabel } from "../utils";
+import { formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, notificationStatusTagColor, runStatusLabel, runStatusTagColor } from "../utils";
 
 const { RangePicker } = DatePicker;
 const HISTORY_PAGE_SIZE = 12;
 const NOTIFICATION_STATUS_VALUES = ["sent", "failed", "suppressed", "disabled", "not_required"] as const;
+const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
+
+const runPaginationItemRender: PaginationProps["itemRender"] = (_, itemType, originalElement) => {
+  const label = itemType === "prev" ? "上一页执行记录" : itemType === "next" ? "下一页执行记录" : "";
+  if (!label || !isValidElement(originalElement)) return originalElement;
+  return cloneElement(originalElement as ReactElement<Record<string, unknown>>, { "aria-label": label, title: label });
+};
 
 const NOTIFICATION_FILTER_OPTIONS: Array<{ label: string; value: NotificationStatus | "" }> = [
   { label: "全部告警", value: "" },
@@ -217,10 +223,20 @@ export function RunsPage() {
             {value}
           </Button>
           {run.check_id <= 0 && <Tag>草稿调试</Tag>}
+          <Tooltip title={runnerTooltip(run)}>
+            <span className="history-runner-meta">{runnerSummary(run)}</span>
+          </Tooltip>
         </Space>
       )
     },
-    { title: "状态", dataIndex: "status", render: (_, run) => <RunStatusBadge status={run.status} />, width: 92, align: "center" },
+    { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 92, align: "center" },
+    {
+      title: "归因",
+      dataIndex: "failure_kind",
+      render: (_, run) => failureKindTag(run),
+      width: 92,
+      align: "center"
+    },
     {
       title: "告警",
       dataIndex: "notification_status",
@@ -234,18 +250,12 @@ export function RunsPage() {
     { title: "耗时", dataIndex: "duration_ms", render: (value?: number | null) => formatDuration(value), width: 88, align: "right" },
     { title: "错误摘要", dataIndex: "error_message", ellipsis: true, width: 144 },
     {
-      title: "产物",
-      width: 96,
-      align: "center",
-      render: (_, run) => <ArtifactMenu run={run} />
-    },
-    {
       title: "操作",
       width: 92,
       fixed: isNarrowTable ? undefined : "right",
       align: "center",
       render: (_, run) => (
-        <Space>
+        <Space className="history-row-actions" size={6}>
           <Button
             size="small"
             title="查看详情"
@@ -369,24 +379,15 @@ export function RunsPage() {
           loading={loading}
           className="history-table"
           locale={{ emptyText: <Empty description={hasFilters ? "没有符合筛选条件的执行记录" : "暂无执行记录"} /> }}
-          pagination={{ pageSize: HISTORY_PAGE_SIZE, showSizeChanger: false }}
-          scroll={{ x: 1046 }}
-          onRow={(run) => ({
-            className: "history-clickable-row",
-            role: "button",
-            tabIndex: 0,
-            "aria-label": `查看 ${run.check_name} 的执行详情`,
-            onClick: () => setDetailRunId(run.id),
-            onKeyDown: (event) => {
-              if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                setDetailRunId(run.id);
-              }
-            }
-          })}
+          pagination={{ pageSize: HISTORY_PAGE_SIZE, showSizeChanger: false, itemRender: runPaginationItemRender }}
+          scroll={{ x: 950 }}
         />
       )}
-      <RunDetailDrawer runId={detailRunId} onClose={() => setDetailRunId(null)} onRerun={rerun} returnTo={`${location.pathname}${location.search}`} />
+      {detailRunId && (
+        <Suspense fallback={null}>
+          <RunDetailDrawer runId={detailRunId} onClose={() => setDetailRunId(null)} onRerun={rerun} returnTo={`${location.pathname}${location.search}`} />
+        </Suspense>
+      )}
     </div>
   );
 }
@@ -434,7 +435,7 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
           <article className={`history-card history-card-${run.status}`} key={run.id}>
             <header className="history-card-header">
               <div className="history-card-main">
-                <div className="history-card-eyebrow">
+                <div className="history-card-context">
                   <span>{run.check_type === "ui" ? "UI" : "API"}</span>
                   <span>运行记录 #{run.id}</span>
                   {run.check_id <= 0 && <Tag>草稿调试</Tag>}
@@ -445,7 +446,8 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
                 {run.error_message && <div className="history-card-error">{run.error_message}</div>}
               </div>
               <div className="history-card-state">
-                <RunStatusBadge status={run.status} />
+                <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>
+                {failureKindTag(run)}
                 <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>
               </div>
             </header>
@@ -453,6 +455,7 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
             <div className="history-card-meta">
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
               <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
+              <HistoryMeta label="Runner" value={runnerSummary(run)} />
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
               <HistoryMeta label="连续失败" value={run.consecutive_failures || "-"} />
             </div>
@@ -470,7 +473,6 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
               >
                 重跑
               </Button>
-              <ArtifactMenu run={run} />
             </Space>
           </article>
         );
@@ -483,6 +485,7 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
           simple
           showSizeChanger={false}
           total={runs.length}
+          itemRender={runPaginationItemRender}
           onChange={onPageChange}
         />
       )}
@@ -499,50 +502,28 @@ function HistoryMeta({ label, value }: { label: string; value: string | number }
   );
 }
 
+function runnerSummary(run: Run): string {
+  const name = (run.runner_name || "local").trim();
+  const region = (run.runner_region || "").trim();
+  return region && region !== name ? `${name} · ${region}` : name;
+}
+
+function runnerTooltip(run: Run): string {
+  const details = [
+    `Runner: ${runnerSummary(run)}`,
+    run.runner_address ? `地址: ${run.runner_address}` : "",
+    run.runner_browser_version ? `浏览器: ${run.runner_browser_version}` : ""
+  ].filter(Boolean);
+  return details.join("\n");
+}
+
+function failureKindTag(run: Run) {
+  const kind = run.failure_kind || "none";
+  if (kind === "target") return <Tag color="red">目标</Tag>;
+  if (kind === "runner") return <Tag color="orange">Runner</Tag>;
+  return <span className="history-empty-cell">-</span>;
+}
+
 function runStatusFilterLabel(status: RunStatus): string {
   return status === "failed" ? "失败/超时" : runStatusLabel(status);
-}
-
-function ArtifactMenu({ run }: { run: Run }) {
-  const items = [
-    artifactItem("screenshot", "截图", run.screenshot_path),
-    artifactItem("trace", "Trace", run.trace_path),
-    artifactItem("response", "Response", run.response_path)
-  ].filter(Boolean) as MenuProps["items"];
-
-  const hasArtifacts = Boolean(items?.length);
-
-  return (
-    <Dropdown
-      disabled={!hasArtifacts}
-      trigger={["click"]}
-      menu={{
-        items,
-        onClick: ({ domEvent }) => domEvent.stopPropagation()
-      }}
-    >
-      <Button
-        size="small"
-        icon={<Download size={14} />}
-        disabled={!hasArtifacts}
-        title={hasArtifacts ? "查看产物" : "暂无产物"}
-        onClick={(event) => event.stopPropagation()}
-      >
-        产物
-      </Button>
-    </Dropdown>
-  );
-}
-
-function artifactItem(key: string, label: string, path?: string | null): NonNullable<MenuProps["items"]>[number] | null {
-  const href = artifactHref(path);
-  if (!href) return null;
-  return {
-    key,
-    label: (
-      <a href={href} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
-        {label}
-      </a>
-    )
-  };
 }

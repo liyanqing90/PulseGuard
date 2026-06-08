@@ -1,11 +1,11 @@
-import { Alert, Button, Descriptions, Empty, Image as AntImage, Space, Table, Tabs, Tag } from "antd";
+import { Alert, Button, Descriptions, Empty, Image as AntImage, Skeleton, Space, Table, Tabs, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Archive, Download, ExternalLink, FileText, Image as ImageIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import type { Run } from "../types";
-import { artifactHref, formatDate, formatDuration, parseSnapshot } from "../utils";
-import { RunStatusBadge } from "./StatusBadge";
+import { api } from "../api";
+import type { Run, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
+import { artifactHref, formatDate, formatDuration, parseSnapshot, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
 type RunResultMode = "detail" | "debug";
@@ -27,14 +27,81 @@ interface Props {
 
 export function RunResultPanel({ run, mode = "detail" }: Props) {
   const [activeTab, setActiveTab] = useState("overview");
+  const [comparison, setComparison] = useState<RunComparison | null>(null);
+  const [comparisonLoading, setComparisonLoading] = useState(false);
+  const [comparisonError, setComparisonError] = useState<string | null>(null);
+  const [failureSummary, setFailureSummary] = useState<RunFailureSummary | null>(null);
+  const [failureSummaryLoading, setFailureSummaryLoading] = useState(false);
+  const [failureSummaryError, setFailureSummaryError] = useState<string | null>(null);
   const requestSnapshot = useMemo(() => parseSnapshot(run?.request_snapshot), [run?.request_snapshot]);
   const responseSnapshot = useMemo(() => parseSnapshot(run?.response_snapshot), [run?.response_snapshot]);
   const responseBody = useMemo(() => extractResponseBody(responseSnapshot), [responseSnapshot]);
   const assertionResults = useMemo(() => extractAssertionResults(responseSnapshot), [responseSnapshot]);
+  const showComparison = Boolean(run && mode === "detail" && run.check_id > 0 && ["failed", "timeout"].includes(run.status));
+  const showFailureSummary = Boolean(run && mode === "detail" && run.check_id > 0 && ["failed", "timeout", "skipped"].includes(run.status));
+  const showDiagnostics = mode === "debug";
 
   useEffect(() => {
     setActiveTab(defaultRunTab(run, mode, responseSnapshot, assertionResults.length));
   }, [assertionResults.length, mode, responseSnapshot, run]);
+
+  useEffect(() => {
+    if (!run || !showComparison) {
+      setComparison(null);
+      setComparisonError(null);
+      setComparisonLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setComparisonLoading(true);
+    setComparisonError(null);
+    api
+      .runComparison(run.id)
+      .then((value) => {
+        if (!cancelled) setComparison(value);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) {
+          setComparison(null);
+          setComparisonError(err.message);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setComparisonLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.id, showComparison]);
+
+  useEffect(() => {
+    if (!run || !showFailureSummary) {
+      setFailureSummary(null);
+      setFailureSummaryError(null);
+      setFailureSummaryLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setFailureSummaryLoading(true);
+    setFailureSummaryError(null);
+    api
+      .runFailureSummary(run.id)
+      .then((value) => {
+        if (!cancelled) setFailureSummary(value);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) {
+          setFailureSummary(null);
+          setFailureSummaryError(err.message);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setFailureSummaryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [run?.id, showFailureSummary]);
 
   if (!run) {
     return <Empty description={false} />;
@@ -45,7 +112,7 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
     <Space orientation="vertical" size={14} className="drawer-stack">
       <Descriptions bordered column={2} size="small">
         <Descriptions.Item label="状态">
-          <RunStatusBadge status={run.status} />
+          <RunStatusTag status={run.status} />
         </Descriptions.Item>
         <Descriptions.Item label="任务 ID">{isDraftRun ? "草稿调试" : run.check_id}</Descriptions.Item>
         <Descriptions.Item label="任务名称">{run.check_name}</Descriptions.Item>
@@ -54,41 +121,72 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
         <Descriptions.Item label="结束时间">{formatDate(run.finished_at)}</Descriptions.Item>
         <Descriptions.Item label="耗时">{formatDuration(run.duration_ms)}</Descriptions.Item>
         <Descriptions.Item label="连续失败">{run.consecutive_failures || "-"}</Descriptions.Item>
+        <Descriptions.Item label="失败归因">{failureKindTag(run.failure_kind)}</Descriptions.Item>
+        <Descriptions.Item label="Runner">{runnerSummary(run)}</Descriptions.Item>
+        <Descriptions.Item label="Runner 地址">{run.runner_address || "-"}</Descriptions.Item>
+        <Descriptions.Item label="网络区域">{run.runner_region || "-"}</Descriptions.Item>
+        <Descriptions.Item label="浏览器版本">{run.runner_browser_version || "-"}</Descriptions.Item>
       </Descriptions>
     </Space>
   );
   const errorPanel = (
     <Space orientation="vertical" size={12} className="drawer-stack">
       {run.error_message ? (
-        <Alert type="error" message="错误摘要" description={run.error_message} showIcon />
+        <Alert type="error" message="错误摘要" description={detailErrorText(run, mode)} showIcon />
       ) : (
         <Tag color="success">{mode === "debug" ? "调试无错误" : "运行无错误"}</Tag>
       )}
-      <StructuredViewer title="错误堆栈" value={run.error_stack} defaultMode="text" />
+      {showDiagnostics && <StructuredViewer title="错误堆栈" value={run.error_stack} defaultMode="text" />}
     </Space>
   );
+  const comparisonTab = showComparison
+    ? [
+        {
+          key: "compare",
+          label: "对比",
+          children: <RunComparisonPanel comparison={comparison} error={comparisonError} loading={comparisonLoading} />
+        }
+      ]
+    : [];
+  const summaryTab = showFailureSummary
+    ? [
+        {
+          key: "summary",
+          label: "摘要",
+          children: <FailureSummaryPanel summary={failureSummary} error={failureSummaryError} loading={failureSummaryLoading} />
+        }
+      ]
+    : [];
   const apiTabs = [
+    ...summaryTab,
+    ...comparisonTab,
     { key: "overview", label: "概览", children: overviewPanel },
     ...(assertionResults.length ? [{ key: "assertions", label: "校验", children: <AssertionResultsPanel results={assertionResults} /> }] : []),
-    { key: "request", label: "请求", children: <StructuredViewer title="请求快照" value={requestSnapshot} defaultMode="json" /> },
-    {
-      key: "response",
-      label: "响应",
-      children: (
-        <Space orientation="vertical" size={12} className="drawer-stack">
-          <StructuredViewer title="响应快照" value={responseSnapshot} defaultMode="json" />
-          <StructuredViewer title="响应体" value={responseBody} defaultMode="auto" />
-        </Space>
-      )
-    },
-    { key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> },
+    ...(showDiagnostics
+      ? [
+          { key: "request", label: "请求", children: <StructuredViewer title="请求快照" value={requestSnapshot} defaultMode="json" /> },
+          {
+            key: "response",
+            label: "响应",
+            children: (
+              <Space orientation="vertical" size={12} className="drawer-stack">
+                <StructuredViewer title="响应快照" value={responseSnapshot} defaultMode="json" />
+                <StructuredViewer title="响应体" value={responseBody} defaultMode="auto" />
+              </Space>
+            )
+          },
+          { key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> }
+        ]
+      : []),
     { key: "error", label: "错误", children: errorPanel }
   ];
   const uiTabs = [
+    ...summaryTab,
+    ...comparisonTab,
     { key: "overview", label: "概览", children: overviewPanel },
     ...(assertionResults.length ? [{ key: "assertions", label: "校验", children: <AssertionResultsPanel results={assertionResults} /> }] : []),
-    { key: "evidence", label: "页面证据", children: <EvidencePanel run={run} onOpenResponse={() => setActiveTab("response")} /> },
-    { key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> },
+    { key: "evidence", label: "页面证据", children: <EvidencePanel run={run} diagnosticsEnabled={showDiagnostics} onOpenResponse={() => setActiveTab("response")} /> },
+    ...(showDiagnostics ? [{ key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> }] : []),
     { key: "error", label: "错误", children: errorPanel }
   ];
   const tabItems = run.check_type === "api" ? apiTabs : uiTabs;
@@ -96,7 +194,7 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
     <Space orientation="vertical" size={16} className="drawer-stack">
       <section className={`run-detail-summary run-detail-${run.status}`}>
         <div className="run-detail-title">
-          <RunStatusBadge status={run.status} />
+          <RunStatusTag status={run.status} />
           {isDraftRun && <Tag color="blue">草稿调试</Tag>}
           <div>
             <strong>{run.check_name}</strong>
@@ -111,11 +209,12 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
         </div>
       </section>
 
-      {run.error_message && <Alert type="error" message="错误摘要" description={run.error_message} showIcon />}
+      {run.error_message && <Alert type="error" message="错误摘要" description={detailErrorText(run, mode)} showIcon />}
 
       <Tabs
         activeKey={activeTab}
         className={`run-detail-tabs ${mode === "debug" ? "debug-result-tabs" : ""}`}
+        moreIcon={<span className="tabs-more-label">更多</span>}
         onChange={setActiveTab}
         items={tabItems}
       />
@@ -127,7 +226,7 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
       <section className="run-result-panel">
         <div className="section-title">
           <h3>调试结果</h3>
-          <RunStatusBadge status={run.status} />
+          <RunStatusTag status={run.status} />
         </div>
         {content}
       </section>
@@ -135,6 +234,186 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
   }
 
   return content;
+}
+
+function FailureSummaryPanel({
+  error,
+  loading,
+  summary
+}: {
+  error: string | null;
+  loading: boolean;
+  summary: RunFailureSummary | null;
+}) {
+  if (loading) return <Skeleton active paragraph={{ rows: 4 }} />;
+  if (error) return <Alert type="error" message={error} showIcon />;
+  if (!summary) return <Empty description="暂无失败摘要" />;
+  return (
+    <Space orientation="vertical" size={12} className="drawer-stack">
+      <Alert type={summary.failure_kind === "runner" ? "warning" : "error"} message={summary.summary} showIcon />
+      <Descriptions bordered column={2} size="small">
+        {summary.signals.map((signal) => (
+          <Descriptions.Item label={signal.label} key={signal.label}>
+            {formatAssertionValue(signal.value)}
+          </Descriptions.Item>
+        ))}
+      </Descriptions>
+      <div className="failure-summary-steps">
+        {summary.next_steps.map((step) => (
+          <Tag key={step}>{step}</Tag>
+        ))}
+      </div>
+    </Space>
+  );
+}
+
+function RunComparisonPanel({
+  comparison,
+  error,
+  loading
+}: {
+  comparison: RunComparison | null;
+  error: string | null;
+  loading: boolean;
+}) {
+  if (loading) {
+    return <Skeleton active paragraph={{ rows: 6 }} />;
+  }
+  if (error) {
+    return <Alert type="error" message="对比加载失败" description={error} showIcon />;
+  }
+  if (!comparison) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无对比数据" />;
+  }
+  if (!comparison.available) {
+    return <Alert type="info" message="暂无成功基线" description={comparison.message || "同一任务暂无可对比的成功运行记录"} showIcon />;
+  }
+
+  return (
+    <Space orientation="vertical" size={14} className="drawer-stack">
+      <Descriptions bordered column={2} size="small">
+        <Descriptions.Item label="当前运行">#{comparison.current_run?.id || "-"}</Descriptions.Item>
+        <Descriptions.Item label="成功基线">#{comparison.baseline_run?.id || "-"}</Descriptions.Item>
+        <Descriptions.Item label="当前时间">{formatDate(comparison.current_run?.finished_at || comparison.current_run?.started_at)}</Descriptions.Item>
+        <Descriptions.Item label="基线时间">{formatDate(comparison.baseline_run?.finished_at || comparison.baseline_run?.started_at)}</Descriptions.Item>
+        <Descriptions.Item label="当前耗时">{formatDuration(comparison.current_run?.duration_ms)}</Descriptions.Item>
+        <Descriptions.Item label="基线耗时">{formatDuration(comparison.baseline_run?.duration_ms)}</Descriptions.Item>
+      </Descriptions>
+      <ComparisonFieldsTable fields={comparison.fields || []} />
+      <ComparisonAssertionsTable assertions={comparison.assertions || []} />
+    </Space>
+  );
+}
+
+function ComparisonFieldsTable({ fields }: { fields: RunComparisonField[] }) {
+  if (!fields.length) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无字段差异" />;
+  }
+  const columns: ColumnsType<RunComparisonField> = [
+    {
+      title: "字段",
+      dataIndex: "label",
+      width: 110,
+      render: (value: string, item) => (
+        <Space size={6}>
+          <span>{value}</span>
+          {item.changed && <Tag color="warning">变化</Tag>}
+        </Space>
+      )
+    },
+    {
+      title: "失败运行",
+      dataIndex: "current",
+      render: (value: unknown) => <code className="comparison-value">{formatAssertionValue(value)}</code>
+    },
+    {
+      title: "最近成功",
+      dataIndex: "baseline",
+      render: (value: unknown) => <code className="comparison-value">{formatAssertionValue(value)}</code>
+    }
+  ];
+  return <Table rowKey="key" size="small" pagination={false} columns={columns} dataSource={fields} scroll={{ x: 720 }} />;
+}
+
+function ComparisonAssertionsTable({ assertions }: { assertions: RunComparisonAssertion[] }) {
+  if (!assertions.length) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="关键断言无差异" />;
+  }
+  const columns: ColumnsType<RunComparisonAssertion> = [
+    {
+      title: "断言",
+      dataIndex: "rule",
+      width: 190,
+      render: (value: string, item) => (
+        <div className="assertion-result-rule">
+          <strong>{value || "-"}</strong>
+          {item.path && <span>{item.path}</span>}
+        </div>
+      )
+    },
+    {
+      title: "失败运行",
+      dataIndex: "current_status",
+      render: (value: string | null | undefined, item) => (
+        <ComparisonAssertionCell
+          status={value}
+          actual={item.current_actual}
+          operator={item.current_operator}
+          expected={item.current_expected}
+          message={item.current_message}
+        />
+      )
+    },
+    {
+      title: "最近成功",
+      dataIndex: "baseline_status",
+      render: (value: string | null | undefined, item) => (
+        <ComparisonAssertionCell
+          status={value}
+          actual={item.baseline_actual}
+          operator={item.baseline_operator}
+          expected={item.baseline_expected}
+          message={item.baseline_message}
+        />
+      )
+    }
+  ];
+  return <Table rowKey="key" size="small" pagination={false} columns={columns} dataSource={assertions} scroll={{ x: 860 }} />;
+}
+
+function ComparisonAssertionCell({
+  status,
+  actual,
+  operator,
+  expected,
+  message
+}: {
+  status?: string | null;
+  actual?: unknown;
+  operator?: string | null;
+  expected?: unknown;
+  message?: string | null;
+}) {
+  return (
+    <div className="comparison-assertion-cell">
+      <Tag color={assertionStatusColor(status)}>{assertionStatusLabel(status)}</Tag>
+      <div className="comparison-assertion-values">
+        <span className="comparison-assertion-field">
+          <span className="comparison-assertion-label">实际</span>
+          <code>{formatAssertionValue(actual)}</code>
+        </span>
+        <span className="comparison-assertion-field">
+          <span className="comparison-assertion-label">关系</span>
+          <code>{formatOperatorValue(operator)}</code>
+        </span>
+        <span className="comparison-assertion-field">
+          <span className="comparison-assertion-label">预期</span>
+          <code>{formatAssertionValue(expected)}</code>
+        </span>
+      </div>
+      {message && <span className="comparison-assertion-message">{message}</span>}
+    </div>
+  );
 }
 
 function MetaItem({ label, value }: { label: string; value: string | number }) {
@@ -205,10 +484,18 @@ function AssertionResultsPanel({ results }: { results: AssertionResult[] }) {
   );
 }
 
-function EvidencePanel({ run, onOpenResponse }: { run: Run; onOpenResponse: () => void }) {
+function EvidencePanel({
+  diagnosticsEnabled,
+  onOpenResponse,
+  run
+}: {
+  diagnosticsEnabled: boolean;
+  onOpenResponse: () => void;
+  run: Run;
+}) {
   const screenshotHref = artifactHref(run.screenshot_path);
-  const traceHref = artifactHref(run.trace_path);
-  const responseHref = artifactHref(run.response_path);
+  const traceHref = diagnosticsEnabled ? artifactHref(run.trace_path) : null;
+  const responseHref = diagnosticsEnabled ? artifactHref(run.response_path) : null;
   const hasArtifacts = Boolean(screenshotHref || traceHref || responseHref);
 
   return (
@@ -218,7 +505,7 @@ function EvidencePanel({ run, onOpenResponse }: { run: Run; onOpenResponse: () =
           <strong>现场留证</strong>
           <span>{hasArtifacts ? "已归档" : "无产物"}</span>
         </div>
-        {responseHref && (
+        {diagnosticsEnabled && responseHref && (
           <Button size="small" icon={<FileText size={15} />} onClick={onOpenResponse}>
             查看响应
           </Button>
@@ -256,22 +543,26 @@ function EvidencePanel({ run, onOpenResponse }: { run: Run; onOpenResponse: () =
             href={screenshotHref}
             actionLabel="打开原图"
           />
-          <EvidenceAction
-            icon={<Archive size={16} />}
-            title="Trace"
-            description={traceHref ? "可下载" : "未生成"}
-            href={traceHref}
-            actionLabel="下载 Trace"
-            download
-          />
-          <EvidenceAction
-            icon={<FileText size={16} />}
-            title="Response"
-            description={responseHref ? "已归档" : "未生成"}
-            href={responseHref}
-            actionLabel="下载文件"
-            download
-          />
+          {diagnosticsEnabled && (
+            <>
+              <EvidenceAction
+                icon={<Archive size={16} />}
+                title="Trace"
+                description={traceHref ? "可下载" : "未生成"}
+                href={traceHref}
+                actionLabel="下载 Trace"
+                download
+              />
+              <EvidenceAction
+                icon={<FileText size={16} />}
+                title="Response"
+                description={responseHref ? "已归档" : "未生成"}
+                href={responseHref}
+                actionLabel="下载文件"
+                download
+              />
+            </>
+          )}
         </div>
       </div>
     </section>
@@ -336,8 +627,69 @@ function formatAssertionValue(value: unknown): string {
   }
 }
 
+function RunStatusTag({ status }: { status: Run["status"] }) {
+  return <Tag color={runStatusTagColor(status)}>{runStatusLabel(status)}</Tag>;
+}
+
+function detailErrorText(run: Run, mode: RunResultMode): string {
+  if (mode === "debug") return run.error_message || "-";
+  if (run.failure_kind === "runner") return "Runner 执行异常，请查看失败摘要中的建议动作。";
+  if (run.status === "timeout") return "运行超时，请查看失败摘要和最近成功对比。";
+  if (run.status === "skipped") return "本次运行已跳过，请查看失败摘要中的跳过原因。";
+  return "运行失败，请查看失败摘要、断言结果和最近成功对比。";
+}
+
+function formatOperatorValue(value?: string | null): string {
+  if (!value) return "-";
+  const labels: Record<string, string> = {
+    eq: "=",
+    ne: "!=",
+    gt: ">",
+    gte: ">=",
+    lt: "<",
+    lte: "<=",
+    contains: "包含",
+    exists: "存在"
+  };
+  if (labels[value]) return labels[value];
+  if (/^[=!<>]+$/.test(value) || /[\u4e00-\u9fa5]/.test(value)) return value;
+  return "自定义";
+}
+
+function assertionStatusLabel(value?: string | null): string {
+  if (!value) return "缺失";
+  const labels: Record<string, string> = {
+    ok: "通过",
+    failed: "失败",
+    timeout: "超时",
+    skipped: "跳过"
+  };
+  return labels[value] || "异常";
+}
+
+function assertionStatusColor(value?: string | null): string {
+  if (!value) return "default";
+  if (value === "ok") return "success";
+  if (value === "skipped") return "default";
+  return "error";
+}
+
+function runnerSummary(run: Run): string {
+  const name = (run.runner_name || "local").trim();
+  const region = (run.runner_region || "").trim();
+  return region && region !== name ? `${name} · ${region}` : name;
+}
+
+function failureKindTag(value?: string | null) {
+  if (value === "target") return <Tag color="red">目标</Tag>;
+  if (value === "runner") return <Tag color="orange">Runner</Tag>;
+  return <Tag>无</Tag>;
+}
+
 function defaultRunTab(run: Run | null, mode: RunResultMode, responseSnapshot: unknown, assertionCount: number): string {
   if (!run) return "overview";
+  if (mode === "detail" && run.check_id > 0 && ["failed", "timeout", "skipped"].includes(run.status)) return "summary";
+  if (mode === "detail" && run.check_id > 0 && ["failed", "timeout"].includes(run.status)) return "compare";
   if (mode === "debug" && assertionCount > 0) return "assertions";
   if (mode === "debug" && run.check_type === "api" && responseSnapshot) return "response";
   if (mode === "debug" && run.error_message) return "error";
