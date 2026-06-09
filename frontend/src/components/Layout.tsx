@@ -1,5 +1,5 @@
 import { Menu, Typography } from "antd";
-import { Activity, History, LayoutDashboard, MonitorCheck, PlugZap, ScrollText, Settings, ShieldCheck } from "lucide-react";
+import { History, LayoutDashboard, MonitorCheck, PlugZap, ScrollText, Settings, ShieldCheck } from "lucide-react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
 const { Text, Title } = Typography;
@@ -40,7 +40,7 @@ export function Layout() {
       <aside className="sidebar" aria-label="主导航">
         <div className="brand">
           <div className="brand-mark">
-            <Activity aria-hidden="true" size={18} />
+            <img src="/favicon.svg" alt="" aria-hidden="true" />
           </div>
           <div>
             <Text strong className="brand-name">

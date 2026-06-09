@@ -180,6 +180,12 @@ button svg {
   color: var(--accent-deep);
 }
 
+.brand-mark img {
+  width: 24px;
+  height: 24px;
+  display: block;
+}
+
 .brand-name {
   font-weight: var(--weight-semibold);
   font-family: var(--font-heading);

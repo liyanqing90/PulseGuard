@@ -1,5 +1,11 @@
 # PulseGuard
 
+[简体中文](./README.md) | [English](./README.en.md)
+
+<p align="center">
+  <img src="./assets/brand/pulseguard-brand-card.svg" alt="PulseGuard - 本地和局域网 UI/API 探活控制台" width="100%" />
+</p>
+
 PulseGuard（脉守）是一个面向本地和局域网的小型 UI/API 探活控制台。它适合团队在内网环境里持续检查后台页面、登录前置流程、健康接口、批处理心跳、证书和基础网络可达性，并把运行历史、失败证据、告警策略和只读状态统一放在一个单实例控制台中管理。
 
 PulseGuard 不是 SaaS、公开状态页、完整 E2E 测试管理平台或 incident/on-call 系统。当前边界是单实例、本地或 LAN 使用，默认 SQLite 持久化。
@@ -171,3 +177,25 @@ uv.lock                  后端依赖锁定
 - 保持 SQLite 单实例模型，除非部署形态升级到多实例、多用户或高容量历史分析。
 - AI 辅助生成规则和 Playwright 用例导入属于后续增强，必须默认脱敏、用户确认后保存。
 - 录制器仅作为远期观察项，不进入当前主线。
+
+## 品牌资产
+
+PulseGuard 的基础品牌资产位于 `assets/brand/`：
+
+- `pulseguard-mark.svg`：浅底项目图标，适合 favicon、应用侧栏和小尺寸场景。
+- `pulseguard-brand-card.svg`：README 和项目介绍使用的横版品牌展示图。
+- `pulseguard-brand-card.en.svg`：英文 README 和英文项目介绍使用的横版品牌展示图。
+- `pulseguard-logo-concept.png`：使用 imagegen 生成的浅底概念参考，正式主标识以 SVG 文件为准。
+
+品牌图形使用项目设计系统里的浅色面板、控制蓝和状态绿，不使用深色 icon 背景、渐变或玻璃拟态。
+
+## 开源协议
+
+PulseGuard 使用 [Apache License 2.0](./LICENSE) 开源。你可以商用、修改和再分发，但必须按协议要求保留版权、许可证和项目署名信息。
+
+再分发或基于本项目修改发布时，请保留：
+
+- [LICENSE](./LICENSE)
+- [NOTICE](./NOTICE)
+- 项目名称 `PulseGuard`
+- 原始仓库链接 `https://github.com/liyanqing90/PulseGuard`
