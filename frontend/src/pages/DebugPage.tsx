@@ -151,10 +151,10 @@ export function DebugPage() {
               <Tag color={dirtyTagColor(isDirty)}>{isDirty ? "未保存变更" : "已保存"}</Tag>
             </Tooltip>
             <Button icon={<Play size={16} />} onClick={runSaved} loading={busy === "saved-run"} disabled={Boolean(busy)}>
-              运行已保存版本
+              人工验证已保存配置
             </Button>
             <Button icon={<Play size={16} />} onClick={runDraft} loading={busy === "draft-run"} disabled={Boolean(busy)}>
-              运行草稿
+              试运行当前配置
             </Button>
             <Button type="primary" icon={<Save size={16} />} onClick={saveOnly} loading={busy === "save"} disabled={Boolean(busy)}>
               保存
@@ -276,7 +276,7 @@ export function DebugPage() {
                 items={[
                   {
                     key: "script",
-                    label: "高级脚本",
+                    label: "高级探测脚本",
                     children: (
                       <CodeEditorPanel
                         title="Python 脚本"

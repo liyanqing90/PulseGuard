@@ -117,7 +117,15 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const batchRunnableCount = useMemo(() => batchTargetChecks.filter((check) => check.enabled).length, [batchTargetChecks]);
 
   const summary = useMemo(() => {
-    const counts: Record<TaskSurfaceStatus, number> = { ok: 0, failed: 0, never: 0, disabled: 0 };
+    const counts: Record<TaskSurfaceStatus, number> = {
+      healthy: 0,
+      suspected_failing: 0,
+      failing: 0,
+      suspected_recovery: 0,
+      unknown: 0,
+      stale: 0,
+      disabled: 0
+    };
     checks.forEach((check) => {
       counts[taskStatus(check)] += 1;
     });
@@ -143,6 +151,19 @@ export function ChecksPage({ type }: { type: CheckType }) {
     setBusy(check.id);
     try {
       const run = await api.runCheck(check.id);
+      setDetailRunId(run.id);
+      await load();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function confirmRecovery(check: Check) {
+    setBusy(check.id);
+    try {
+      const run = await api.confirmRecovery(check.id);
       setDetailRunId(run.id);
       await load();
     } catch (err) {
@@ -371,6 +392,16 @@ export function ChecksPage({ type }: { type: CheckType }) {
               loading={busy === check.id}
               onClick={() => runCheck(check)}
             />
+            {["failing", "suspected_failing", "suspected_recovery", "stale", "unknown"].includes(taskStatus(check)) && (
+              <Button
+                size="small"
+                title="确认恢复"
+                aria-label={`${check.name} 确认恢复`}
+                icon={<RefreshCw size={15} />}
+                loading={busy === check.id}
+                onClick={() => confirmRecovery(check)}
+              />
+            )}
             <Button
               size="small"
               title="编辑"
@@ -416,13 +447,13 @@ export function ChecksPage({ type }: { type: CheckType }) {
           <Statistic title="全部任务" value={summary.total} />
         </Card>
         <Card className="summary-card metric-success">
-          <Statistic title="正常" value={summary.ok} />
+          <Statistic title="健康" value={summary.healthy} />
         </Card>
-        <Card className={`summary-card ${summary.failed ? "metric-danger" : ""}`}>
-          <Statistic title="失败" value={summary.failed} />
+        <Card className={`summary-card ${summary.failing ? "metric-danger" : ""}`}>
+          <Statistic title="故障" value={summary.failing} />
         </Card>
         <Card className="summary-card metric-info">
-          <Statistic title="未运行" value={summary.never} />
+          <Statistic title="确认中/待观测" value={summary.suspected_failing + summary.suspected_recovery + summary.unknown + summary.stale} />
         </Card>
         <Card className="summary-card metric-success">
           <Statistic title="已启用" value={summary.enabled} />
@@ -448,9 +479,12 @@ export function ChecksPage({ type }: { type: CheckType }) {
             onChange={(value) => setStatusFilter(value)}
             options={[
               { label: "全部状态", value: "" },
-              { label: "正常", value: "ok" },
-              { label: "失败", value: "failed" },
-              { label: "未运行", value: "never" },
+              { label: "健康", value: "healthy" },
+              { label: "疑似故障", value: "suspected_failing" },
+              { label: "故障", value: "failing" },
+              { label: "疑似恢复", value: "suspected_recovery" },
+              { label: "无有效观测", value: "unknown" },
+              { label: "观测过期", value: "stale" },
               { label: "已禁用", value: "disabled" }
             ]}
           />
@@ -551,6 +585,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
           onHistory={(check) => navigate(`/runs?check_id=${check.id}`)}
           onOpenLastRun={(check) => check.last_run_id && setDetailRunId(check.last_run_id)}
           onRun={runCheck}
+          onConfirmRecovery={confirmRecovery}
           onToggle={toggle}
           duplicatingId={duplicatingId}
         />
@@ -610,6 +645,7 @@ interface CompactCheckListProps {
   onHistory: (check: Check) => void;
   onOpenLastRun: (check: Check) => void;
   onRun: (check: Check) => void;
+  onConfirmRecovery: (check: Check) => void;
   onToggle: (check: Check) => void;
 }
 
@@ -627,6 +663,7 @@ function CompactCheckList({
   onHistory,
   onOpenLastRun,
   onRun,
+  onConfirmRecovery,
   onToggle
 }: CompactCheckListProps) {
   if (loading) {
@@ -702,8 +739,13 @@ function CompactCheckList({
 
             <Space className="check-card-actions">
               <Button icon={<Play size={15} />} loading={busy === check.id} onClick={() => onRun(check)}>
-                执行
+                人工验证
               </Button>
+              {["failing", "suspected_failing", "suspected_recovery", "stale", "unknown"].includes(status) && (
+                <Button icon={<RefreshCw size={15} />} loading={busy === check.id} onClick={() => onConfirmRecovery(check)}>
+                  确认恢复
+                </Button>
+              )}
               <Button icon={<Edit3 size={15} />} onClick={() => onEdit(check)}>
                 编辑
               </Button>

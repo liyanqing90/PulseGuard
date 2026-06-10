@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import html
 import hmac
 import json
 import time
@@ -32,6 +34,8 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
 
     alert_settings = _resolve_alert_settings(check, settings)
     channels = _notification_channels(alert_settings, enabled_only=True, require_webhook=True)
+    members = _selected_members(alert_settings)
+    channels = [_with_channel_mentions(channel, members) for channel in channels]
     if not channels:
         _record_notification(run, "disabled", error=alert_settings.get("_alert_policy_error"))
         return
@@ -44,20 +48,16 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
     is_recovery = False
     current_status = transition.get("current_status")
     previous_status = transition.get("previous_status")
-    trigger = str(transition.get("trigger") or "")
-    manual_trigger = _is_manual_trigger(trigger)
 
-    if current_status == "failed":
-        if manual_trigger:
-            should_send = True
-        elif previous_status != "failed":
+    if current_status == "failing":
+        if previous_status != "failing":
             should_send = True
         else:
             should_send = _cooldown_elapsed(
                 transition.get("last_notified_at"),
                 int(alert_settings.get("alert_cooldown_minutes", 30)),
             )
-    elif current_status == "ok" and previous_status == "failed" and alert_settings.get("recovery_notification", True):
+    elif current_status == "healthy" and previous_status in {"failing", "suspected_recovery"} and alert_settings.get("recovery_notification", True):
         should_send = True
         is_recovery = True
 
@@ -72,7 +72,7 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
 
     for channel in channels:
         try:
-            await send_webhook_alert(channel, title, text)
+            await _send_with_retry(channel, title, text, int(alert_settings.get("alert_delivery_attempts", 1)))
         except Exception as exc:
             failures.append((_channel_display_name(channel), exc))
         else:
@@ -119,7 +119,7 @@ async def send_test_alert(settings: dict[str, Any]) -> None:
     failures: list[tuple[str, Exception]] = []
     for channel in channels:
         try:
-            await send_webhook_alert(channel, title, text)
+            await _send_with_retry(channel, title, text, int(settings.get("alert_delivery_attempts", 1)))
         except Exception as exc:
             failures.append((_channel_display_name(channel), exc))
     if failures:
@@ -133,6 +133,21 @@ def build_test_alert_preview(settings: dict[str, Any]) -> dict[str, Any]:
         "channels": [_channel_preview(channel, title, text) for channel in channels],
         "message_text": text,
     }
+
+
+async def _send_with_retry(channel: dict[str, Any], title: str, text: str, attempts: int) -> None:
+    attempts = max(1, min(5, int(attempts)))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            await send_webhook_alert(channel, title, text)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(2.0, 0.25 * (2**attempt)))
+    if last_error is not None:
+        raise last_error
 
 
 def _resolve_alert_settings(check: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
@@ -176,6 +191,8 @@ def _apply_alert_policy(settings: dict[str, Any], policy: dict[str, Any]) -> Non
         settings["recovery_notification"] = policy.get("recovery_notification")
     if "notification_channel_ids" in policy:
         settings["notification_channel_ids"] = policy.get("notification_channel_ids")
+    if "member_ids" in policy:
+        settings["member_ids"] = policy.get("member_ids")
 
 
 def _check_tags(value: Any) -> set[str]:
@@ -191,7 +208,7 @@ async def send_webhook_alert(channel: dict[str, Any], title: str, text: str) -> 
         raise AlertDeliveryError("请先填写 Webhook URL")
 
     request_url = _request_url(webhook_type, webhook_url, channel)
-    payload = _webhook_payload(webhook_type, title, text)
+    payload = _webhook_payload(webhook_type, title, text, channel.get("mentions"))
 
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(request_url, json=payload)
@@ -247,6 +264,46 @@ def _notification_channels(
     if selected_ids is not None and missing_ids:
         settings["_alert_policy_error"] = f"告警策略引用的通知渠道不存在或不可用：{'、'.join(sorted(missing_ids))}"
     return channels
+
+
+def _selected_members(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    selected = settings.get("member_ids")
+    if not isinstance(selected, list):
+        return []
+    selected_ids = {str(member_id) for member_id in selected}
+    return [
+        member
+        for member in settings.get("members") or []
+        if isinstance(member, dict) and str(member.get("id") or "") in selected_ids
+    ]
+
+
+def _with_channel_mentions(channel: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, Any]:
+    mentions = _channel_mentions(_channel_type(channel), members)
+    if not mentions:
+        return channel
+    return {**channel, "mentions": mentions}
+
+
+def _channel_mentions(webhook_type: str, members: list[dict[str, Any]]) -> list[dict[str, str]]:
+    mentions: list[dict[str, str]] = []
+    for member in members:
+        name = str(member.get("name") or "").strip()
+        if webhook_type == "feishu":
+            user_id = str(member.get("feishu_open_id") or "").strip()
+            if user_id:
+                mentions.append({"name": name, "user_id": user_id})
+        elif webhook_type == "wecom":
+            user_id = str(member.get("wecom_user_id") or "").strip()
+            mobile = str(member.get("wecom_mobile") or "").strip()
+            if user_id or mobile:
+                mentions.append({"name": name, "user_id": user_id, "mobile": mobile})
+        elif webhook_type == "dingtalk":
+            user_id = str(member.get("dingtalk_user_id") or "").strip()
+            mobile = str(member.get("dingtalk_mobile") or "").strip()
+            if user_id or mobile:
+                mentions.append({"name": name, "user_id": user_id, "mobile": mobile})
+    return mentions
 
 
 def _channel_preview(channel: dict[str, Any], title: str, text: str) -> dict[str, Any]:
@@ -426,20 +483,20 @@ def _cooldown_elapsed(last_notified_at: str | None, cooldown_minutes: int) -> bo
     return datetime.now().astimezone() - last >= timedelta(minutes=cooldown_minutes)
 
 
-def _is_manual_trigger(trigger: str) -> bool:
-    return trigger == "manual" or trigger == "manual-batch" or trigger.startswith("rerun:")
-
-
 def _suppression_reason(transition: dict[str, Any], settings: dict[str, Any]) -> str:
     current_status = transition.get("current_status")
     previous_status = transition.get("previous_status")
-    if current_status == "failed" and previous_status == "failed":
+    if current_status == "failing" and previous_status == "failing":
         cooldown = int(settings.get("alert_cooldown_minutes", 30))
         last_notified_at = transition.get("last_notified_at")
         if last_notified_at:
             return f"连续失败仍在 {cooldown} 分钟告警冷却窗口内，上次告警时间：{last_notified_at}"
         return f"连续失败仍在 {cooldown} 分钟告警冷却窗口内"
-    if current_status == "ok":
+    if current_status == "suspected_failing":
+        return "本轮失败仍在故障确认中，未达到故障告警阈值"
+    if current_status == "suspected_recovery":
+        return "本轮成功仍在恢复确认中，未达到恢复通知阈值"
+    if current_status == "healthy":
         return "当前运行正常，且未满足恢复通知条件"
     return "当前运行结果未满足告警发送条件"
 
@@ -488,16 +545,57 @@ def _format_message(
     return title, "\n".join(lines)
 
 
-def _webhook_payload(webhook_type: str, title: str, text: str) -> dict[str, Any]:
+def _webhook_payload(
+    webhook_type: str,
+    title: str,
+    text: str,
+    mentions: Any = None,
+) -> dict[str, Any]:
+    normalized_mentions = [mention for mention in mentions or [] if isinstance(mention, dict)]
+    text = _text_with_mentions(webhook_type, text, normalized_mentions)
     if webhook_type == "dingtalk":
         return {
             "msgtype": "markdown",
             "markdown": {"title": title[:64], "text": text},
-            "at": {"isAtAll": False},
+            "at": {
+                "atMobiles": _mention_values(normalized_mentions, "mobile"),
+                "atUserIds": _mention_values(normalized_mentions, "user_id"),
+                "isAtAll": False,
+            },
         }
     if webhook_type == "wecom":
-        return {"msgtype": "text", "text": {"content": _plain_text(text)}}
+        return {
+            "msgtype": "text",
+            "text": {
+                "content": _plain_text(text),
+                "mentioned_list": _mention_values(normalized_mentions, "user_id"),
+                "mentioned_mobile_list": _mention_values(normalized_mentions, "mobile"),
+            },
+        }
     return {"msg_type": "text", "content": {"text": _plain_text(text)}}
+
+
+def _text_with_mentions(webhook_type: str, text: str, mentions: list[dict[str, Any]]) -> str:
+    if not mentions:
+        return text
+    if webhook_type == "feishu":
+        values = [
+            f'<at id="{html.escape(str(mention.get("user_id") or ""), quote=True)}"></at>'
+            for mention in mentions
+            if mention.get("user_id")
+        ]
+    elif webhook_type == "dingtalk":
+        values = [
+            f'@{mention.get("mobile") or mention.get("name") or mention.get("user_id")}'
+            for mention in mentions
+        ]
+    else:
+        values = [f'@{mention.get("name") or mention.get("user_id") or mention.get("mobile")}' for mention in mentions]
+    return f"{text}\n- 相关成员：{' '.join(values)}" if values else text
+
+
+def _mention_values(mentions: list[dict[str, Any]], key: str) -> list[str]:
+    return list(dict.fromkeys(str(mention.get(key) or "").strip() for mention in mentions if str(mention.get(key) or "").strip()))
 
 
 def _plain_text(text: str) -> str:

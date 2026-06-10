@@ -1,6 +1,6 @@
 import { App, Button, Drawer, Empty, Select, Skeleton, Space, Table, Tabs, Tag, Tooltip, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { Clipboard, Eye, RefreshCw, RotateCcw } from "lucide-react";
+import { Eye, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { StructuredViewer } from "../components/StructuredViewer";
@@ -10,13 +10,6 @@ import { compactUrl, formatDate, formatDuration, runStatusLabel, runStatusTagCol
 const { Text } = Typography;
 
 type DetailDrawer = { title: string; value: unknown } | null;
-
-const OPERATION_ENDPOINTS = [
-  { label: "只读快照", value: "/api/read-only/snapshot" },
-  { label: "内网状态", value: "/api/status-page" },
-  { label: "JSON 指标", value: "/api/metrics.json" },
-  { label: "Prometheus 指标", value: "/api/metrics" }
-];
 
 export function OperationsPage() {
   const { message, modal } = App.useApp();
@@ -84,15 +77,6 @@ export function OperationsPage() {
   useEffect(() => {
     void loadVersions();
   }, [selectedCheckId]);
-
-  async function copyEndpoint(value: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      message.success("已复制地址");
-    } catch {
-      message.error("复制失败");
-    }
-  }
 
   function restoreVersion(version: CheckVersion) {
     modal.confirm({
@@ -305,23 +289,11 @@ export function OperationsPage() {
     <div className="page-content operations-page">
       <section className="operations-command-bar">
         <div>
-          <h2>审计与访问出口</h2>
+          <h2>运维审计</h2>
         </div>
         <Button icon={<RefreshCw size={16} />} onClick={loadOperations}>
           刷新
         </Button>
-      </section>
-
-      <section className="operations-endpoints" aria-label="只读访问出口">
-        {OPERATION_ENDPOINTS.map((endpoint) => (
-          <div className="operation-endpoint" key={endpoint.value}>
-            <span>{endpoint.label}</span>
-            <Text code>{endpoint.value}</Text>
-            <Tooltip title="复制地址">
-              <Button icon={<Clipboard size={16} />} onClick={() => copyEndpoint(endpoint.value)} aria-label={`复制${endpoint.label}`} />
-            </Tooltip>
-          </div>
-        ))}
       </section>
 
       <Tabs

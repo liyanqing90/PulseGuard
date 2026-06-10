@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from .context import RunContext, RunFailure
+from .resource_pool import ProbeResourcePool
 from .variables import mask_data, mask_text, resolve_data, resolve_text
 
 
@@ -89,7 +90,11 @@ async def run_structured_api_check(ctx: RunContext) -> None:
     response = await ctx.request()
     elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
     ctx.log(f"HTTP {response.status_code} · {elapsed_ms} ms")
-    ctx.save_response(response)
+    if ctx.response_snapshot is None or ctx.settings.get("success_response_artifacts_enabled"):
+        ctx.save_response(response)
+    if ctx.response_snapshot is not None:
+        ctx.response_snapshot["duration_ms"] = elapsed_ms
+        ctx.response_snapshot["timings"] = {"request_ms": elapsed_ms}
 
     body_json: Any = None
     body_is_json = False
@@ -119,7 +124,11 @@ async def run_structured_api_check(ctx: RunContext) -> None:
         raise RunFailure("；".join(errors))
 
 
-async def inspect_api_response(config: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+async def inspect_api_response(
+    config: dict[str, Any],
+    settings: dict[str, Any] | None = None,
+    resources: ProbeResourcePool | None = None,
+) -> dict[str, Any]:
     settings = settings or {}
     method = str(config.get("method") or "GET").upper()
     url = resolve_text(config.get("entry_url") or "", settings).strip()
@@ -131,10 +140,15 @@ async def inspect_api_response(config: dict[str, Any], settings: dict[str, Any] 
     request_kwargs = _configured_body_kwargs(resolve_text(config.get("body") or "", settings))
     if headers:
         request_kwargs["headers"] = headers
+    request_kwargs.setdefault("timeout", timeout_ms / 1000)
 
     started = time.perf_counter()
-    async with httpx.AsyncClient(timeout=timeout_ms / 1000, follow_redirects=True) as client:
-        response = await client.request(method, url, **request_kwargs)
+    if resources is not None:
+        async with resources.http_client() as client:
+            response = await client.request(method, url, **request_kwargs)
+    else:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.request(method, url, **request_kwargs)
     elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
     body_text = response.text
     body_preview = body_text if len(body_text) <= 50000 else body_text[:50000] + "\n... 响应体已截断"

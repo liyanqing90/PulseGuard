@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import storage
@@ -20,6 +23,13 @@ class PulseScheduler:
             "interval",
             hours=24,
             id="cleanup-old-runs",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            storage.refresh_stale_statuses,
+            "interval",
+            minutes=1,
+            id="refresh-stale-checks",
             replace_existing=True,
         )
         self.refresh_all()
@@ -57,6 +67,18 @@ class PulseScheduler:
 
     async def _run_scheduled(self, check_id: int) -> None:
         await self.runner.run_check(check_id, trigger="scheduled")
+
+    def runtime_status(self) -> dict[str, Any]:
+        now = datetime.now().astimezone()
+        jobs = [job for job in self.scheduler.get_jobs() if job.id.startswith("check-")]
+        next_times = [job.next_run_time for job in jobs if job.next_run_time is not None]
+        overdue = sum(1 for next_time in next_times if next_time < now)
+        return {
+            "running": self.scheduler.running,
+            "scheduled_checks": len(jobs),
+            "next_due_at": min(next_times).isoformat(timespec="seconds") if next_times else None,
+            "overdue_jobs": overdue,
+        }
 
     @staticmethod
     def _job_id(check_id: int) -> str:

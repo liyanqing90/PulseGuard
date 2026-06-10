@@ -7,6 +7,7 @@ import {
   Database,
   Download,
   FileJson2,
+  Info,
   KeyRound,
   Monitor,
   Plus,
@@ -22,6 +23,8 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { StructuredViewer } from "../components/StructuredViewer";
+import { OperationsPage } from "./OperationsPage";
+import { StatusPage } from "./StatusPage";
 import type {
   AlertTagPolicy,
   AlertPreview,
@@ -30,14 +33,16 @@ import type {
   ConfigExportFile,
   ConfigImportPreview,
   ConfigImportSummary,
+  DatabaseBackup,
   EnvironmentVariable,
   NotificationChannel,
   SettingsValues,
   WebhookType
 } from "../types";
-import { dirtyTagColor, enabledTagColor } from "../utils";
+import { dirtyTagColor, enabledTagColor, formatDate } from "../utils";
 
-type SettingsTab = "alerts" | "runtime" | "browser" | "variables" | "retention" | "access" | "config";
+type SettingsTab = "alerts" | "runtime" | "browser" | "variables" | "retention" | "access" | "maintenance" | "config";
+type AccessDrawer = "status" | "operations" | null;
 
 const CHANNEL_OPTIONS: Array<{ label: string; value: WebhookType }> = [
   { label: "飞书", value: "feishu" },
@@ -98,9 +103,13 @@ export function SettingsPage() {
   const [importPreviewing, setImportPreviewing] = useState(false);
   const [importingConfig, setImportingConfig] = useState(false);
   const [importConfirmOpen, setImportConfirmOpen] = useState(false);
-  const [readOnlyTokenDraft, setReadOnlyTokenDraft] = useState("");
   const [savingReadOnlyToken, setSavingReadOnlyToken] = useState(false);
-  const [savingMaintenance, setSavingMaintenance] = useState(false);
+  const [readOnlyTokenCreateOpen, setReadOnlyTokenCreateOpen] = useState(false);
+  const [readOnlyTokenNameDraft, setReadOnlyTokenNameDraft] = useState("");
+  const [createdReadOnlyToken, setCreatedReadOnlyToken] = useState<{ name: string; token: string } | null>(null);
+  const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [accessDrawer, setAccessDrawer] = useState<AccessDrawer>(null);
 
   useEffect(() => {
     api
@@ -112,6 +121,48 @@ export function SettingsPage() {
       .catch((err: Error) => message.error(err.message))
       .finally(() => setLoading(false));
   }, [message]);
+
+  useEffect(() => {
+    if (activeTab !== "retention") return;
+    void loadDatabaseBackups();
+  }, [activeTab]);
+
+  async function loadDatabaseBackups() {
+    try {
+      setDatabaseBackups(await api.databaseBackups());
+    } catch (err) {
+      message.error((err as Error).message);
+    }
+  }
+
+  async function createDatabaseBackup() {
+    setBackupBusy(true);
+    try {
+      await api.createDatabaseBackup();
+      await loadDatabaseBackups();
+      message.success("数据库备份已创建");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  async function restoreDatabaseBackup(filename: string) {
+    setBackupBusy(true);
+    try {
+      await api.restoreDatabaseBackup(filename);
+      await Promise.all([loadDatabaseBackups(), api.settings().then((values) => {
+        setSettings(cloneSettings(values));
+        setSavedSettings(cloneSettings(values));
+      })]);
+      message.success("数据库备份已恢复，并已自动创建恢复前安全备份");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBackupBusy(false);
+    }
+  }
 
   function update<K extends keyof SettingsValues>(key: K, value: SettingsValues[K]) {
     setAlertPreview(null);
@@ -225,6 +276,7 @@ export function SettingsPage() {
         alerts_enabled: settings.alerts_enabled,
         alert_detail_base_url: settings.alert_detail_base_url.trim(),
         alert_cooldown_minutes: settings.alert_cooldown_minutes,
+        alert_delivery_attempts: settings.alert_delivery_attempts,
         recovery_notification: settings.recovery_notification,
         alert_tag_policies: settings.alert_tag_policies.map(toPayloadAlertTagPolicy),
         notification_channels: settings.notification_channels.map(toPayloadChannel)
@@ -239,6 +291,12 @@ export function SettingsPage() {
         max_ui_concurrency: settings.max_ui_concurrency,
         max_queue_size: settings.max_queue_size,
         max_task_runtime_seconds: settings.max_task_runtime_seconds,
+        api_failure_confirmation_count: settings.api_failure_confirmation_count,
+        ui_failure_confirmation_count: settings.ui_failure_confirmation_count,
+        recovery_confirmation_count: settings.recovery_confirmation_count,
+        api_retry_attempts: settings.api_retry_attempts,
+        ui_retry_attempts: settings.ui_retry_attempts,
+        stale_after_intervals: settings.stale_after_intervals,
         local_runner_name: (settings.local_runner_name || "").trim(),
         local_runner_address: (settings.local_runner_address || "").trim(),
         local_runner_region: (settings.local_runner_region || "").trim()
@@ -257,12 +315,26 @@ export function SettingsPage() {
         environment_variables: settings.environment_variables.map(toPayloadEnvironmentVariable)
       };
     }
-    return {
+    if (scope === "retention") {
+      return {
       run_retention_days: settings.run_retention_days,
       screenshot_retention_days: settings.screenshot_retention_days,
       trace_retention_days: settings.trace_retention_days,
-      response_retention_days: settings.response_retention_days
-    };
+      response_retention_days: settings.response_retention_days,
+      success_response_artifacts_enabled: settings.success_response_artifacts_enabled,
+      database_backup_retention: settings.database_backup_retention
+      };
+    }
+    if (scope === "maintenance") {
+      return {
+        maintenance_enabled: Boolean(settings.maintenance_enabled),
+        maintenance_title: (settings.maintenance_title || "").trim(),
+        maintenance_message: (settings.maintenance_message || "").trim(),
+        maintenance_starts_at: (settings.maintenance_starts_at || "").trim(),
+        maintenance_ends_at: (settings.maintenance_ends_at || "").trim()
+      };
+    }
+    return {};
   }
 
   async function save(scope: SettingsTab = activeTab) {
@@ -273,6 +345,9 @@ export function SettingsPage() {
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
       setAlertPreview(null);
+      if (scope === "maintenance") {
+        window.dispatchEvent(new Event("pulseguard:maintenance-updated"));
+      }
       message.success("当前页设置已保存");
     } catch (err) {
       message.error((err as Error).message);
@@ -281,19 +356,23 @@ export function SettingsPage() {
     }
   }
 
-  async function saveReadOnlyToken() {
-    const nextToken = readOnlyTokenDraft.trim();
-    if (!nextToken) {
-      message.error("请输入新的只读访问令牌");
-      return;
-    }
+  function openReadOnlyTokenCreate() {
+    setReadOnlyTokenNameDraft("");
+    setReadOnlyTokenCreateOpen(true);
+  }
+
+  async function createReadOnlyToken() {
+    const tokenName = readOnlyTokenNameDraft.trim() || "未命名令牌";
     setSavingReadOnlyToken(true);
     try {
-      const values = await api.updateSettings({ read_only_token: nextToken });
+      const created = await api.createReadOnlyToken(tokenName);
+      const values = await api.settings();
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
-      setReadOnlyTokenDraft("");
-      message.success("只读访问令牌已更新");
+      setReadOnlyTokenCreateOpen(false);
+      setReadOnlyTokenNameDraft("");
+      setCreatedReadOnlyToken({ name: created.name, token: created.token });
+      message.success("只读访问令牌已新建");
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -301,14 +380,14 @@ export function SettingsPage() {
     }
   }
 
-  async function clearReadOnlyToken() {
+  async function deleteReadOnlyToken(tokenId: string) {
     setSavingReadOnlyToken(true);
     try {
-      const values = await api.updateSettings({ read_only_token: "" });
+      const values = await api.deleteReadOnlyToken(tokenId);
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
-      setReadOnlyTokenDraft("");
-      message.success("只读访问令牌已清空");
+      setCreatedReadOnlyToken(null);
+      message.success("只读访问令牌已删除");
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -316,33 +395,12 @@ export function SettingsPage() {
     }
   }
 
-  async function saveMaintenanceAnnouncement() {
-    if (!settings) return;
-    setSavingMaintenance(true);
+  async function copyValue(value: string, successText = "已复制") {
     try {
-      const values = await api.updateSettings({
-        maintenance_enabled: Boolean(settings.maintenance_enabled),
-        maintenance_title: (settings.maintenance_title || "").trim(),
-        maintenance_message: (settings.maintenance_message || "").trim(),
-        maintenance_starts_at: (settings.maintenance_starts_at || "").trim(),
-        maintenance_ends_at: (settings.maintenance_ends_at || "").trim()
-      });
-      setSettings(cloneSettings(values));
-      setSavedSettings(cloneSettings(values));
-      message.success("维护公告已保存");
-    } catch (err) {
-      message.error((err as Error).message);
-    } finally {
-      setSavingMaintenance(false);
-    }
-  }
-
-  async function copyAccessValue(value: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      message.success("已复制地址");
+      await copyTextToClipboard(value);
+      message.success(successText);
     } catch {
-      message.error("复制失败");
+      message.error("复制失败，请手动选中内容复制");
     }
   }
 
@@ -486,6 +544,7 @@ export function SettingsPage() {
   const previewDisabledReason = settings.notification_channels.length === 0 ? "先添加通知渠道后再预检" : blockingError;
   const enabledChannelCount = settings.notification_channels.filter((channel) => channel.enabled).length;
   const importApplyDisabledReason = configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
+  const readOnlyTokens = settings.read_only_tokens || [];
   const importUploadProps: UploadProps = {
     accept: "application/json,.json",
     maxCount: 1,
@@ -549,6 +608,7 @@ export function SettingsPage() {
           { key: "variables", label: "变量占位符" },
           { key: "retention", label: "数据保留" },
           { key: "access", label: "访问出口" },
+          { key: "maintenance", label: "维护公告" },
           { key: "config", label: "配置迁移" }
         ]}
       />
@@ -571,6 +631,14 @@ export function SettingsPage() {
               max={1440}
               suffix="分钟"
               onChange={(value) => update("alert_cooldown_minutes", value)}
+            />
+            <NumberItem
+              label="告警发送尝试次数"
+              value={settings.alert_delivery_attempts}
+              min={1}
+              max={5}
+              suffix="次"
+              onChange={(value) => update("alert_delivery_attempts", value)}
             />
             <Form.Item label="告警详情链接前缀" className="span-2">
               <Input
@@ -666,6 +734,12 @@ export function SettingsPage() {
             <NumberItem label="默认 UI 超时" value={settings.default_ui_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_ui_timeout_ms", value)} />
             <NumberItem label="默认 API 超时" value={settings.default_api_timeout_ms} min={500} max={300000} suffix="ms" onChange={(value) => update("default_api_timeout_ms", value)} />
             <NumberItem label="单任务最大运行时长" value={settings.max_task_runtime_seconds} min={1} max={600} suffix="秒" onChange={(value) => update("max_task_runtime_seconds", value)} />
+            <NumberItem label="API 故障确认轮数" value={settings.api_failure_confirmation_count} min={1} max={10} suffix="轮" onChange={(value) => update("api_failure_confirmation_count", value)} />
+            <NumberItem label="UI 故障确认轮数" value={settings.ui_failure_confirmation_count} min={1} max={10} suffix="轮" onChange={(value) => update("ui_failure_confirmation_count", value)} />
+            <NumberItem label="恢复确认次数" value={settings.recovery_confirmation_count} min={1} max={10} suffix="次" onChange={(value) => update("recovery_confirmation_count", value)} />
+            <NumberItem label="API 失败重试次数" value={settings.api_retry_attempts} min={0} max={3} suffix="次" onChange={(value) => update("api_retry_attempts", value)} />
+            <NumberItem label="UI 失败重试次数" value={settings.ui_retry_attempts} min={0} max={3} suffix="次" onChange={(value) => update("ui_retry_attempts", value)} />
+            <NumberItem label="观测过期判定周期数" value={settings.stale_after_intervals} min={1} max={10} suffix="个周期" onChange={(value) => update("stale_after_intervals", value)} />
             <Form.Item label="Runner 名称">
               <Input
                 name="local-runner-name"
@@ -763,66 +837,122 @@ export function SettingsPage() {
         )}
 
         {activeTab === "retention" && (
+        <>
         <SettingsPanel title="数据保留" icon={<Database size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <NumberItem label="执行历史保留" value={settings.run_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_retention_days", value)} />
+            <NumberItem label="运行记录保留" value={settings.run_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("run_retention_days", value)} />
             <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("screenshot_retention_days", value)} />
             <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("trace_retention_days", value)} />
             <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("response_retention_days", value)} />
+            <NumberItem label="数据库备份保留" value={settings.database_backup_retention} min={1} max={30} suffix="份" onChange={(value) => update("database_backup_retention", value)} />
+            <Form.Item label="成功响应产物">
+              <Switch
+                aria-label="保存成功响应产物"
+                checked={settings.success_response_artifacts_enabled}
+                onChange={(value) => update("success_response_artifacts_enabled", value)}
+              />
+            </Form.Item>
           </Form>
         </SettingsPanel>
+        <SettingsPanel title="数据库备份与恢复" icon={<Database size={18} />} className="settings-panel-wide">
+          <Space orientation="vertical" size={12} className="drawer-stack">
+            <Button icon={<Database size={16} />} loading={backupBusy} onClick={createDatabaseBackup}>
+              创建备份
+            </Button>
+            {databaseBackups.length === 0 ? (
+              <Empty description="暂无数据库备份" />
+            ) : (
+              databaseBackups.map((backup) => (
+                <Card size="small" key={backup.filename}>
+                  <Space wrap>
+                    <strong>{backup.filename}</strong>
+                    <span>{formatBytes(backup.size_bytes)}</span>
+                    <span>{new Date(backup.created_at).toLocaleString("zh-CN", { hour12: false })}</span>
+                    <Popconfirm
+                      title="恢复数据库备份"
+                      description="恢复会覆盖当前数据库，并自动创建恢复前安全备份。"
+                      okText="确认恢复"
+                      cancelText="取消"
+                      onConfirm={() => restoreDatabaseBackup(backup.filename)}
+                    >
+                      <Button icon={<RotateCcw size={15} />} loading={backupBusy}>
+                        恢复
+                      </Button>
+                    </Popconfirm>
+                  </Space>
+                </Card>
+              ))
+            )}
+          </Space>
+        </SettingsPanel>
+        </>
         )}
 
         {activeTab === "access" && (
           <>
             <SettingsPanel title="只读访问令牌" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
-              <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-                <Form.Item label="令牌状态">
-                  <Tag color={settings.read_only_token_set ? "success" : "default"}>
-                    {settings.read_only_token_set ? "已配置" : "未配置"}
-                  </Tag>
-                </Form.Item>
-                <Form.Item label="新令牌">
-                  <Input.Password
-                    value={readOnlyTokenDraft}
-                    placeholder="输入新令牌，保存后不会回显明文"
-                    onChange={(event) => setReadOnlyTokenDraft(event.target.value)}
-                  />
-                </Form.Item>
-              </Form>
-              <Space wrap>
-                <Button
-                  icon={<Save size={16} />}
-                  loading={savingReadOnlyToken}
-                  disabled={!readOnlyTokenDraft.trim()}
-                  onClick={saveReadOnlyToken}
-                >
-                  保存新令牌
-                </Button>
-                <Popconfirm
-                  title="清空只读访问令牌"
-                  description="清空后只读快照接口会拒绝访问。"
-                  okText="清空"
-                  cancelText="取消"
-                  onConfirm={clearReadOnlyToken}
-                >
-                  <Button danger icon={<Trash2 size={16} />} loading={savingReadOnlyToken} disabled={!settings.read_only_token_set}>
-                    清空令牌
+              <Space orientation="vertical" size={14} className="drawer-stack">
+                <div className="read-only-token-toolbar">
+                  <Space size={8} wrap>
+                    <strong>令牌状态</strong>
+                    <Tag color={readOnlyTokens.length > 0 ? "success" : "default"}>
+                      {readOnlyTokens.length > 0 ? `${readOnlyTokens.length} 个已配置` : "未配置"}
+                    </Tag>
+                    <Tooltip title="允许多个令牌共存；已有令牌只可删除。">
+                      <Button type="text" size="small" icon={<Info size={14} />} aria-label="令牌说明" />
+                    </Tooltip>
+                  </Space>
+                  <Button type="primary" icon={<KeyRound size={16} />} loading={savingReadOnlyToken} onClick={openReadOnlyTokenCreate}>
+                    新建令牌
                   </Button>
-                </Popconfirm>
-                <Button icon={<Clipboard size={16} />} onClick={() => copyAccessValue("/api/read-only/snapshot")}>
-                  复制快照地址
-                </Button>
-                <Button icon={<Clipboard size={16} />} onClick={() => copyAccessValue("/api/metrics")}>
-                  复制指标地址
-                </Button>
-                <Button icon={<Clipboard size={16} />} onClick={() => copyAccessValue("/api/status-page")}>
-                  复制状态页接口
-                </Button>
+                </div>
+                {readOnlyTokens.length === 0 ? (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无只读访问令牌" />
+                ) : (
+                  <Space orientation="vertical" size={10} className="drawer-stack">
+                    {readOnlyTokens.map((token) => (
+                      <Card size="small" key={token.id}>
+                        <div className="read-only-token-card">
+                          <div>
+                            <strong>{token.name || "未命名令牌"}</strong>
+                            <span>创建时间 {formatDate(token.created_at)}</span>
+                          </div>
+                          <Popconfirm
+                            title="删除只读访问令牌"
+                            description="删除后，使用该令牌的外部调用会立即失效。"
+                            okText="删除"
+                            cancelText="取消"
+                            onConfirm={() => deleteReadOnlyToken(token.id)}
+                          >
+                            <Button danger icon={<Trash2 size={16} />} loading={savingReadOnlyToken}>
+                              删除
+                            </Button>
+                          </Popconfirm>
+                        </div>
+                      </Card>
+                    ))}
+                  </Space>
+                )}
+              </Space>
+              <Space wrap className="settings-secondary-actions">
+                <Button onClick={() => setAccessDrawer("status")}>打开内网状态</Button>
+                <Button onClick={() => setAccessDrawer("operations")}>打开运维审计</Button>
               </Space>
             </SettingsPanel>
 
-            <SettingsPanel title="维护公告" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
+            <ReadOnlyApiDocs onCopyPath={(path) => copyValue(path, "已复制 Path")} />
+          </>
+        )}
+
+        {activeTab === "maintenance" && (
+          <SettingsPanel title="维护公告" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
+              <Alert
+                type="info"
+                showIcon
+                message="展示位置：所有页面顶栏右侧"
+                description="启用并保存后，所有页面右上角“本地运行”旁都会出现公告按钮；点击按钮查看公告详情。关闭后顶栏不展示公告。"
+                className="settings-inline-alert"
+              />
               <Form layout="vertical" className="settings-form-grid" autoComplete="off">
                 <Form.Item label="启用公告">
                   <Switch aria-label="启用维护公告" checked={Boolean(settings.maintenance_enabled)} onChange={(value) => update("maintenance_enabled", value)} />
@@ -844,11 +974,7 @@ export function SettingsPage() {
                   />
                 </Form.Item>
               </Form>
-              <Button icon={<Save size={16} />} loading={savingMaintenance} onClick={saveMaintenanceAnnouncement}>
-                保存维护公告
-              </Button>
             </SettingsPanel>
-          </>
         )}
 
         {activeTab === "config" && (
@@ -893,7 +1019,169 @@ export function SettingsPage() {
           )}
         </div>
       </Modal>
+
+      <Drawer
+        title={accessDrawer === "status" ? "内网状态" : "运维审计"}
+        open={Boolean(accessDrawer)}
+        width="min(1120px, 92vw)"
+        destroyOnHidden
+        onClose={() => setAccessDrawer(null)}
+      >
+        {accessDrawer === "status" && <StatusPage />}
+        {accessDrawer === "operations" && <OperationsPage />}
+      </Drawer>
+
+      <Modal
+        title="新建只读访问令牌"
+        open={readOnlyTokenCreateOpen}
+        okText="新建"
+        cancelText="取消"
+        confirmLoading={savingReadOnlyToken}
+        onOk={createReadOnlyToken}
+        onCancel={() => setReadOnlyTokenCreateOpen(false)}
+      >
+        <Space orientation="vertical" size={12} className="drawer-stack">
+          <Form layout="vertical">
+            <Form.Item
+              label={
+                <Space size={6}>
+                  <span>令牌名称</span>
+                  <Tooltip title="名称只用于区分调用方。">
+                    <Info size={14} />
+                  </Tooltip>
+                </Space>
+              }
+            >
+              <Input
+                value={readOnlyTokenNameDraft}
+                maxLength={120}
+                placeholder="例如：外部看板、巡检脚本"
+                onChange={(event) => setReadOnlyTokenNameDraft(event.target.value)}
+              />
+            </Form.Item>
+          </Form>
+        </Space>
+      </Modal>
+
+      <Modal
+        title="请保存新令牌"
+        open={Boolean(createdReadOnlyToken)}
+        okText="我已保存"
+        cancelButtonProps={{ style: { display: "none" } }}
+        maskClosable={false}
+        onOk={() => setCreatedReadOnlyToken(null)}
+        onCancel={() => setCreatedReadOnlyToken(null)}
+      >
+        <Space orientation="vertical" size={12} className="drawer-stack">
+          <Alert
+            type="warning"
+            showIcon
+            message="令牌明文关闭后不可再次查看"
+            description="请立即复制并保存到调用方。新令牌会与已有令牌共存，后续设置页只显示名称和创建时间。"
+          />
+          <div className="created-token-box">
+            <span>{createdReadOnlyToken?.name}</span>
+            <code>{createdReadOnlyToken?.token}</code>
+            <Tooltip title="复制令牌">
+              <Button
+                type="text"
+                icon={<Clipboard size={15} />}
+                onClick={() => createdReadOnlyToken && copyValue(createdReadOnlyToken.token, "已复制令牌")}
+                aria-label="复制新令牌"
+              />
+            </Tooltip>
+          </div>
+        </Space>
+      </Modal>
     </div>
+  );
+}
+
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (copyTextWithTextarea(value)) return;
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back to a temporary textarea below. Some local browser contexts
+      // expose Clipboard API but deny writes without a focused secure context.
+    }
+  }
+
+  if (!copyTextWithTextarea(value)) {
+    throw new Error("copy command rejected");
+  }
+}
+
+function copyTextWithTextarea(value: string): boolean {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  try {
+    return document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+function ReadOnlyApiDocs({ onCopyPath }: { onCopyPath: (path: string) => void }) {
+  return (
+    <SettingsPanel title="只读 API 文档" icon={<Clipboard size={18} />} className="settings-panel-wide">
+      <Space orientation="vertical" size={12} className="drawer-stack">
+        <Card size="small" title={<EndpointTitle path="/api/read-only/snapshot" onCopy={onCopyPath} />}>
+          <Space orientation="vertical" size={8}>
+            <span>用途：给外部看板、脚本或巡检工具读取当前监控概况、任务状态和最近运行。</span>
+            <span>鉴权：需要只读访问令牌，推荐使用 Authorization: Bearer &lt;token&gt;；也兼容 X-PulseGuard-Read-Only-Token 请求头或 token 查询参数。</span>
+            <pre>{`curl -H "Authorization: Bearer <token>" "http://<host>:8787/api/read-only/snapshot"`}</pre>
+          </Space>
+        </Card>
+
+        <Card size="small" title={<EndpointTitle path="/api/status-page" onCopy={onCopyPath} />}>
+          <Space orientation="vertical" size={8}>
+            <span>用途：内网状态页数据源，返回脱敏后的任务健康状态和最近异常。</span>
+            <span>鉴权：不需要只读令牌，适合内网只读展示。</span>
+          </Space>
+        </Card>
+
+        <Card
+          size="small"
+          title={
+            <div className="endpoint-title-group">
+              <EndpointTitle path="/api/metrics" onCopy={onCopyPath} />
+              <EndpointTitle path="/api/metrics.json" onCopy={onCopyPath} />
+            </div>
+          }
+        >
+          <Space orientation="vertical" size={8}>
+            <span>用途：监控系统采集指标，Prometheus 使用 /api/metrics，JSON 集成使用 /api/metrics.json。</span>
+            <span>鉴权：不需要只读令牌。</span>
+          </Space>
+        </Card>
+      </Space>
+    </SettingsPanel>
+  );
+}
+
+function EndpointTitle({ path, onCopy }: { path: string; onCopy: (path: string) => void }) {
+  return (
+    <span className="endpoint-title">
+      <span className="endpoint-title-main">
+        <span>GET</span>
+        <code>{path}</code>
+      </span>
+      <Tooltip title="复制 Path">
+        <Button type="text" size="small" icon={<Clipboard size={14} />} onClick={() => onCopy(path)} aria-label={`复制 ${path}`} />
+      </Tooltip>
+    </span>
   );
 }
 
@@ -966,7 +1254,7 @@ function ConfigTransferPanel({
         title="导入配置"
         open={drawerOpen}
         width={720}
-        destroyOnClose={false}
+        destroyOnHidden={false}
         closable={!importing}
         maskClosable={!importing}
         onClose={onCloseImport}
@@ -1813,6 +2101,12 @@ function channelTypeLabel(type: WebhookType): string {
   return CHANNEL_GUIDES[type]?.label || type;
 }
 
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function settingsChanged(current: SettingsValues, saved: SettingsValues): boolean {
   return JSON.stringify(comparableSettings(current)) !== JSON.stringify(comparableSettings(saved));
 }
@@ -1826,6 +2120,7 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     alerts_enabled: values.alerts_enabled,
     alert_detail_base_url: values.alert_detail_base_url,
     alert_cooldown_minutes: values.alert_cooldown_minutes,
+    alert_delivery_attempts: values.alert_delivery_attempts,
     recovery_notification: values.recovery_notification,
     alert_tag_policies: (values.alert_tag_policies || []).map((policy) => ({
       id: policy.id,
@@ -1855,6 +2150,12 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     max_ui_concurrency: values.max_ui_concurrency,
     max_queue_size: values.max_queue_size,
     max_task_runtime_seconds: values.max_task_runtime_seconds,
+    api_failure_confirmation_count: values.api_failure_confirmation_count,
+    ui_failure_confirmation_count: values.ui_failure_confirmation_count,
+    recovery_confirmation_count: values.recovery_confirmation_count,
+    api_retry_attempts: values.api_retry_attempts,
+    ui_retry_attempts: values.ui_retry_attempts,
+    stale_after_intervals: values.stale_after_intervals,
     local_runner_name: values.local_runner_name || "",
     local_runner_address: values.local_runner_address || "",
     local_runner_region: values.local_runner_region || ""
@@ -1879,10 +2180,19 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     run_retention_days: values.run_retention_days,
     screenshot_retention_days: values.screenshot_retention_days,
     trace_retention_days: values.trace_retention_days,
-    response_retention_days: values.response_retention_days
+    response_retention_days: values.response_retention_days,
+    success_response_artifacts_enabled: values.success_response_artifacts_enabled,
+    database_backup_retention: values.database_backup_retention
   };
   const access = {
     read_only_token_set: Boolean(values.read_only_token_set),
+    read_only_tokens: (values.read_only_tokens || []).map((token) => ({
+      id: token.id,
+      name: token.name || "",
+      created_at: token.created_at || ""
+    }))
+  };
+  const maintenance = {
     maintenance_enabled: Boolean(values.maintenance_enabled),
     maintenance_title: values.maintenance_title || "",
     maintenance_message: values.maintenance_message || "",
@@ -1895,7 +2205,8 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
   if (tab === "variables") return variables;
   if (tab === "retention") return retention;
   if (tab === "access") return access;
-  return { alerts, runtime, browser, variables, retention, access };
+  if (tab === "maintenance") return maintenance;
+  return { alerts, runtime, browser, variables, retention, access, maintenance };
 }
 
 function cloneSettings(values: SettingsValues): SettingsValues {
@@ -1904,15 +2215,22 @@ function cloneSettings(values: SettingsValues): SettingsValues {
     ...cloned,
     read_only_token: "",
     read_only_token_set: Boolean(cloned.read_only_token_set),
+    read_only_tokens: cloned.read_only_tokens || [],
     local_runner_name: cloned.local_runner_name || "local",
     local_runner_address: cloned.local_runner_address || "127.0.0.1",
     local_runner_region: cloned.local_runner_region || "local",
+    api_failure_confirmation_count: cloned.api_failure_confirmation_count ?? 2,
+    ui_failure_confirmation_count: cloned.ui_failure_confirmation_count ?? 3,
+    recovery_confirmation_count: cloned.recovery_confirmation_count ?? 2,
+    api_retry_attempts: cloned.api_retry_attempts ?? 1,
+    ui_retry_attempts: cloned.ui_retry_attempts ?? 1,
     maintenance_enabled: Boolean(cloned.maintenance_enabled),
     maintenance_title: cloned.maintenance_title || "",
     maintenance_message: cloned.maintenance_message || "",
     maintenance_starts_at: cloned.maintenance_starts_at || "",
     maintenance_ends_at: cloned.maintenance_ends_at || "",
     notification_channels: cloned.notification_channels || [],
+    members: cloned.members || [],
     alert_tag_policies: (cloned.alert_tag_policies || []).map((policy) => ({
       id: policy.id,
       name: policy.name || "",

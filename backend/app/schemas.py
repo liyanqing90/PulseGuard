@@ -197,12 +197,22 @@ SETTING_RANGES: dict[str, tuple[int, int]] = {
     "max_concurrency": (1, 20),
     "max_ui_concurrency": (1, 5),
     "max_queue_size": (1, 1000),
+    "api_pool_size": (1, 20),
+    "browser_pool_size": (1, 5),
     "max_task_runtime_seconds": (1, 600),
     "alert_cooldown_minutes": (1, 1440),
+    "alert_delivery_attempts": (1, 5),
+    "api_failure_confirmation_count": (1, 10),
+    "ui_failure_confirmation_count": (1, 10),
+    "recovery_confirmation_count": (1, 10),
+    "api_retry_attempts": (0, 3),
+    "ui_retry_attempts": (0, 3),
+    "stale_after_intervals": (1, 10),
     "run_retention_days": (1, 365),
     "screenshot_retention_days": (1, 365),
     "trace_retention_days": (1, 365),
     "response_retention_days": (1, 365),
+    "database_backup_retention": (1, 30),
 }
 
 SETTING_LABELS = {
@@ -212,15 +222,29 @@ SETTING_LABELS = {
     "max_concurrency": "最大并发任务数",
     "max_ui_concurrency": "最大 UI 并发数",
     "max_queue_size": "执行队列容量",
+    "api_pool_size": "API 请求池大小",
+    "browser_pool_size": "浏览器池大小",
     "max_task_runtime_seconds": "单任务最大运行时长",
     "alert_cooldown_minutes": "告警冷却时间",
     "alert_detail_base_url": "告警详情链接前缀",
-    "run_retention_days": "执行历史保留",
+    "api_failure_confirmation_count": "API 故障确认次数",
+    "ui_failure_confirmation_count": "UI 故障确认次数",
+    "api_retry_attempts": "API 失败重试次数",
+    "ui_retry_attempts": "UI 失败重试次数",
+    "run_retention_days": "运行记录保留",
     "screenshot_retention_days": "截图保留",
     "trace_retention_days": "Trace 保留",
     "response_retention_days": "Response Body 保留",
     "alerts_enabled": "启用告警",
     "notification_channels": "通知渠道",
+    "members": "成员",
+    "member_name": "成员名称",
+    "member_ids": "关联成员",
+    "feishu_open_id": "飞书 Open ID",
+    "wecom_user_id": "企业微信 User ID",
+    "wecom_mobile": "企业微信手机号",
+    "dingtalk_user_id": "钉钉 User ID",
+    "dingtalk_mobile": "钉钉手机号",
     "alert_tag_policies": "标签告警策略",
     "alert_policy_json": "任务告警策略",
     "alert_policy_tag": "标签告警策略标签",
@@ -237,6 +261,9 @@ SETTING_LABELS = {
     "browser_proxy": "浏览器代理",
     "browser_viewport": "浏览器 Viewport",
     "read_only_token": "只读访问令牌",
+    "read_only_tokens": "只读访问令牌",
+    "read_only_token_id": "只读访问令牌 ID",
+    "read_only_token_name": "只读访问令牌名称",
     "local_runner_name": "本机 Runner 名称",
     "local_runner_address": "本机 Runner 地址",
     "local_runner_region": "本机 Runner 网络区域",
@@ -254,6 +281,7 @@ BOOLEAN_SETTINGS = {
     "recovery_notification",
     "browser_headless",
     "maintenance_enabled",
+    "success_response_artifacts_enabled",
 }
 
 WEBHOOK_TYPES = {"feishu", "wecom", "dingtalk"}
@@ -270,6 +298,8 @@ def normalize_settings_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = _coerce_bool(key, value)
         elif key == "notification_channels":
             normalized[key] = _notification_channels(value)
+        elif key == "members":
+            normalized[key] = _members(value)
         elif key == "alert_tag_policies":
             normalized[key] = _alert_tag_policies(value)
         elif key == "environment_variables":
@@ -282,6 +312,8 @@ def normalize_settings_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = _string(key, value, max_length=2048)
         elif key == "read_only_token":
             normalized[key] = _string(key, value, max_length=256)
+        elif key == "read_only_tokens":
+            normalized[key] = _read_only_tokens(value)
         elif key in {"local_runner_name", "local_runner_address", "local_runner_region"}:
             normalized[key] = _string(key, value, max_length=120)
         elif key in {"maintenance_title", "maintenance_starts_at", "maintenance_ends_at"}:
@@ -304,6 +336,10 @@ class RunnerHeartbeatRequest(BaseModel):
     browser_version: str = Field(default="", max_length=120)
     status: Literal["ok", "warning", "offline"] = "ok"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReadOnlyTokenCreate(BaseModel):
+    read_only_token_name: str = Field(default="", max_length=120)
 
 
 def _bounded_int(key: str, value: Any, minimum: int, maximum: int) -> int:
@@ -341,6 +377,34 @@ def _string(key: str, value: Any, max_length: int) -> str:
     if len(text) > max_length:
         raise ValueError(f"{_setting_label(key)} 过长")
     return text
+
+
+def _read_only_tokens(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("只读访问令牌必须是数组")
+
+    tokens: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_tokens: set[str] = set()
+    for index, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"第 {index} 个只读访问令牌格式不正确")
+        token_id = _string("read_only_token_id", raw.get("id"), max_length=80)
+        name = _string("read_only_token_name", raw.get("name"), max_length=120) or "未命名令牌"
+        token = _string("read_only_token", raw.get("token"), max_length=256)
+        created_at = _string("created_at", raw.get("created_at"), max_length=80)
+        if not token_id or not token:
+            raise ValueError(f"第 {index} 个只读访问令牌格式不正确")
+        if token_id in seen_ids:
+            raise ValueError("只读访问令牌 ID 不能重复")
+        if token in seen_tokens:
+            raise ValueError("只读访问令牌不能重复")
+        seen_ids.add(token_id)
+        seen_tokens.add(token)
+        tokens.append({"id": token_id, "name": name, "token": token, "created_at": created_at})
+    return tokens
 
 
 def _absolute_http_url(key: str, value: Any) -> str:
@@ -394,6 +458,61 @@ def _notification_channels(value: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _members(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("成员必须是列表")
+
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    seen_accounts: dict[str, set[str]] = {
+        "feishu_open_id": set(),
+        "wecom_user_id": set(),
+        "wecom_mobile": set(),
+        "dingtalk_user_id": set(),
+        "dingtalk_mobile": set(),
+    }
+    for index, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"第 {index} 个成员格式不正确")
+
+        member_id = _string("members", raw.get("id") or f"member-{index}", max_length=80)
+        if member_id in seen_ids:
+            raise ValueError("成员 ID 不能重复")
+        seen_ids.add(member_id)
+
+        name = _string("member_name", raw.get("name") or "", max_length=80)
+        if not name:
+            raise ValueError("成员名称不能为空")
+        normalized_name = name.lower()
+        if normalized_name in seen_names:
+            raise ValueError("成员名称不能重复")
+        seen_names.add(normalized_name)
+
+        member = {
+            "id": member_id,
+            "name": name,
+            "feishu_open_id": _string("feishu_open_id", raw.get("feishu_open_id") or "", max_length=120),
+            "wecom_user_id": _string("wecom_user_id", raw.get("wecom_user_id") or "", max_length=120),
+            "wecom_mobile": _string("wecom_mobile", raw.get("wecom_mobile") or "", max_length=32),
+            "dingtalk_user_id": _string("dingtalk_user_id", raw.get("dingtalk_user_id") or "", max_length=120),
+            "dingtalk_mobile": _string("dingtalk_mobile", raw.get("dingtalk_mobile") or "", max_length=32),
+        }
+        if not any(member[field] for field in seen_accounts):
+            raise ValueError(f"成员“{name}”至少需要配置一个通知渠道账号")
+        for field, accounts in seen_accounts.items():
+            account = member[field]
+            if not account:
+                continue
+            if account in accounts:
+                raise ValueError(f"{_setting_label(field)}不能被多个成员重复使用")
+            accounts.add(account)
+        normalized.append(member)
+    return normalized
+
+
 def _alert_tag_policies(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
@@ -423,6 +542,7 @@ def _alert_tag_policies(value: Any) -> list[dict[str, Any]]:
         seen_tags.add(normalized_tag)
 
         policy = _alert_policy(raw)
+        policy.pop("member_ids", None)
         policy.update(
             {
                 "id": policy_id,
@@ -449,6 +569,8 @@ def _alert_policy(value: Any) -> dict[str, Any]:
     if "notification_channel_ids" in value and value.get("notification_channel_ids") is not None:
         channel_ids = _string_list("notification_channels", value.get("notification_channel_ids"), max_length=80)
         policy["notification_channel_ids"] = channel_ids
+    if "member_ids" in value and value.get("member_ids") is not None:
+        policy["member_ids"] = _string_list("member_ids", value.get("member_ids"), max_length=80)
     return policy
 
 

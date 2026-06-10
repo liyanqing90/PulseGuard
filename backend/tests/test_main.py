@@ -408,6 +408,30 @@ class OperationsRouteTests(unittest.TestCase):
         self.assertNotIn("script", payload_text)
         self.assertNotIn("error_stack", payload_text)
 
+    def test_status_page_excludes_manual_verification_failures(self) -> None:
+        runs = [
+            {
+                "id": 2,
+                "check_id": 1,
+                "check_name": "API",
+                "check_type": "api",
+                "status": "failed",
+                "started_at": "2026-06-08T12:00:00+08:00",
+                "failure_kind": "target",
+                "affects_health": False,
+            }
+        ]
+
+        with patch("backend.app.main.storage.get_settings", return_value={}), patch(
+            "backend.app.main.storage.get_overview", return_value={}
+        ), patch("backend.app.main.storage.list_checks", return_value=[]), patch(
+            "backend.app.main.storage.list_runs", return_value=runs
+        ):
+            response = TestClient(app).get("/api/status-page")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["recent_incidents"], [])
+
     def test_read_only_snapshot_requires_configured_token(self) -> None:
         with patch("backend.app.main.storage.get_settings", return_value={"read_only_token": ""}):
             unconfigured = TestClient(app).get("/api/read-only/snapshot")
@@ -507,7 +531,15 @@ class OperationsRouteTests(unittest.TestCase):
         overview = {
             "failing_count": 1,
             "today_runs": 3,
-            "trends": [{"key": "24h", "runs": 4, "failure_count": 1, "success_rate": 75.0}],
+            "trends": [
+                {
+                    "key": "24h",
+                    "series": [
+                        {"check_type": "ui", "runs": 1, "success_count": 1, "failure_count": 0},
+                        {"check_type": "api", "runs": 3, "success_count": 2, "failure_count": 1},
+                    ],
+                }
+            ],
         }
         checks = [{"id": 1, "enabled": True}, {"id": 2, "enabled": False}]
 
@@ -541,6 +573,8 @@ class OperationsRouteTests(unittest.TestCase):
         }
 
         with patch("backend.app.main.storage.get_run", return_value=run), patch(
+            "backend.app.main.storage.get_previous_successful_run", return_value=None
+        ), patch(
             "backend.app.main.storage.get_settings", return_value=settings
         ):
             response = TestClient(app).get("/api/runs/8/failure-summary")
@@ -549,6 +583,100 @@ class OperationsRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["failure_kind"], "runner")
         self.assertIn("Runner", payload["summary"])
+        self.assertNotIn("token-secret-123", json.dumps(payload, ensure_ascii=False))
+
+    def test_failure_summary_uses_assertion_evidence_and_success_baseline(self) -> None:
+        current_assertions = [
+            {
+                "rule": "元素可见",
+                "path": "span.store-tag:nth-of-type(2)",
+                "status": "failed",
+                "actual": "未找到",
+                "message": "校验失败：元素未找到：span.store-tag:nth-of-type(2)",
+            },
+            {
+                "rule": "组件不为空",
+                "path": "h3.store-title",
+                "status": "failed",
+                "actual": "未找到",
+                "message": "校验失败：元素未找到：h3.store-title",
+            },
+            {"rule": "文本出现", "path": "详情", "status": "ok", "actual": "出现", "message": "文本出现"},
+        ]
+        baseline_assertions = [
+            {**current_assertions[0], "status": "ok", "actual": "可见", "message": "元素可见"},
+            {**current_assertions[1], "status": "ok", "actual": "购车门店", "message": "组件不为空"},
+            current_assertions[2],
+        ]
+        run = {
+            "id": 2941,
+            "check_id": 11,
+            "check_name": "商品详情",
+            "check_type": "ui",
+            "status": "failed",
+            "failure_kind": "target",
+            "runner_name": "local",
+            "runner_region": "local",
+            "duration_ms": 8869,
+            "error_message": "UI 结构化校验失败",
+            "response_snapshot": json.dumps(
+                {"page": {"url": "https://example.test/new"}, "assertions": current_assertions},
+                ensure_ascii=False,
+            ),
+        }
+        baseline = {
+            "id": 885,
+            "response_snapshot": json.dumps(
+                {"page": {"url": "https://example.test/old"}, "assertions": baseline_assertions},
+                ensure_ascii=False,
+            ),
+        }
+
+        with patch("backend.app.main.storage.get_run", return_value=run), patch(
+            "backend.app.main.storage.get_previous_successful_run", return_value=baseline
+        ), patch("backend.app.main.storage.get_settings", return_value={}):
+            response = TestClient(app).get("/api/runs/2941/failure-summary")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["summary"], "2/3 项 UI 校验失败，其中 2 项为相对最近成功运行的新增失败。")
+        self.assertNotIn("error_message", payload)
+        self.assertIn({"label": "失败来源", "value": "目标页面/API"}, payload["signals"])
+        self.assertIn({"label": "对比基线", "value": "成功运行 #885"}, payload["signals"])
+        self.assertNotIn("span.store-tag:nth-of-type(2)", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(
+            payload["next_steps"],
+            [
+                "当前访问地址与成功运行 #885 不同，确认地址变更是否符合预期。",
+                "在“对比”中查看 2 项新增失败的变化。",
+                "在“校验”中逐项确认页面内容或校验规则是否需要更新。",
+            ],
+        )
+
+    def test_failure_summary_uses_masked_target_error_when_assertions_are_unavailable(self) -> None:
+        run = {
+            "id": 9,
+            "check_id": 3,
+            "check_name": "API",
+            "check_type": "api",
+            "status": "failed",
+            "failure_kind": "target",
+            "duration_ms": 25,
+            "error_message": "token-secret-123 connection refused",
+        }
+        settings = {
+            "environment_variables": [
+                {"id": "token", "name": "SERVICE_TOKEN", "value": "token-secret-123", "secret": True}
+            ],
+        }
+
+        with patch("backend.app.main.storage.get_run", return_value=run), patch(
+            "backend.app.main.storage.get_previous_successful_run", return_value=None
+        ), patch("backend.app.main.storage.get_settings", return_value=settings):
+            response = TestClient(app).get("/api/runs/9/failure-summary")
+
+        payload = response.json()
+        self.assertEqual(payload["summary"], "目标检查失败：*** connection refused")
         self.assertNotIn("token-secret-123", json.dumps(payload, ensure_ascii=False))
 
     def test_run_archives_route_returns_archive_summaries(self) -> None:

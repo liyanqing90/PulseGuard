@@ -3,7 +3,15 @@ export type ViewportMode = "web" | "h5";
 export type RunStatus = "pending" | "running" | "ok" | "failed" | "timeout" | "skipped";
 export type NotificationStatus = "disabled" | "not_required" | "suppressed" | "sent" | "failed";
 export type FailureKind = "none" | "target" | "runner" | string;
-export type TaskSurfaceStatus = "ok" | "failed" | "never" | "disabled";
+export type TaskSurfaceStatus =
+  | "healthy"
+  | "suspected_failing"
+  | "failing"
+  | "suspected_recovery"
+  | "unknown"
+  | "stale"
+  | "disabled";
+export type ObservationKind = "observation" | "verification" | "draft";
 export type WebhookType = "feishu" | "wecom" | "dingtalk";
 export type ConfigBundle = Record<string, unknown>;
 export type CheckBatchAction = "enable" | "disable" | "run" | "update_interval";
@@ -11,6 +19,7 @@ export interface AlertPolicy {
   alert_cooldown_minutes?: number;
   recovery_notification?: boolean;
   notification_channel_ids?: string[];
+  member_ids?: string[];
 }
 
 export interface AlertTagPolicy extends AlertPolicy {
@@ -180,14 +189,19 @@ export interface Check {
   alert_policy_json: string;
   created_at: string;
   updated_at: string;
-  current_status?: "ok" | "failed" | null;
+  current_status?: TaskSurfaceStatus | null;
+  monitor_status?: TaskSurfaceStatus | null;
   consecutive_failures: number;
+  consecutive_successes?: number;
   last_success_at?: string | null;
   last_failed_at?: string | null;
   last_run_at?: string | null;
   last_run_id?: number | null;
   last_error?: string | null;
   last_duration_ms?: number | null;
+  last_scheduled_at?: string | null;
+  last_scheduled_run_id?: number | null;
+  last_state_changed_at?: string | null;
 }
 
 export interface CheckBatchPayload {
@@ -318,6 +332,9 @@ export interface Run {
   notification_channel?: "feishu" | "wecom" | "dingtalk" | string | null;
   notification_error?: string | null;
   notification_sent_at?: string | null;
+  trigger: string;
+  observation_kind: ObservationKind;
+  affects_health: boolean;
   created_at: string;
   consecutive_failures?: number;
 }
@@ -338,7 +355,6 @@ export interface RunFailureSummary {
   status: RunStatus | string;
   failure_kind: FailureKind;
   summary: string;
-  error_message: string;
   signals: Array<{ label: string; value: unknown }>;
   next_steps: string[];
 }
@@ -383,6 +399,12 @@ export interface Overview {
   ui_count: number;
   api_count: number;
   failing_count: number;
+  suspected_failing_count: number;
+  suspected_recovery_count: number;
+  suspected_count: number;
+  unknown_count: number;
+  stale_count: number;
+  healthy_count: number;
   today_runs: number;
   latest_run: Run | null;
   latest_recovered: { name: string; type: CheckType; last_success_at: string } | null;
@@ -393,7 +415,14 @@ export interface Overview {
 export interface OverviewTrend {
   key: "24h" | "7d" | string;
   label: string;
+  series: OverviewTrendSeries[];
+}
+
+export interface OverviewTrendSeries {
+  check_type: CheckType;
+  label: string;
   runs: number;
+  success_count: number;
   success_rate?: number | null;
   failure_count: number;
   duration_p50_ms?: number | null;
@@ -411,10 +440,18 @@ export interface SettingsValues {
   alerts_enabled: boolean;
   alert_detail_base_url: string;
   notification_channels: NotificationChannel[];
+  members: Member[];
   alert_tag_policies: AlertTagPolicy[];
   environment_variables: EnvironmentVariable[];
   alert_cooldown_minutes: number;
+  alert_delivery_attempts: number;
   recovery_notification: boolean;
+  api_failure_confirmation_count: number;
+  ui_failure_confirmation_count: number;
+  recovery_confirmation_count: number;
+  api_retry_attempts: number;
+  ui_retry_attempts: number;
+  stale_after_intervals: number;
   browser_headless: boolean;
   browser_type: "chromium" | "firefox" | "webkit";
   browser_proxy: string;
@@ -423,8 +460,11 @@ export interface SettingsValues {
   screenshot_retention_days: number;
   trace_retention_days: number;
   response_retention_days: number;
+  success_response_artifacts_enabled: boolean;
+  database_backup_retention: number;
   read_only_token?: string;
   read_only_token_set?: boolean;
+  read_only_tokens?: ReadOnlyToken[];
   local_runner_name?: string;
   local_runner_address?: string;
   local_runner_region?: string;
@@ -453,6 +493,35 @@ export interface RuntimeStatus {
   };
   active_checks: number;
   closing: boolean;
+  scheduler: {
+    running: boolean;
+    scheduled_checks: number;
+    next_due_at?: string | null;
+    overdue_jobs: number;
+  };
+}
+
+export interface RunPage {
+  items: Run[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface DatabaseBackup {
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+}
+
+export interface ReadOnlyToken {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
+export interface CreatedReadOnlyToken extends ReadOnlyToken {
+  token: string;
 }
 
 export interface NotificationChannel {
@@ -464,6 +533,16 @@ export interface NotificationChannel {
   dingtalk_secret?: string;
   dingtalk_secret_set?: boolean;
   dingtalk_secret_clear?: boolean;
+}
+
+export interface Member {
+  id: string;
+  name: string;
+  feishu_open_id: string;
+  wecom_user_id: string;
+  wecom_mobile: string;
+  dingtalk_user_id: string;
+  dingtalk_mobile: string;
 }
 
 export interface EnvironmentVariable {
@@ -542,10 +621,15 @@ export type CheckPayload = Omit<
   | "created_at"
   | "updated_at"
   | "current_status"
+  | "monitor_status"
   | "consecutive_failures"
+  | "consecutive_successes"
   | "last_success_at"
   | "last_failed_at"
   | "last_run_at"
   | "last_run_id"
   | "last_error"
+  | "last_scheduled_at"
+  | "last_scheduled_run_id"
+  | "last_state_changed_at"
 >;

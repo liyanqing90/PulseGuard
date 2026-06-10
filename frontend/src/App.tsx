@@ -8,6 +8,7 @@ const ChecksPage = lazy(() => import("./pages/ChecksPage").then((module) => ({ d
 const RunsPage = lazy(() => import("./pages/RunsPage").then((module) => ({ default: module.RunsPage })));
 const RunDetailPage = lazy(() => import("./pages/RunDetailPage").then((module) => ({ default: module.RunDetailPage })));
 const SettingsPage = lazy(() => import("./pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
+const MembersPage = lazy(() => import("./pages/MembersPage").then((module) => ({ default: module.MembersPage })));
 const DebugPage = lazy(() => import("./pages/DebugPage").then((module) => ({ default: module.DebugPage })));
 const OperationsPage = lazy(() => import("./pages/OperationsPage").then((module) => ({ default: module.OperationsPage })));
 const StatusPage = lazy(() => import("./pages/StatusPage").then((module) => ({ default: module.StatusPage })));
@@ -36,6 +37,7 @@ export default function App() {
         <Route path="/status" element={page(<StatusPage />)} />
         <Route path="/operations" element={page(<OperationsPage />)} />
         <Route path="/settings" element={page(<SettingsPage />)} />
+        <Route path="/members" element={page(<MembersPage />)} />
         <Route path="/debug/:type/:checkId" element={page(<DebugPage />)} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

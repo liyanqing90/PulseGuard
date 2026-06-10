@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { checkToPayload, detectBodyMode, normalizeCheckPayload, prepareCheckPayload, sameCheckPayload, type BodyEditorMode } from "../checkPayload";
 import { apiScriptTemplate, blankCheck, checkFromTemplate, checkTemplatesForType } from "../defaults";
-import type { AlertPolicy, Check, CheckPayload, CheckType, NotificationChannel, Run } from "../types";
+import type { AlertPolicy, Check, CheckPayload, CheckType, Member, NotificationChannel, Run } from "../types";
 import { dirtyTagColor } from "../utils";
 import { ApiAssertionsBuilder } from "./ApiAssertionsBuilder";
 import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
@@ -32,6 +32,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const [debugSnapshot, setDebugSnapshot] = useState<CheckPayload | null>(null);
   const [bodyMode, setBodyMode] = useState<BodyEditorMode>("json");
   const [notificationChannels, setNotificationChannels] = useState<NotificationChannel[]>([]);
+  const [members, setMembers] = useState<Member[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState(() => checkTemplatesForType(type)[0]?.id || "");
 
   const templates = useMemo(() => checkTemplatesForType(type), [type]);
@@ -58,8 +59,14 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     if (!open) return;
     api
       .settings()
-      .then((values) => setNotificationChannels(values.notification_channels || []))
-      .catch(() => setNotificationChannels([]));
+      .then((values) => {
+        setNotificationChannels(values.notification_channels || []);
+        setMembers(values.members || []);
+      })
+      .catch(() => {
+        setNotificationChannels([]);
+        setMembers([]);
+      });
   }, [open]);
 
   async function save(): Promise<Check> {
@@ -144,11 +151,16 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
 
   function setAlertPolicyMode(mode: "inherit" | "custom") {
     if (mode === "inherit") {
-      patchForm({ alert_policy_json: "{}" });
+      patchForm({ alert_policy_json: serializeCheckAlertPolicy({ member_ids: alertPolicy.member_ids || [] }) });
       return;
     }
     if (hasAlertPolicyOverrides(alertPolicy)) return;
-    patchForm({ alert_policy_json: serializeCheckAlertPolicy(defaultAlertPolicy(notificationChannels)) });
+    patchForm({
+      alert_policy_json: serializeCheckAlertPolicy({
+        ...defaultAlertPolicy(notificationChannels),
+        member_ids: alertPolicy.member_ids || []
+      })
+    });
   }
 
   function requestClose() {
@@ -191,7 +203,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
       open={open}
       size={920}
       onClose={requestClose}
-      destroyOnClose
+      destroyOnHidden
       extra={
         <Space size={8}>
           {debugStale && (
@@ -213,10 +225,10 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             loading={runningMode === "saved"}
             disabled={saving || running || !activeCheck}
           >
-            运行已保存版本
+            人工验证已保存配置
           </Button>
           <Button icon={<Play size={16} />} onClick={handleRunDraft} loading={runningMode === "draft"} disabled={saving || running}>
-            运行草稿
+            试运行当前配置
           </Button>
           <Button type="primary" icon={<Save size={16} />} onClick={handleSaveOnly} loading={saving} disabled={running}>
             保存
@@ -312,6 +324,16 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
                       ]}
                     />
                   </Form.Item>
+                  <Form.Item label="关联成员" className="span-2">
+                    <Select
+                      mode="multiple"
+                      value={alertPolicy.member_ids || []}
+                      onChange={(value) => patchAlertPolicy({ member_ids: value })}
+                      options={members.map((member) => ({ label: member.name, value: member.id }))}
+                      placeholder={members.length ? "选择告警时需要通知的成员" : "暂无可关联成员"}
+                      allowClear
+                    />
+                  </Form.Item>
                   {alertPolicyMode === "custom" && (
                     <>
                       <Form.Item label="通知渠道" className="span-2">
@@ -393,18 +415,40 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
                 }
               />
             </div>
-            <ApiAssertionsBuilder
-              bodyMode={bodyMode}
-              check={form}
-              value={form.assertions_json}
-              onChange={(assertions_json) => patchForm({ assertions_json })}
+            <Collapse
+              className="advanced-script-collapse"
+              items={[
+                {
+                  key: "health-rules",
+                  label: "健康判定规则",
+                  children: (
+                    <ApiAssertionsBuilder
+                      bodyMode={bodyMode}
+                      check={form}
+                      value={form.assertions_json}
+                      onChange={(assertions_json) => patchForm({ assertions_json })}
+                    />
+                  )
+                }
+              ]}
             />
           </>
         )}
 
         {type === "ui" ? (
           <>
-            <UiAssertionsBuilder check={form} value={form.assertions_json} onChange={(assertions_json) => patchForm({ assertions_json })} />
+            <Collapse
+              className="advanced-script-collapse"
+              items={[
+                {
+                  key: "health-rules",
+                  label: "健康判定规则",
+                  children: (
+                    <UiAssertionsBuilder check={form} value={form.assertions_json} onChange={(assertions_json) => patchForm({ assertions_json })} />
+                  )
+                }
+              ]}
+            />
             <UiScriptSections
               setupScript={form.setup_script}
               script={form.script}
@@ -418,7 +462,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             items={[
               {
                 key: "script",
-                label: "高级脚本",
+                label: "高级探测脚本",
                 children: (
                   <CodeEditorPanel
                     title="Python 脚本"
@@ -456,7 +500,8 @@ function parseCheckAlertPolicy(value?: string | null): AlertPolicy {
     return {
       ...(typeof policy.alert_cooldown_minutes === "number" ? { alert_cooldown_minutes: policy.alert_cooldown_minutes } : {}),
       ...(typeof policy.recovery_notification === "boolean" ? { recovery_notification: policy.recovery_notification } : {}),
-      ...(Array.isArray(policy.notification_channel_ids) ? { notification_channel_ids: policy.notification_channel_ids.map(String) } : {})
+      ...(Array.isArray(policy.notification_channel_ids) ? { notification_channel_ids: policy.notification_channel_ids.map(String) } : {}),
+      ...(Array.isArray(policy.member_ids) ? { member_ids: policy.member_ids.map(String) } : {})
     };
   } catch {
     return {};
@@ -473,6 +518,9 @@ function serializeCheckAlertPolicy(policy: AlertPolicy): string {
   }
   if (Array.isArray(policy.notification_channel_ids)) {
     normalized.notification_channel_ids = Array.from(new Set(policy.notification_channel_ids.map((item) => String(item || "").trim()).filter(Boolean)));
+  }
+  if (Array.isArray(policy.member_ids)) {
+    normalized.member_ids = Array.from(new Set(policy.member_ids.map((item) => String(item || "").trim()).filter(Boolean)));
   }
   return JSON.stringify(normalized);
 }

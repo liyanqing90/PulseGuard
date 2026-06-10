@@ -4,9 +4,7 @@ import {
   AlertTriangle,
   BellRing,
   Clock3,
-  Database,
   History,
-  Monitor,
   Play,
   RotateCcw,
   Settings2,
@@ -23,8 +21,8 @@ import {
   batchRunNotificationType,
   summarizeBatchRuns
 } from "../components/BatchRunAlert";
-import type { CheckType, Overview, OverviewTrend, Run, SettingsValues } from "../types";
-import { checkListPath, formatDate, formatDuration, intervalLabel, runStatusLabel, runStatusTagColor } from "../utils";
+import type { CheckType, Overview, OverviewTrend, OverviewTrendSeries, Run, RuntimeStatus, SettingsValues } from "../types";
+import { checkListPath, formatDate, formatDuration, runStatusLabel, runStatusTagColor } from "../utils";
 
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
 
@@ -33,6 +31,7 @@ export function OverviewPage() {
   const location = useLocation();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<number | null>(null);
@@ -41,9 +40,10 @@ export function OverviewPage() {
 
   async function load() {
     try {
-      const [nextOverview, nextSettings] = await Promise.all([api.overview(), api.settings()]);
+      const [nextOverview, nextSettings, nextRuntime] = await Promise.all([api.overview(), api.settings(), api.runtime()]);
       setOverview(nextOverview);
       setSettings(nextSettings);
+      setRuntime(nextRuntime);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -104,7 +104,10 @@ export function OverviewPage() {
     }
   }
 
-  const hasIncident = Boolean((overview?.failing_count || 0) > 0);
+  const confirmingCount = (overview?.suspected_failing_count || 0) + (overview?.suspected_recovery_count || 0);
+  const staleOrUnknownCount = (overview?.unknown_count || 0) + (overview?.stale_count || 0);
+  const abnormalCount = (overview?.failing_count || 0) + confirmingCount + staleOrUnknownCount;
+  const hasIncident = abnormalCount > 0;
   const trends = overview?.trends || [];
 
   const columns: ColumnsType<Run> = [
@@ -120,7 +123,7 @@ export function OverviewPage() {
       )
     },
     { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 100 },
-    { title: "归因", dataIndex: "failure_kind", render: (_, run) => failureKindTag(run), width: 90 },
+    { title: "失败来源", dataIndex: "failure_kind", render: (_, run) => failureKindTag(run), width: 118 },
     { title: "耗时", dataIndex: "duration_ms", render: (value: number | null) => formatDuration(value), width: 110 },
     { title: "错误摘要", dataIndex: "error_message", ellipsis: true },
     { title: "连续失败", dataIndex: "consecutive_failures", render: (value?: number) => value || "-", width: 110 },
@@ -142,11 +145,11 @@ export function OverviewPage() {
 
       <section className={`overview-command ${hasIncident ? "overview-command-danger" : ""}`}>
         <div>
-          <h2>{hasIncident ? "存在失败任务，需要处理" : "当前监控面正常"}</h2>
+          <h2>{hasIncident ? "存在需要处理的监控异常" : "当前监控面健康"}</h2>
           <p>
             {hasIncident
-              ? `${overview?.failing_count || 0} 个启用任务处于失败态，建议优先查看失败现场。`
-              : `UI/API 探活已接入，今日已执行 ${overview?.today_runs ?? 0} 次。`}
+              ? `故障 ${overview?.failing_count || 0}，疑似故障 ${overview?.suspected_failing_count || 0}，疑似恢复 ${overview?.suspected_recovery_count || 0}，无有效观测或过期 ${staleOrUnknownCount}。`
+              : `页面和接口监控正常，今日完成 ${overview?.today_runs ?? 0} 次定时观测。`}
           </p>
         </div>
         <Space wrap>
@@ -170,39 +173,39 @@ export function OverviewPage() {
         </Card>
         <Card className="metric-card metric-compact metric-info">
           <span className="metric-icon"><Zap size={17} /></span>
-          <Statistic title="默认调度" value={settings ? intervalLabel(settings.default_interval_seconds) : "-"} />
+          <Statistic title="调度器" value={runtime?.scheduler.running ? "运行中" : "未运行"} />
           <div className="metric-detail">
-            {settings ? `并发 ${settings.max_concurrency}，UI ${settings.max_ui_concurrency}，队列 ${settings.max_queue_size}` : "-"}
+            {runtime ? `${runtime.scheduler.scheduled_checks} 个定时任务，逾期 ${runtime.scheduler.overdue_jobs}` : "-"}
           </div>
         </Card>
         <Card className="metric-card metric-compact">
-          <span className="metric-icon"><Monitor size={17} /></span>
-          <Statistic title="浏览器运行" value={settings?.browser_type || "-"} />
-          <div className="metric-detail">{settings ? `${settings.browser_headless ? "Headless" : "可视化"}，${settings.browser_viewport}` : "-"}</div>
+          <span className="metric-icon"><Zap size={17} /></span>
+          <Statistic title="执行器" value={runtime ? `${runtime.workers.running}/${runtime.workers.limit}` : "-"} />
+          <div className="metric-detail">{runtime ? `排队 ${runtime.queue.queued}，浏览器 ${runtime.browser.running}/${runtime.browser.limit}` : "-"}</div>
         </Card>
         <Card className="metric-card metric-compact">
-          <span className="metric-icon"><Database size={17} /></span>
-          <Statistic title="数据保留" value={settings ? `${settings.run_retention_days} 天` : "-"} />
-          <div className="metric-detail">{settings ? `Trace ${settings.trace_retention_days} 天，响应 ${settings.response_retention_days} 天` : "-"}</div>
+          <span className="metric-icon"><AlertTriangle size={17} /></span>
+          <Statistic title="无有效观测/过期" value={staleOrUnknownCount} />
+          <div className="metric-detail">无有效观测：尚未形成健康结论；过期：超过设定周期未更新</div>
         </Card>
       </section>
 
       <section className="metric-grid">
         <Card className="metric-card metric-info">
           <span className="metric-icon"><ShieldCheck size={19} /></span>
-          <Statistic title="UI 任务" value={overview?.ui_count ?? 0} />
+          <Statistic title="页面监控" value={overview?.ui_count ?? 0} />
         </Card>
         <Card className="metric-card metric-info">
           <span className="metric-icon"><ShieldCheck size={19} /></span>
-          <Statistic title="API 任务" value={overview?.api_count ?? 0} />
+          <Statistic title="接口监控" value={overview?.api_count ?? 0} />
         </Card>
         <Card className={`metric-card ${hasIncident ? "metric-danger" : "metric-success"}`}>
           <span className="metric-icon"><AlertTriangle size={19} /></span>
-          <Statistic title="当前失败" value={overview?.failing_count ?? 0} />
+          <Statistic title="当前故障" value={overview?.failing_count ?? 0} />
         </Card>
         <Card className="metric-card">
           <span className="metric-icon"><History size={19} /></span>
-          <Statistic title="今日执行" value={overview?.today_runs ?? 0} />
+          <Statistic title="今日定时观测" value={overview?.today_runs ?? 0} />
         </Card>
         <Card className="metric-card metric-wide">
           <span className="metric-icon"><Clock3 size={19} /></span>
@@ -224,10 +227,10 @@ export function OverviewPage() {
       )}
 
       <Card
-        title="失败现场"
+        title="当前故障现场"
         extra={
           <Button icon={<History size={16} />} onClick={() => navigate("/runs")}>
-            执行历史
+            运行记录
           </Button>
         }
       >
@@ -273,27 +276,53 @@ export function OverviewPage() {
 }
 
 function failureKindTag(run: Run) {
-  if (run.failure_kind === "target") return <Tag color="red">目标</Tag>;
-  if (run.failure_kind === "runner") return <Tag color="orange">Runner</Tag>;
+  if (run.failure_kind === "target") return <Tag color="red">目标页面/API</Tag>;
+  if (run.failure_kind === "runner") return <Tag color="orange">执行环境</Tag>;
   return <span>-</span>;
 }
 
 function TrendCard({ trend }: { trend: OverviewTrend }) {
-  const successRate = formatSuccessRate(trend.success_rate);
+  const totalRuns = trend.series.reduce((sum, item) => sum + item.runs, 0);
   return (
     <Card className="trend-card">
       <div className="trend-card-header">
         <strong>{trend.label}</strong>
-        <span>{trend.runs} 次运行</span>
+        <span>{totalRuns} 次运行</span>
       </div>
       <div className="trend-card-body">
-        <Statistic title="成功率" value={successRate} />
-        <Statistic title="失败次数" value={trend.failure_count} />
-        <TrendMeta label="P50 耗时" value={formatDuration(trend.duration_p50_ms)} />
-        <TrendMeta label="P95 耗时" value={formatDuration(trend.duration_p95_ms)} />
+        <div className="trend-series-table">
+          <div className="trend-series-header">
+            <span>类型</span>
+            <span>运行</span>
+            <span>成功率</span>
+            <span>失败</span>
+            <span>P50</span>
+            <span>P95</span>
+          </div>
+          {trend.series.map((item) => (
+            <TrendSeriesRow key={item.check_type} item={item} />
+          ))}
+        </div>
       </div>
     </Card>
   );
+}
+
+function TrendSeriesRow({ item }: { item: OverviewTrendSeries }) {
+  return (
+    <div className="trend-series-row">
+      <span className="trend-series-label">{checkTypeLabel(item.check_type)}</span>
+      <TrendValue value={`${item.runs} 次`} />
+      <TrendValue value={formatSuccessRate(item.success_rate)} />
+      <TrendValue value={`${item.failure_count} 次`} />
+      <TrendValue value={formatDuration(item.duration_p50_ms)} />
+      <TrendValue value={formatDuration(item.duration_p95_ms)} />
+    </div>
+  );
+}
+
+function checkTypeLabel(type: CheckType): string {
+  return type === "ui" ? "UI" : "API";
 }
 
 function formatSuccessRate(value: number | null | undefined): string {
@@ -301,13 +330,8 @@ function formatSuccessRate(value: number | null | undefined): string {
   return `${value.toLocaleString("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`;
 }
 
-function TrendMeta({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="trend-meta">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function TrendValue({ value }: { value: string }) {
+  return <strong className="trend-value">{value}</strong>;
 }
 
 function alertChannel(settings: SettingsValues): string {

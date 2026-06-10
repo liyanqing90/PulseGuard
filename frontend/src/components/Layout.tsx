@@ -1,24 +1,30 @@
-import { Menu, Typography } from "antd";
-import { History, LayoutDashboard, MonitorCheck, PlugZap, ScrollText, Settings, ShieldCheck } from "lucide-react";
+import { Button, Menu, Modal, Typography } from "antd";
+import { History, LayoutDashboard, Megaphone, MonitorCheck, PlugZap, ScrollText, Settings, ShieldCheck, Users } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { api } from "../api";
+import type { StatusPageSnapshot } from "../types";
+import { formatDate } from "../utils";
 
 const { Text, Title } = Typography;
 
 const navItems = [
   { to: "/", label: "总览", icon: <LayoutDashboard size={16} /> },
-  { to: "/ui-checks", label: "UI 监控", icon: <MonitorCheck size={16} /> },
+  { to: "/ui-checks", label: "页面监控", icon: <MonitorCheck size={16} /> },
   { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> },
-  { to: "/runs", label: "执行历史", icon: <History size={16} /> },
+  { to: "/runs", label: "运行记录", icon: <History size={16} /> },
   { to: "/status", label: "内网状态", icon: <ShieldCheck size={16} /> },
   { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> },
+  { to: "/members", label: "成员管理", icon: <Users size={16} /> },
   { to: "/settings", label: "系统设置", icon: <Settings size={16} /> }
 ];
 
 const titles: Record<string, string> = {
   "/": "总览",
-  "/ui-checks": "UI 监控",
+  "/ui-checks": "页面监控",
   "/api-checks": "接口监控",
-  "/runs": "执行历史",
+  "/runs": "运行记录",
+  "/members": "成员管理",
   "/status": "内网状态",
   "/operations": "运维审计",
   "/settings": "系统设置"
@@ -27,10 +33,34 @@ const titles: Record<string, string> = {
 export function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
+  const [maintenance, setMaintenance] = useState<StatusPageSnapshot["maintenance"] | null>(null);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const selectedPath = navItems.find((item) => item.to !== "/" && location.pathname.startsWith(item.to))?.to || "/";
   const activeTitle = location.pathname.startsWith("/debug")
     ? "全屏调试"
-    : titles[selectedPath] || (location.pathname.startsWith("/runs") ? "执行历史" : "PulseGuard");
+    : titles[selectedPath] || (location.pathname.startsWith("/runs") ? "运行记录" : "PulseGuard");
+  const maintenanceWindow = formatMaintenanceWindow(maintenance?.starts_at, maintenance?.ends_at);
+  const showMaintenanceButton = Boolean(maintenance?.enabled);
+
+  useEffect(() => {
+    let disposed = false;
+    const loadMaintenance = () => {
+      api
+        .statusPage()
+        .then((snapshot) => {
+          if (!disposed) setMaintenance(snapshot.maintenance);
+        })
+        .catch(() => {
+          if (!disposed) setMaintenance(null);
+        });
+    };
+    loadMaintenance();
+    window.addEventListener("pulseguard:maintenance-updated", loadMaintenance);
+    return () => {
+      disposed = true;
+      window.removeEventListener("pulseguard:maintenance-updated", loadMaintenance);
+    };
+  }, [location.pathname]);
 
   return (
     <div className="app-shell">
@@ -66,13 +96,43 @@ export function Layout() {
               {activeTitle}
             </Title>
           </div>
-          <div className="runtime-pill">
-            <span className="runtime-dot" />
-            本地运行
+          <div className="topbar-actions">
+            {showMaintenanceButton && (
+              <Button className="maintenance-topbar-button" icon={<Megaphone size={15} />} onClick={() => setMaintenanceOpen(true)}>
+                公告
+              </Button>
+            )}
+            <div className="runtime-pill">
+              <span className="runtime-dot" />
+              本地运行
+            </div>
           </div>
         </header>
         <Outlet />
       </main>
+      <Modal
+        title={maintenance?.title || "维护公告"}
+        open={maintenanceOpen}
+        footer={null}
+        onCancel={() => setMaintenanceOpen(false)}
+      >
+        <div className="maintenance-modal-content">
+          <p>{maintenance?.message || "暂无公告内容"}</p>
+          {maintenanceWindow && (
+            <div className="maintenance-window">
+              <span>维护窗口</span>
+              <strong>{maintenanceWindow}</strong>
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
   );
+}
+
+function formatMaintenanceWindow(startsAt?: string, endsAt?: string): string {
+  const start = startsAt ? formatDate(startsAt) : "";
+  const end = endsAt ? formatDate(endsAt) : "";
+  if (start && end) return `${start} - ${end}`;
+  return start || end;
 }

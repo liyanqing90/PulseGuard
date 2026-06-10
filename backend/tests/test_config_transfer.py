@@ -60,6 +60,7 @@ class ConfigTransferApiTests(unittest.TestCase):
             "alert_cooldown_minutes": 15,
             "recovery_notification": False,
             "notification_channel_ids": ["ding"],
+            "member_ids": ["alice"],
         }
         tag_policy = {
             "id": "critical-api",
@@ -81,6 +82,17 @@ class ConfigTransferApiTests(unittest.TestCase):
                         "enabled": True,
                         "webhook_url": "${DING_WEBHOOK}",
                         "dingtalk_secret": "SEC-dingtalk-signing-secret",
+                    }
+                ],
+                "members": [
+                    {
+                        "id": "alice",
+                        "name": "Alice",
+                        "feishu_open_id": "ou_alice_private",
+                        "wecom_user_id": "alice.private",
+                        "wecom_mobile": "13800000001",
+                        "dingtalk_user_id": "",
+                        "dingtalk_mobile": "",
                     }
                 ],
                 "alert_tag_policies": [
@@ -126,10 +138,17 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertNotIn("token-secret-456", exported_text)
         self.assertNotIn("read-token-secret-999", exported_text)
         self.assertNotIn("process-secret-789", exported_text)
+        self.assertNotIn("ou_alice_private", exported_text)
+        self.assertNotIn("alice.private", exported_text)
+        self.assertNotIn("13800000001", exported_text)
         self.assertEqual(exported["settings"]["read_only_token"], "")
+        self.assertEqual(exported["settings"]["members"], [])
 
         exported_check = next(check for check in exported["checks"] if check["name"] == "Secret-bearing API")
-        self.assertEqual(json.loads(exported_check["alert_policy_json"]), task_policy)
+        self.assertEqual(
+            json.loads(exported_check["alert_policy_json"]),
+            {key: value for key, value in task_policy.items() if key != "member_ids"},
+        )
 
         tag_policies = exported["settings"]["alert_tag_policies"]
         self.assertEqual(tag_policies, [tag_policy])
@@ -144,6 +163,13 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertNotEqual(variables["explicit"].get("value"), "session-secret-123")
         self.assertTrue(variables["named"]["secret"])
         self.assertNotEqual(variables["named"].get("value"), "token-secret-456")
+
+        full_response = self.client.get("/api/config/export?redact=false")
+        self.assertEqual(full_response.status_code, 200)
+        full_export = full_response.json()
+        self.assertEqual(full_export["settings"]["members"][0]["id"], "alice")
+        full_check = next(check for check in full_export["checks"] if check["name"] == "Secret-bearing API")
+        self.assertEqual(json.loads(full_check["alert_policy_json"])["member_ids"], ["alice"])
 
     def test_import_preview_reports_counts_and_does_not_persist_changes(self) -> None:
         before_check_count = len(storage.list_checks())

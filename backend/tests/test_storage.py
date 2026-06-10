@@ -44,46 +44,73 @@ class OverviewStorageTests(unittest.TestCase):
         self.assertEqual(overview["latest_run"]["id"], saved_run["id"])
         self.assertNotIn(draft_run["id"], [run["id"] for run in overview["recent_failures"]])
 
-    def test_overview_trends_count_windows_and_ignore_drafts_and_non_terminal_runs(self) -> None:
+    def test_overview_trends_split_ui_and_api_windows_and_ignore_invalid_runs(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
         ):
             storage.init_db()
-            check = storage.create_check(api_check_data("Trend API"))
-            check_id = int(check["id"])
+            api_check = storage.create_check(api_check_data("Trend API"))
+            ui_check = storage.create_check(ui_check_data("Trend UI"))
+            api_check_id = int(api_check["id"])
+            ui_check_id = int(ui_check["id"])
             now = datetime.now().astimezone().replace(microsecond=0)
 
-            insert_trend_run(check_id, "ok", now - timedelta(hours=1), 100)
-            insert_trend_run(check_id, "failed", now - timedelta(hours=2), 300)
-            insert_trend_run(check_id, "timeout", now - timedelta(hours=3), 500)
-            insert_trend_run(check_id, "ok", now - timedelta(hours=4), 700)
-            insert_trend_run(check_id, "ok", now - timedelta(days=2), 200)
-            insert_trend_run(check_id, "failed", now - timedelta(days=3), 400)
-            insert_trend_run(check_id, "ok", now - timedelta(days=4), 600)
+            insert_trend_run(api_check_id, "api", "ok", now - timedelta(hours=1), 100)
+            insert_trend_run(api_check_id, "api", "failed", now - timedelta(hours=2), 300)
+            insert_trend_run(api_check_id, "api", "timeout", now - timedelta(hours=3), 500)
+            insert_trend_run(api_check_id, "api", "ok", now - timedelta(hours=4), 700)
+            insert_trend_run(api_check_id, "api", "ok", now - timedelta(days=2), 200)
+            insert_trend_run(api_check_id, "api", "failed", now - timedelta(days=3), 400)
+            insert_trend_run(api_check_id, "api", "ok", now - timedelta(days=4), 600)
 
-            insert_trend_run(check_id, "ok", now - timedelta(days=8), 999)
-            insert_trend_run(0, "failed", now - timedelta(hours=5), 1)
-            insert_trend_run(-10, "ok", now - timedelta(hours=6), 2)
-            insert_trend_run(check_id, "skipped", now - timedelta(hours=7), 3)
-            insert_trend_run(check_id, "running", now - timedelta(hours=8), 4)
-            insert_trend_run(check_id, "pending", now - timedelta(hours=9), 5)
-            insert_trend_run(check_id, "failed", now + timedelta(hours=1), 800)
+            insert_trend_run(ui_check_id, "ui", "ok", now - timedelta(hours=1), 120)
+            insert_trend_run(ui_check_id, "ui", "failed", now - timedelta(hours=2), 320)
+            insert_trend_run(ui_check_id, "ui", "ok", now - timedelta(days=2), 220)
+            insert_trend_run(ui_check_id, "ui", "timeout", now - timedelta(days=3), 420)
+            insert_trend_run(ui_check_id, "ui", "ok", now - timedelta(days=4), 620)
+
+            insert_trend_run(api_check_id, "api", "ok", now - timedelta(days=8), 999)
+            insert_trend_run(ui_check_id, "ui", "ok", now - timedelta(days=8), 998)
+            insert_trend_run(0, "api", "failed", now - timedelta(hours=5), 1)
+            insert_trend_run(-10, "ui", "ok", now - timedelta(hours=6), 2)
+            insert_trend_run(api_check_id, "api", "skipped", now - timedelta(hours=7), 3)
+            insert_trend_run(api_check_id, "api", "running", now - timedelta(hours=8), 4)
+            insert_trend_run(ui_check_id, "ui", "pending", now - timedelta(hours=9), 5)
+            insert_trend_run(api_check_id, "api", "failed", now + timedelta(hours=1), 800)
 
             overview = storage.get_overview()
 
         trends = {item["key"]: item for item in overview["trends"]}
+        trend_24h = {item["check_type"]: item for item in trends["24h"]["series"]}
+        trend_7d = {item["check_type"]: item for item in trends["7d"]["series"]}
 
         self.assertEqual(set(trends), {"24h", "7d"})
-        self.assertEqual(trends["24h"]["runs"], 4)
-        self.assertEqual(trends["24h"]["success_rate"], 50.0)
-        self.assertEqual(trends["24h"]["failure_count"], 2)
-        self.assertEqual(trends["24h"]["duration_p50_ms"], 300)
-        self.assertEqual(trends["24h"]["duration_p95_ms"], 700)
-        self.assertEqual(trends["7d"]["runs"], 7)
-        self.assertEqual(trends["7d"]["success_rate"], 57.1)
-        self.assertEqual(trends["7d"]["failure_count"], 3)
-        self.assertEqual(trends["7d"]["duration_p50_ms"], 400)
-        self.assertEqual(trends["7d"]["duration_p95_ms"], 700)
+        self.assertEqual(set(trend_24h), {"ui", "api"})
+        self.assertEqual(trend_24h["ui"]["label"], "UI")
+        self.assertEqual(trend_24h["api"]["label"], "API")
+        self.assertNotIn("runs", trends["24h"])
+        self.assertEqual(trend_24h["api"]["runs"], 4)
+        self.assertEqual(trend_24h["api"]["success_count"], 2)
+        self.assertEqual(trend_24h["api"]["success_rate"], 50.0)
+        self.assertEqual(trend_24h["api"]["failure_count"], 2)
+        self.assertEqual(trend_24h["api"]["duration_p50_ms"], 300)
+        self.assertEqual(trend_24h["api"]["duration_p95_ms"], 700)
+        self.assertEqual(trend_24h["ui"]["runs"], 2)
+        self.assertEqual(trend_24h["ui"]["success_count"], 1)
+        self.assertEqual(trend_24h["ui"]["success_rate"], 50.0)
+        self.assertEqual(trend_24h["ui"]["failure_count"], 1)
+        self.assertEqual(trend_24h["ui"]["duration_p50_ms"], 120)
+        self.assertEqual(trend_24h["ui"]["duration_p95_ms"], 320)
+        self.assertEqual(trend_7d["api"]["runs"], 7)
+        self.assertEqual(trend_7d["api"]["success_rate"], 57.1)
+        self.assertEqual(trend_7d["api"]["failure_count"], 3)
+        self.assertEqual(trend_7d["api"]["duration_p50_ms"], 400)
+        self.assertEqual(trend_7d["api"]["duration_p95_ms"], 700)
+        self.assertEqual(trend_7d["ui"]["runs"], 5)
+        self.assertEqual(trend_7d["ui"]["success_rate"], 60.0)
+        self.assertEqual(trend_7d["ui"]["failure_count"], 2)
+        self.assertEqual(trend_7d["ui"]["duration_p50_ms"], 320)
+        self.assertEqual(trend_7d["ui"]["duration_p95_ms"], 620)
 
     def test_overview_trends_return_empty_metrics_without_duration_samples(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -92,16 +119,22 @@ class OverviewStorageTests(unittest.TestCase):
             storage.init_db()
             check = storage.create_check(api_check_data("Sparse Trend API"))
             now = datetime.now().astimezone().replace(microsecond=0)
-            insert_trend_run(int(check["id"]), "ok", now - timedelta(hours=1), None)
+            insert_trend_run(int(check["id"]), "api", "ok", now - timedelta(hours=1), None)
 
             overview = storage.get_overview()
 
         trends = {item["key"]: item for item in overview["trends"]}
-        self.assertEqual(trends["24h"]["runs"], 1)
-        self.assertEqual(trends["24h"]["success_rate"], 100.0)
-        self.assertEqual(trends["24h"]["failure_count"], 0)
-        self.assertIsNone(trends["24h"]["duration_p50_ms"])
-        self.assertIsNone(trends["24h"]["duration_p95_ms"])
+        series = {item["check_type"]: item for item in trends["24h"]["series"]}
+        self.assertEqual(series["api"]["runs"], 1)
+        self.assertEqual(series["api"]["success_rate"], 100.0)
+        self.assertEqual(series["api"]["failure_count"], 0)
+        self.assertIsNone(series["api"]["duration_p50_ms"])
+        self.assertIsNone(series["api"]["duration_p95_ms"])
+        self.assertEqual(series["ui"]["runs"], 0)
+        self.assertIsNone(series["ui"]["success_rate"])
+        self.assertEqual(series["ui"]["failure_count"], 0)
+        self.assertIsNone(series["ui"]["duration_p50_ms"])
+        self.assertIsNone(series["ui"]["duration_p95_ms"])
 
     def test_ui_setup_fields_are_persisted(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -261,6 +294,46 @@ class CheckAlertPolicyStorageTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded["alert_policy_json"], "{}")
 
+    def test_member_settings_support_multiple_channels_and_prune_deleted_task_references(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            members = [
+                {
+                    "id": "alice",
+                    "name": "Alice",
+                    "feishu_open_id": "ou_alice",
+                    "wecom_user_id": "alice.wx",
+                    "wecom_mobile": "13800000001",
+                    "dingtalk_user_id": "alice.ding",
+                    "dingtalk_mobile": "13900000001",
+                },
+                {
+                    "id": "bob",
+                    "name": "Bob",
+                    "feishu_open_id": "ou_bob",
+                    "wecom_user_id": "",
+                    "wecom_mobile": "",
+                    "dingtalk_user_id": "",
+                    "dingtalk_mobile": "",
+                },
+            ]
+            storage.update_settings({"members": members})
+            check = storage.create_check(
+                api_check_data(
+                    "Member policy API",
+                    alert_policy_json=json_dumps({"member_ids": ["alice", "bob"]}),
+                )
+            )
+
+            storage.update_settings({"members": [members[1]]})
+            loaded = storage.get_check(int(check["id"]))
+            saved_members = storage.get_settings()["members"]
+
+        self.assertEqual(saved_members, [members[1]])
+        self.assertEqual(json.loads(loaded["alert_policy_json"])["member_ids"], ["bob"])
+
 
 class CheckBatchStorageTests(unittest.TestCase):
     def test_check_tag_set_normalizes_comma_and_whitespace_tags(self) -> None:
@@ -346,9 +419,9 @@ class RunArchiveStorageTests(unittest.TestCase):
             check_id = int(check["id"])
             old_day = datetime.now().astimezone().replace(microsecond=0) - timedelta(days=3)
             recent = datetime.now().astimezone().replace(microsecond=0)
-            insert_trend_run(check_id, "ok", old_day, 100)
-            insert_trend_run(check_id, "failed", old_day + timedelta(hours=1), 300)
-            insert_trend_run(check_id, "ok", recent, 500)
+            insert_trend_run(check_id, "api", "ok", old_day, 100)
+            insert_trend_run(check_id, "api", "failed", old_day + timedelta(hours=1), 300)
+            insert_trend_run(check_id, "api", "ok", recent, 500)
 
             removed = storage.cleanup_old_data({"run_retention_days": 1})
             archives = storage.list_run_archives()
@@ -576,7 +649,13 @@ def run_payload(status: str, error_message: str | None = None) -> dict[str, obje
     }
 
 
-def insert_trend_run(check_id: int, status: str, started_at: datetime, duration_ms: int | None) -> None:
+def insert_trend_run(
+    check_id: int,
+    check_type: str,
+    status: str,
+    started_at: datetime,
+    duration_ms: int | None,
+) -> None:
     timestamp = started_at.isoformat(timespec="seconds")
     finished_at = None if status in {"pending", "running"} else timestamp
     with storage._connect() as conn:
@@ -589,8 +668,8 @@ def insert_trend_run(check_id: int, status: str, started_at: datetime, duration_
             """,
             (
                 check_id,
-                "Trend API",
-                "api",
+                "Trend UI" if check_type == "ui" else "Trend API",
+                check_type,
                 status,
                 timestamp,
                 finished_at,

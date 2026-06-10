@@ -17,12 +17,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from .api_assertions import inspect_api_response
-from . import config_transfer, notifier, run_comparison, storage
+from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
 from .config import REPORTS_DIR, RESPONSES_DIR, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, ensure_runtime_dirs
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
-from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest
+from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest
 from .variables import mask_data, mask_text
 
 
@@ -49,6 +49,8 @@ VALIDATION_FIELD_LABELS = {
     "alert_policy_json": "任务告警策略",
     "values": "设置",
     "notification_channels": "通知渠道",
+    "members": "成员",
+    "member_ids": "关联成员",
     "alert_tag_policies": "标签告警策略",
     "alert_policy_tag": "标签告警策略标签",
     "environment_variables": "环境变量",
@@ -59,6 +61,8 @@ VALIDATION_FIELD_LABELS = {
     "alert_detail_base_url": "告警详情链接前缀",
     "recovery_notification": "恢复通知",
     "max_queue_size": "执行队列容量",
+    "api_pool_size": "API 请求池大小",
+    "browser_pool_size": "浏览器池大小",
     "max_ui_concurrency": "最大 UI 并发数",
     "viewport_width": "Viewport 宽度",
     "viewport_height": "Viewport 高度",
@@ -75,6 +79,8 @@ VALIDATION_FIELD_LABELS = {
     "maintenance_message": "维护公告内容",
     "maintenance_starts_at": "维护开始时间",
     "maintenance_ends_at": "维护结束时间",
+    "read_only_tokens": "只读访问令牌",
+    "read_only_token_name": "只读访问令牌名称",
 }
 
 
@@ -152,7 +158,10 @@ def overview() -> dict[str, Any]:
 
 @app.get("/api/runtime")
 def runtime_status(request: Request) -> dict[str, Any]:
-    return request.app.state.runner.runtime_status()
+    payload = request.app.state.runner.runtime_status()
+    scheduler = request.app.state.scheduler
+    payload["scheduler"] = scheduler.runtime_status() if hasattr(scheduler, "runtime_status") else {}
+    return payload
 
 
 @app.get("/api/runners")
@@ -211,6 +220,39 @@ def audit_events(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str
 @app.get("/api/run-archives")
 def run_archives(limit: int = Query(default=90, ge=1, le=365)) -> list[dict[str, Any]]:
     return storage.list_run_archives(limit=limit)
+
+
+@app.get("/api/anomaly-cycles")
+def anomaly_cycles(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    if status and status not in {"open", "resolved"}:
+        raise HTTPException(status_code=400, detail="异常周期状态无效")
+    return storage.list_anomaly_cycles(limit=limit, status=status)
+
+
+@app.get("/api/database-backups")
+def database_backups() -> list[dict[str, Any]]:
+    return storage.list_database_backups()
+
+
+@app.post("/api/database-backups")
+def create_database_backup() -> dict[str, Any]:
+    backup = storage.create_database_backup()
+    storage.record_audit_event("created", "database_backup", entity_name=backup["filename"], summary="创建数据库备份")
+    return backup
+
+
+@app.post("/api/database-backups/{filename}/restore")
+def restore_database_backup(filename: str, request: Request) -> dict[str, Any]:
+    try:
+        result = storage.restore_database_backup(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    request.app.state.scheduler.refresh_all()
+    storage.record_audit_event("restored", "database_backup", entity_name=filename, summary="恢复数据库备份")
+    return result
 
 
 @app.post("/api/checks")
@@ -277,10 +319,12 @@ async def debug_check(payload: CheckCreate, request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/checks/inspect-api")
-async def inspect_api_check(payload: ApiInspectRequest) -> dict[str, Any]:
+async def inspect_api_check(payload: ApiInspectRequest, request: Request) -> dict[str, Any]:
     settings = storage.get_settings()
+    runner = getattr(request.app.state, "runner", None)
+    resources = getattr(runner, "resources", None)
     try:
-        return await inspect_api_response(payload.model_dump(), settings)
+        return await inspect_api_response(payload.model_dump(), settings, resources=resources)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=mask_text(str(exc), settings)) from exc
     except httpx.HTTPError as exc:
@@ -403,6 +447,14 @@ async def run_check(check_id: int, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/checks/{check_id}/confirm-recovery")
+async def confirm_recovery(check_id: int, request: Request) -> dict[str, Any]:
+    try:
+        return await request.app.state.runner.run_check(check_id, trigger="confirm-recovery")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/runs")
 def runs(
     type: str | None = Query(default=None),
@@ -434,6 +486,43 @@ def runs(
     )
 
 
+@app.get("/api/runs-page")
+def runs_page(
+    type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    notification_status: str | None = Query(default=None),
+    observation_kind: str | None = Query(default=None),
+    trigger: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    check_id: int | None = Query(default=None),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    if type and type not in {"ui", "api"}:
+        raise HTTPException(status_code=400, detail="任务类型无效")
+    if status and status not in {"ok", "failed", "timeout", "skipped", "running", "pending"}:
+        raise HTTPException(status_code=400, detail="运行状态无效")
+    if observation_kind and observation_kind not in {"observation", "verification", "draft"}:
+        raise HTTPException(status_code=400, detail="运行来源类型无效")
+    return storage.list_runs_page(
+        {
+            "check_type": type,
+            "status": status,
+            "notification_status": notification_status,
+            "observation_kind": observation_kind,
+            "trigger": trigger,
+            "q": q,
+            "check_id": check_id,
+            "start": start,
+            "end": end,
+        },
+        page=page,
+        page_size=page_size,
+    )
+
+
 @app.get("/api/runs/{run_id}")
 def run_detail(run_id: int) -> dict[str, Any]:
     run = storage.get_run(run_id)
@@ -447,7 +536,8 @@ def run_failure_summary(run_id: int) -> dict[str, Any]:
     run = storage.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="运行记录不存在")
-    return _run_failure_summary_payload(run)
+    baseline = storage.get_previous_successful_run(run)
+    return _run_failure_summary_payload(run, baseline)
 
 
 @app.get("/api/runs/{run_id}/compare-success")
@@ -486,6 +576,38 @@ async def update_settings(payload: SettingsUpdate, request: Request) -> dict[str
     request.app.state.scheduler.refresh_all()
     storage.record_audit_event("updated", "settings", summary="更新系统设置", payload={"fields": sorted(payload.values)})
     return storage.get_public_settings()
+
+
+@app.post("/api/read-only-tokens")
+def create_read_only_token(payload: ReadOnlyTokenCreate) -> dict[str, Any]:
+    try:
+        token = storage.create_read_only_token(payload.read_only_token_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    storage.record_audit_event(
+        "created",
+        "read_only_token",
+        token.get("id"),
+        token.get("name", ""),
+        "新建只读访问令牌",
+        {"name": token.get("name", "")},
+    )
+    return token
+
+
+@app.delete("/api/read-only-tokens/{token_id}")
+def delete_read_only_token(token_id: str) -> dict[str, Any]:
+    try:
+        settings = storage.delete_read_only_token(token_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    storage.record_audit_event(
+        "deleted",
+        "read_only_token",
+        token_id,
+        summary="删除只读访问令牌",
+    )
+    return settings
 
 
 @app.post("/api/settings/test-alert")
@@ -539,10 +661,17 @@ def _settings_with_overrides(payload: SettingsUpdate) -> dict[str, Any]:
 
 
 def _verify_read_only_token(token: str) -> None:
-    expected = str(storage.get_settings().get("read_only_token") or "")
-    if not expected:
+    settings = storage.get_settings()
+    expected_tokens = [str(settings.get("read_only_token") or "").strip()]
+    expected_tokens.extend(
+        str(item.get("token") or "").strip()
+        for item in settings.get("read_only_tokens", [])
+        if isinstance(item, dict)
+    )
+    expected_tokens = [expected for expected in expected_tokens if expected]
+    if not expected_tokens:
         raise HTTPException(status_code=403, detail="只读访问令牌未配置")
-    if not secrets.compare_digest(token, expected):
+    if not any(secrets.compare_digest(token, expected) for expected in expected_tokens):
         raise HTTPException(status_code=403, detail="只读访问令牌无效")
 
 
@@ -617,7 +746,7 @@ def _status_page_payload() -> dict[str, Any]:
     incidents = [
         _status_incident_payload(run, settings)
         for run in storage.list_runs(limit=100)
-        if run.get("status") in {"failed", "timeout"}
+        if run.get("status") in {"failed", "timeout"} and run.get("affects_health", True)
     ][:20]
     return {
         "generated_at": storage.now_iso(),
@@ -670,6 +799,16 @@ def _status_incident_payload(run: dict[str, Any], settings: dict[str, Any]) -> d
 
 
 def _public_failure_summary(status: str, failure_kind: str = "") -> str:
+    if status == "failing":
+        return "当前监控故障"
+    if status == "suspected_failing":
+        return "疑似故障，故障确认中"
+    if status == "suspected_recovery":
+        return "疑似恢复，恢复确认中"
+    if status == "unknown":
+        return "暂无有效观测"
+    if status == "stale":
+        return "观测已过期"
     if status == "timeout":
         return "最近运行超时"
     if failure_kind == "runner":
@@ -681,60 +820,38 @@ def _public_failure_summary(status: str, failure_kind: str = "") -> str:
     return ""
 
 
-def _run_failure_summary_payload(run: dict[str, Any]) -> dict[str, Any]:
+def _run_failure_summary_payload(run: dict[str, Any], baseline: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = storage.get_settings()
-    status = str(run.get("status") or "")
-    failure_kind = str(run.get("failure_kind") or "none")
-    error_message = mask_text(str(run.get("error_message") or ""), settings)[:1000]
-    if status not in {"failed", "timeout", "skipped"}:
-        summary = "本次运行未记录失败，暂无需要处理的失败摘要。"
-        next_steps = ["如需复盘，可查看运行日志、请求/响应快照和最近成功对比。"]
-    elif failure_kind == "runner":
-        summary = "本次异常更可能来自 Runner 执行环境或调度过程。"
-        next_steps = [
-            "检查 Runner 是否在线、队列是否已满、浏览器或依赖是否可用。",
-            "查看运行日志中的清理、取消、浏览器启动或内部执行错误。",
-            "确认本机 Runner 名称、地址和网络区域配置是否符合当前部署。"
-        ]
-    else:
-        summary = "本次异常更可能来自被探测目标、响应内容或断言规则。"
-        next_steps = [
-            "先确认目标服务、页面或接口在对应网络区域是否可达。",
-            "查看错误摘要和断言结果，判断是状态码、内容、选择器还是超时问题。",
-            "如最近成功基线可用，优先对比 URL、标题、状态码和关键断言差异。"
-        ]
-    signals = [
-        {"label": "运行状态", "value": status or "-"},
-        {"label": "失败归因", "value": failure_kind},
-        {"label": "Runner", "value": " · ".join(str(run.get(key) or "") for key in ("runner_name", "runner_region")).strip(" · ") or "-"},
-        {"label": "耗时", "value": run.get("duration_ms")},
-    ]
-    return {
-        "run_id": run.get("id"),
-        "check_id": run.get("check_id"),
-        "check_name": run.get("check_name"),
-        "status": status,
-        "failure_kind": failure_kind,
-        "summary": summary,
-        "error_message": error_message,
-        "signals": signals,
-        "next_steps": next_steps,
-    }
+    return failure_summary.build_failure_summary(run, settings, baseline)
 
 
 def _metrics_payload() -> dict[str, Any]:
     overview = storage.get_overview()
     checks = storage.list_checks()
     runs_24h = next((item for item in overview.get("trends", []) if item.get("key") == "24h"), {})
+    trend_totals_24h = _trend_totals(runs_24h)
     return {
         "checks_total": len(checks),
         "checks_enabled": sum(1 for check in checks if check.get("enabled")),
         "checks_disabled": sum(1 for check in checks if not check.get("enabled")),
         "checks_failing": int(overview.get("failing_count") or 0),
         "runs_today": int(overview.get("today_runs") or 0),
-        "runs_24h": int(runs_24h.get("runs") or 0),
-        "failures_24h": int(runs_24h.get("failure_count") or 0),
-        "success_rate_24h": runs_24h.get("success_rate"),
+        "runs_24h": trend_totals_24h["runs"],
+        "failures_24h": trend_totals_24h["failure_count"],
+        "success_rate_24h": trend_totals_24h["success_rate"],
+    }
+
+
+def _trend_totals(trend: dict[str, Any]) -> dict[str, Any]:
+    series = trend.get("series") if isinstance(trend, dict) else None
+    rows = series if isinstance(series, list) else []
+    runs = sum(int(row.get("runs") or 0) for row in rows if isinstance(row, dict))
+    successes = sum(int(row.get("success_count") or 0) for row in rows if isinstance(row, dict))
+    failures = sum(int(row.get("failure_count") or 0) for row in rows if isinstance(row, dict))
+    return {
+        "runs": runs,
+        "failure_count": failures,
+        "success_rate": round((successes / runs) * 100, 1) if runs else None,
     }
 
 

@@ -13,11 +13,14 @@ import type {
   ConfigExportFile,
   ConfigImportPreview,
   ConfigImportResult,
+  DatabaseBackup,
   NotificationStatus,
   Overview,
   ProbeRunner,
+  CreatedReadOnlyToken,
   Run,
   RunArchive,
+  RunPage,
   RunComparison,
   RunFailureSummary,
   RunStatus,
@@ -100,6 +103,8 @@ const FIELD_LABELS: Record<string, string> = {
   expected_count: "命中数量",
   alert_policy_json: "任务告警策略",
   notification_channels: "通知渠道",
+  members: "成员",
+  member_ids: "关联成员",
   alert_tag_policies: "标签告警策略",
   alert_policy_tag: "标签告警策略标签",
   alert_cooldown_minutes: "告警冷却时间",
@@ -184,6 +189,7 @@ export const api = {
   enableCheck: (id: number) => request<Check>(`/api/checks/${id}/enable`, { method: "POST" }),
   disableCheck: (id: number) => request<Check>(`/api/checks/${id}/disable`, { method: "POST" }),
   runCheck: (id: number) => request<Run>(`/api/checks/${id}/run`, { method: "POST" }),
+  confirmRecovery: (id: number) => request<Run>(`/api/checks/${id}/confirm-recovery`, { method: "POST" }),
   debugCheck: (payload: CheckPayload) =>
     request<Run>("/api/checks/debug", { method: "POST", body: JSON.stringify(payload) }),
   inspectApi: (payload: ApiInspectPayload) =>
@@ -216,6 +222,24 @@ export const api = {
     });
     return request<Run[]>(`/api/runs?${query.toString()}`);
   },
+  runsPage: (params: {
+    type?: CheckType | "";
+    status?: RunStatus | "failed" | "";
+    notification_status?: NotificationStatus | "";
+    observation_kind?: "observation" | "verification" | "draft" | "";
+    q?: string;
+    check_id?: string | null;
+    start?: string;
+    end?: string;
+    page: number;
+    page_size: number;
+  }) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== "" && value !== null && value !== undefined) query.set(key, String(value));
+    });
+    return request<RunPage>(`/api/runs-page?${query.toString()}`);
+  },
   run: (id: number) => request<Run>(`/api/runs/${id}`),
   runComparison: (id: number) => request<RunComparison>(`/api/runs/${id}/compare-success`),
   runFailureSummary: (id: number) => request<RunFailureSummary>(`/api/runs/${id}/failure-summary`),
@@ -223,6 +247,10 @@ export const api = {
   settings: () => request<SettingsValues>("/api/settings"),
   updateSettings: (values: Partial<SettingsValues>) =>
     request<SettingsValues>("/api/settings", { method: "PUT", body: JSON.stringify({ values }) }),
+  createReadOnlyToken: (name: string) =>
+    request<CreatedReadOnlyToken>("/api/read-only-tokens", { method: "POST", body: JSON.stringify({ read_only_token_name: name }) }),
+  deleteReadOnlyToken: (id: string) =>
+    request<SettingsValues>(`/api/read-only-tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
   alertPreview: (values: Partial<SettingsValues>) =>
     request<AlertPreview>("/api/settings/alert-preview", { method: "POST", body: JSON.stringify({ values }) }),
   testAlert: (values: Partial<SettingsValues>) =>
@@ -231,5 +259,12 @@ export const api = {
   previewConfigImport: (bundle: ConfigBundle) =>
     request<ConfigImportPreview>("/api/config/import-preview", { method: "POST", body: JSON.stringify({ bundle }) }),
   importConfig: (bundle: ConfigBundle) =>
-    request<ConfigImportResult>("/api/config/import", { method: "POST", body: JSON.stringify({ bundle }) })
+    request<ConfigImportResult>("/api/config/import", { method: "POST", body: JSON.stringify({ bundle }) }),
+  databaseBackups: () => request<DatabaseBackup[]>("/api/database-backups"),
+  createDatabaseBackup: () => request<DatabaseBackup>("/api/database-backups", { method: "POST" }),
+  restoreDatabaseBackup: (filename: string) =>
+    request<{ restored: DatabaseBackup; safety_backup: DatabaseBackup }>(
+      `/api/database-backups/${encodeURIComponent(filename)}/restore`,
+      { method: "POST" }
+    )
 };

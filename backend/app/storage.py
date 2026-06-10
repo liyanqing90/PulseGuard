@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
 from .artifacts import cleanup_old_artifacts
-from .config import DB_PATH, ensure_runtime_dirs
+from .config import BACKUPS_DIR, DB_PATH, ensure_runtime_dirs
 from .defaults import DEFAULT_SETTINGS, DEMO_CHECKS
+from .monitoring import HEALTH_STATES, next_health_state, run_metadata
 from .schemas import normalize_settings_values
 from .variables import is_sensitive_variable_name
 
@@ -81,6 +84,9 @@ def init_db() -> None:
                 notification_channel TEXT,
                 notification_error TEXT,
                 notification_sent_at TEXT,
+                trigger TEXT NOT NULL DEFAULT 'legacy',
+                observation_kind TEXT NOT NULL DEFAULT 'observation',
+                affects_health INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
 
@@ -94,6 +100,11 @@ def init_db() -> None:
                 last_run_id INTEGER,
                 last_error TEXT,
                 last_notified_at TEXT,
+                monitor_status TEXT NOT NULL DEFAULT 'unknown',
+                consecutive_successes INTEGER NOT NULL DEFAULT 0,
+                last_scheduled_at TEXT,
+                last_scheduled_run_id INTEGER,
+                last_state_changed_at TEXT,
                 updated_at TEXT NOT NULL
             );
 
@@ -156,6 +167,24 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS anomaly_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                check_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                opened_at TEXT NOT NULL,
+                resolved_at TEXT,
+                first_run_id INTEGER NOT NULL,
+                last_run_id INTEGER NOT NULL,
+                failure_count INTEGER NOT NULL DEFAULT 1,
+                failure_kind TEXT NOT NULL DEFAULT 'target',
+                summary TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_versions (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_checks_type ON checks(type);
             CREATE INDEX IF NOT EXISTS idx_runs_check_id ON runs(check_id);
             CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
@@ -164,19 +193,27 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_check_versions_check_id ON check_versions(check_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_run_archives_date ON run_archives(archive_date DESC);
             CREATE INDEX IF NOT EXISTS idx_probe_runners_region ON probe_runners(network_region, status);
+            CREATE INDEX IF NOT EXISTS idx_anomaly_cycles_check_status ON anomaly_cycles(check_id, status, opened_at DESC);
             """
         )
         _ensure_check_columns(conn)
         _ensure_run_columns(conn)
+        _ensure_check_status_columns(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation ON runs(affects_health, started_at DESC)")
+        conn.execute("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", (now_iso(),))
         _ensure_default_settings(conn)
+        _migrate_read_only_tokens(conn)
         _mark_interrupted_runs(conn)
         _seed_demo_checks(conn)
 
 
 def list_checks(check_type: str | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
+    refresh_stale_statuses()
     sql = """
-        SELECT c.*, s.current_status, s.consecutive_failures, s.last_success_at,
-               s.last_failed_at, s.last_run_at, s.last_run_id, s.last_error,
+        SELECT c.*, s.current_status, s.monitor_status, s.consecutive_failures,
+               s.consecutive_successes, s.last_success_at, s.last_failed_at,
+               s.last_run_at, s.last_run_id, s.last_error, s.last_scheduled_at,
+               s.last_scheduled_run_id, s.last_state_changed_at,
                r.duration_ms AS last_duration_ms
         FROM checks c
         LEFT JOIN check_status s ON s.check_id = c.id
@@ -209,11 +246,14 @@ def select_checks_for_batch(check_type: str | None = None, tag: str | None = Non
 
 
 def get_check(check_id: int) -> dict[str, Any] | None:
+    refresh_stale_statuses(check_id)
     with _LOCK, _connect() as conn:
         row = conn.execute(
             """
-            SELECT c.*, s.current_status, s.consecutive_failures, s.last_success_at,
-                   s.last_failed_at, s.last_run_at, s.last_run_id, s.last_error,
+            SELECT c.*, s.current_status, s.monitor_status, s.consecutive_failures,
+                   s.consecutive_successes, s.last_success_at, s.last_failed_at,
+                   s.last_run_at, s.last_run_id, s.last_error, s.last_scheduled_at,
+                   s.last_scheduled_run_id, s.last_state_changed_at,
                    r.duration_ms AS last_duration_ms
             FROM checks c
             LEFT JOIN check_status s ON s.check_id = c.id
@@ -481,6 +521,9 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
     duration_ms = 0 if status == "skipped" else None
     notification_status = "not_required" if status == "skipped" else None
     runner = check.get("_runner") if isinstance(check.get("_runner"), dict) else {}
+    metadata = check.get("_run") if isinstance(check.get("_run"), dict) else run_metadata(
+        "scheduled" if int(check.get("id") or 0) > 0 else "draft"
+    )
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
@@ -490,8 +533,8 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 trace_path, response_path, request_snapshot, response_snapshot,
                 runner_name, runner_address, runner_region, runner_browser_version, failure_kind,
                 notification_status, notification_channel, notification_error,
-                notification_sent_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notification_sent_at, trigger, observation_kind, affects_health, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(check["id"]),
@@ -518,6 +561,9 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 None,
                 None,
                 None,
+                metadata["trigger"],
+                metadata["observation_kind"],
+                1 if metadata["affects_health"] else 0,
                 timestamp,
             ),
         )
@@ -665,11 +711,8 @@ def update_run_notification(
 
 
 def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
-    if run["status"] == "skipped":
-        return get_status_transition(check_id, "skipped")
-
-    current_status = "ok" if run["status"] == "ok" else "failed"
     timestamp = run.get("finished_at") or now_iso()
+    settings = get_settings()
 
     with _LOCK, _connect() as conn:
         previous = conn.execute(
@@ -677,18 +720,25 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
             (check_id,),
         ).fetchone()
         previous_dict = dict(previous) if previous else None
-        previous_failures = int(previous_dict["consecutive_failures"]) if previous_dict else 0
-        consecutive_failures = previous_failures + 1 if current_status == "failed" else 0
-        last_success_at = timestamp if current_status == "ok" else (previous_dict or {}).get("last_success_at")
-        last_failed_at = timestamp if current_status == "failed" else (previous_dict or {}).get("last_failed_at")
+        transition = next_health_state(previous_dict, run, settings)
+        current_status = transition["current_status"]
+        previous_status = transition["previous_status"]
+        last_success_at = timestamp if run["status"] == "ok" else (previous_dict or {}).get("last_success_at")
+        last_failed_at = (
+            timestamp
+            if run["status"] in {"failed", "timeout"} and run.get("failure_kind") != "runner"
+            else (previous_dict or {}).get("last_failed_at")
+        )
+        state_changed_at = timestamp if current_status != previous_status else (previous_dict or {}).get("last_state_changed_at")
 
         conn.execute(
             """
             INSERT INTO check_status (
                 check_id, current_status, consecutive_failures, last_success_at,
                 last_failed_at, last_run_at, last_run_id, last_error, last_notified_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                monitor_status, consecutive_successes, last_scheduled_at,
+                last_scheduled_run_id, last_state_changed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(check_id) DO UPDATE SET
                 current_status = excluded.current_status,
                 consecutive_failures = excluded.consecutive_failures,
@@ -697,29 +747,135 @@ def update_check_status(check_id: int, run: dict[str, Any]) -> dict[str, Any]:
                 last_run_at = excluded.last_run_at,
                 last_run_id = excluded.last_run_id,
                 last_error = excluded.last_error,
+                monitor_status = excluded.monitor_status,
+                consecutive_successes = excluded.consecutive_successes,
+                last_scheduled_at = excluded.last_scheduled_at,
+                last_scheduled_run_id = excluded.last_scheduled_run_id,
+                last_state_changed_at = excluded.last_state_changed_at,
                 updated_at = excluded.updated_at
             """,
             (
                 check_id,
                 current_status,
-                consecutive_failures,
+                transition["consecutive_failures"],
                 last_success_at,
                 last_failed_at,
                 timestamp,
                 run["id"],
                 run.get("error_message"),
                 (previous_dict or {}).get("last_notified_at"),
+                current_status,
+                transition["consecutive_successes"],
+                timestamp,
+                run["id"],
+                state_changed_at,
                 timestamp,
             ),
         )
+        _update_anomaly_cycle(conn, check_id, run, transition, timestamp)
 
-    return {
-        "previous_status": (previous_dict or {}).get("current_status"),
-        "current_status": current_status,
-        "previous_consecutive_failures": previous_failures,
-        "consecutive_failures": consecutive_failures,
-        "last_notified_at": (previous_dict or {}).get("last_notified_at"),
-    }
+    return transition
+
+
+def refresh_stale_statuses(check_id: int | None = None) -> int:
+    settings = get_settings()
+    stale_after = max(1, int(settings.get("stale_after_intervals", 2)))
+    clauses = ["c.enabled = 1", "s.last_scheduled_at IS NOT NULL", "s.monitor_status != 'stale'"]
+    params: list[Any] = []
+    if check_id is not None:
+        clauses.append("c.id = ?")
+        params.append(check_id)
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT c.id, c.interval_seconds, s.last_scheduled_at
+            FROM checks c
+            JOIN check_status s ON s.check_id = c.id
+            WHERE {" AND ".join(clauses)}
+            """,
+            params,
+        ).fetchall()
+        stale_ids: list[int] = []
+        now = datetime.now().astimezone()
+        for row in rows:
+            try:
+                last_scheduled = datetime.fromisoformat(str(row["last_scheduled_at"]))
+            except ValueError:
+                continue
+            if now - last_scheduled > timedelta(seconds=max(5, int(row["interval_seconds"])) * stale_after):
+                stale_ids.append(int(row["id"]))
+        if not stale_ids:
+            return 0
+        placeholders = ",".join("?" for _ in stale_ids)
+        timestamp = now_iso()
+        conn.execute(
+            f"""
+            UPDATE check_status
+            SET current_status = 'stale', monitor_status = 'stale',
+                last_state_changed_at = ?, updated_at = ?
+            WHERE check_id IN ({placeholders})
+            """,
+            [timestamp, timestamp, *stale_ids],
+        )
+        return len(stale_ids)
+
+
+def _update_anomaly_cycle(
+    conn: sqlite3.Connection,
+    check_id: int,
+    run: dict[str, Any],
+    transition: dict[str, Any],
+    timestamp: str,
+) -> None:
+    current = transition["current_status"]
+    previous = transition["previous_status"]
+    if current == "failing":
+        open_cycle = conn.execute(
+            "SELECT id FROM anomaly_cycles WHERE check_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (check_id,),
+        ).fetchone()
+        if open_cycle:
+            conn.execute(
+                """
+                UPDATE anomaly_cycles
+                SET last_run_id = ?, failure_count = ?, failure_kind = ?, summary = ?
+                WHERE id = ?
+                """,
+                (
+                    run["id"],
+                    transition["consecutive_failures"],
+                    run.get("failure_kind") or "target",
+                    run.get("error_message") or "",
+                    open_cycle["id"],
+                ),
+            )
+        elif previous != "failing":
+            conn.execute(
+                """
+                INSERT INTO anomaly_cycles (
+                    check_id, status, opened_at, first_run_id, last_run_id,
+                    failure_count, failure_kind, summary
+                ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    check_id,
+                    timestamp,
+                    run["id"],
+                    run["id"],
+                    transition["consecutive_failures"],
+                    run.get("failure_kind") or "target",
+                    run.get("error_message") or "",
+                ),
+            )
+    elif current == "healthy":
+        conn.execute(
+            """
+            UPDATE anomaly_cycles
+            SET status = 'resolved', resolved_at = ?, last_run_id = ?
+            WHERE check_id = ? AND status = 'open'
+            """,
+            (timestamp, run["id"], check_id),
+        )
 
 
 def get_status_transition(check_id: int, current_status: str) -> dict[str, Any]:
@@ -787,6 +943,12 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[d
     if filters.get("notification_status"):
         clauses.append("notification_status = ?")
         params.append(filters["notification_status"])
+    if filters.get("trigger"):
+        clauses.append("trigger = ?")
+        params.append(filters["trigger"])
+    if filters.get("observation_kind"):
+        clauses.append("observation_kind = ?")
+        params.append(filters["observation_kind"])
     if filters.get("q"):
         clauses.append("check_name LIKE ?")
         params.append(f"%{filters['q']}%")
@@ -810,6 +972,145 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[d
         return [_normalize_run(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def list_runs_page(
+    filters: dict[str, Any] | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> dict[str, Any]:
+    filters = filters or {}
+    page = max(1, int(page))
+    page_size = max(1, min(100, int(page_size)))
+    clauses, params = _run_filter_clauses(filters)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _LOCK, _connect() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
+        rows = conn.execute(
+            f"SELECT * FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+    return {
+        "items": [_normalize_run(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    mappings = (
+        ("check_type", "check_type"),
+        ("notification_status", "notification_status"),
+        ("trigger", "trigger"),
+        ("observation_kind", "observation_kind"),
+    )
+    for key, column in mappings:
+        if filters.get(key):
+            clauses.append(f"{column} = ?")
+            params.append(filters[key])
+    if filters.get("status"):
+        if filters["status"] == "failed":
+            clauses.append("status IN ('failed', 'timeout')")
+        else:
+            clauses.append("status = ?")
+            params.append(filters["status"])
+    if filters.get("q"):
+        clauses.append("check_name LIKE ?")
+        params.append(f"%{filters['q']}%")
+    if filters.get("check_id"):
+        clauses.append("check_id = ?")
+        params.append(int(filters["check_id"]))
+    if filters.get("start"):
+        clauses.append("started_at >= ?")
+        params.append(filters["start"])
+    if filters.get("end"):
+        clauses.append("started_at <= ?")
+        params.append(filters["end"])
+    return clauses, params
+
+
+def list_anomaly_cycles(limit: int = 100, status: str | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = ""
+    if status:
+        where = "WHERE a.status = ?"
+        params.append(status)
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT a.*, c.name AS check_name, c.type AS check_type
+            FROM anomaly_cycles a
+            JOIN checks c ON c.id = a.check_id
+            {where}
+            ORDER BY a.opened_at DESC, a.id DESC
+            LIMIT ?
+            """,
+            [*params, max(1, min(500, int(limit)))],
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_database_backup(preserve_filename: str | None = None) -> dict[str, Any]:
+    ensure_runtime_dirs()
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"pulseguard-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f')}.db"
+    target = BACKUPS_DIR / filename
+    with _LOCK:
+        source = sqlite3.connect(DB_PATH, timeout=30)
+        destination = sqlite3.connect(target, timeout=30)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+    _cleanup_database_backups(preserve_filename)
+    return _database_backup_info(target)
+
+
+def list_database_backups() -> list[dict[str, Any]]:
+    ensure_runtime_dirs()
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    return [_database_backup_info(path) for path in sorted(BACKUPS_DIR.glob("pulseguard-*.db"), reverse=True)]
+
+
+def restore_database_backup(filename: str) -> dict[str, Any]:
+    source_path = (BACKUPS_DIR / filename).resolve()
+    if source_path.parent != BACKUPS_DIR.resolve() or not source_path.is_file():
+        raise ValueError("数据库备份不存在")
+    safety_backup = create_database_backup(preserve_filename=source_path.name)
+    with _LOCK:
+        source = sqlite3.connect(source_path, timeout=30)
+        destination = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+    init_db()
+    return {"restored": _database_backup_info(source_path), "safety_backup": safety_backup}
+
+
+def _database_backup_info(path: Any) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "filename": path.name,
+        "size_bytes": stat.st_size,
+        "created_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def _cleanup_database_backups(preserve_filename: str | None = None) -> None:
+    retention = max(1, int(get_settings().get("database_backup_retention", 7)))
+    removable = [
+        path
+        for path in sorted(BACKUPS_DIR.glob("pulseguard-*.db"), reverse=True)
+        if path.name != preserve_filename
+    ]
+    for path in removable[retention:]:
+        path.unlink(missing_ok=True)
+
+
 def get_settings() -> dict[str, Any]:
     with _LOCK, _connect() as conn:
         rows = conn.execute("SELECT key, value FROM settings").fetchall()
@@ -826,7 +1127,12 @@ def get_settings() -> dict[str, Any]:
 
 def get_public_settings() -> dict[str, Any]:
     settings = get_settings()
-    settings["read_only_token_set"] = bool(settings.get("read_only_token"))
+    settings["read_only_tokens"] = [
+        _public_read_only_token(token)
+        for token in settings.get("read_only_tokens", [])
+        if isinstance(token, dict)
+    ]
+    settings["read_only_token_set"] = bool(settings.get("read_only_token") or settings["read_only_tokens"])
     settings["read_only_token"] = ""
     settings["notification_channels"] = [
         _public_notification_channel(channel)
@@ -859,6 +1165,13 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
                 """,
                 (key, json.dumps(value, ensure_ascii=False), timestamp),
             )
+        if "members" in normalized_values:
+            member_ids = {
+                str(member.get("id") or "")
+                for member in normalized_values["members"]
+                if isinstance(member, dict) and member.get("id")
+            }
+            _prune_unknown_member_references(conn, member_ids, timestamp)
     return get_settings()
 
 
@@ -866,6 +1179,71 @@ def normalize_settings_update_values(values: dict[str, Any]) -> dict[str, Any]:
     values = _preserve_notification_channel_secrets(values)
     values = _preserve_environment_variable_secrets(values)
     return normalize_settings_values(values)
+
+
+def create_read_only_token(name: str) -> dict[str, Any]:
+    token = f"pgro_{secrets.token_urlsafe(32)}"
+    item = {
+        "id": f"rot_{uuid.uuid4().hex}",
+        "name": str(name or "").strip() or "未命名令牌",
+        "token": token,
+        "created_at": now_iso(),
+    }
+    settings = get_settings()
+    tokens = [
+        token_item
+        for token_item in settings.get("read_only_tokens", [])
+        if isinstance(token_item, dict)
+    ]
+    tokens.append(item)
+    update_settings({"read_only_tokens": tokens})
+    public = _public_read_only_token(item)
+    public["token"] = token
+    return public
+
+
+def delete_read_only_token(token_id: str) -> dict[str, Any]:
+    target = str(token_id or "").strip()
+    settings = get_settings()
+    tokens = [
+        token_item
+        for token_item in settings.get("read_only_tokens", [])
+        if isinstance(token_item, dict)
+    ]
+    next_tokens = [token_item for token_item in tokens if str(token_item.get("id") or "") != target]
+    if len(next_tokens) == len(tokens):
+        raise ValueError("只读访问令牌不存在")
+    update_settings({"read_only_tokens": next_tokens})
+    return get_public_settings()
+
+
+def _public_read_only_token(token: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(token.get("id") or ""),
+        "name": str(token.get("name") or "未命名令牌"),
+        "created_at": str(token.get("created_at") or ""),
+    }
+
+
+def _prune_unknown_member_references(conn: sqlite3.Connection, member_ids: set[str], timestamp: str) -> None:
+    for row in conn.execute("SELECT id, alert_policy_json FROM checks").fetchall():
+        try:
+            policy = json.loads(row["alert_policy_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(policy, dict) or not isinstance(policy.get("member_ids"), list):
+            continue
+        selected = [str(member_id) for member_id in policy["member_ids"] if str(member_id) in member_ids]
+        if selected == policy["member_ids"]:
+            continue
+        if selected:
+            policy["member_ids"] = selected
+        else:
+            policy.pop("member_ids", None)
+        conn.execute(
+            "UPDATE checks SET alert_policy_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(policy, ensure_ascii=False), timestamp, int(row["id"])),
+        )
 
 
 def _public_notification_channel(channel: dict[str, Any]) -> dict[str, Any]:
@@ -944,24 +1322,37 @@ def _preserve_environment_variable_secrets(values: dict[str, Any]) -> dict[str, 
 
 
 def get_overview() -> dict[str, Any]:
+    refresh_stale_statuses()
     today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     with _LOCK, _connect() as conn:
         ui_count = conn.execute("SELECT COUNT(*) AS count FROM checks WHERE type = 'ui'").fetchone()["count"]
         api_count = conn.execute("SELECT COUNT(*) AS count FROM checks WHERE type = 'api'").fetchone()["count"]
+        state_counts = {
+            str(row["monitor_status"] or "unknown"): int(row["count"])
+            for row in conn.execute(
+                """
+                SELECT COALESCE(s.monitor_status, 'unknown') AS monitor_status, COUNT(*) AS count
+                FROM checks c
+                LEFT JOIN check_status s ON s.check_id = c.id
+                WHERE c.enabled = 1
+                GROUP BY COALESCE(s.monitor_status, 'unknown')
+                """
+            ).fetchall()
+        }
         failing_count = conn.execute(
             """
             SELECT COUNT(*) AS count
             FROM check_status s
             JOIN checks c ON c.id = s.check_id
-            WHERE c.enabled = 1 AND s.current_status = 'failed'
+            WHERE c.enabled = 1 AND s.monitor_status = 'failing'
             """
         ).fetchone()["count"]
         today_runs = conn.execute(
-            "SELECT COUNT(*) AS count FROM runs WHERE check_id > 0 AND started_at >= ?",
+            "SELECT COUNT(*) AS count FROM runs WHERE check_id > 0 AND affects_health = 1 AND started_at >= ?",
             (today,),
         ).fetchone()["count"]
         latest_run = conn.execute(
-            "SELECT * FROM runs WHERE check_id > 0 ORDER BY started_at DESC, id DESC LIMIT 1"
+            "SELECT * FROM runs WHERE check_id > 0 AND affects_health = 1 ORDER BY started_at DESC, id DESC LIMIT 1"
         ).fetchone()
         recovered = conn.execute(
             """
@@ -978,10 +1369,12 @@ def get_overview() -> dict[str, Any]:
         failures = conn.execute(
             """
             SELECT r.*, s.consecutive_failures
-            FROM runs r
-            LEFT JOIN check_status s ON s.last_run_id = r.id
-            WHERE r.status IN ('failed', 'timeout')
-              AND r.check_id > 0
+            FROM check_status s
+            JOIN runs r ON r.id = s.last_scheduled_run_id
+            JOIN checks c ON c.id = s.check_id
+            WHERE c.enabled = 1
+              AND s.monitor_status = 'failing'
+              AND r.status IN ('failed', 'timeout')
             ORDER BY r.started_at DESC, r.id DESC
             LIMIT 8
             """
@@ -992,6 +1385,12 @@ def get_overview() -> dict[str, Any]:
         "ui_count": ui_count,
         "api_count": api_count,
         "failing_count": failing_count,
+        "suspected_failing_count": state_counts.get("suspected_failing", 0),
+        "suspected_recovery_count": state_counts.get("suspected_recovery", 0),
+        "suspected_count": state_counts.get("suspected_failing", 0) + state_counts.get("suspected_recovery", 0),
+        "unknown_count": state_counts.get("unknown", 0),
+        "stale_count": state_counts.get("stale", 0),
+        "healthy_count": state_counts.get("healthy", 0),
         "today_runs": today_runs,
         "latest_run": _normalize_run(latest_run) if latest_run else None,
         "latest_recovered": dict(recovered) if recovered else None,
@@ -1003,38 +1402,58 @@ def get_overview() -> dict[str, Any]:
 def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[str, Any]]:
     now = now or datetime.now().astimezone()
     periods = [
-        ("24h", "近 24h", now - timedelta(hours=24)),
-        ("7d", "近 7d", now - timedelta(days=7)),
+        ("24h", "近 24 小时", now - timedelta(hours=24)),
+        ("7d", "近 7 天", now - timedelta(days=7)),
     ]
+    trend_types = [("ui", "UI"), ("api", "API")]
     trends: list[dict[str, Any]] = []
     for key, label, cutoff in periods:
         rows = conn.execute(
             """
-            SELECT status, duration_ms
+            SELECT check_type, status, duration_ms
             FROM runs
             WHERE check_id > 0
+              AND affects_health = 1
               AND started_at >= ?
               AND started_at <= ?
+              AND check_type IN ('ui', 'api')
               AND status IN ('ok', 'failed', 'timeout')
             """,
             (cutoff.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
         ).fetchall()
-        total = len(rows)
-        successes = sum(1 for row in rows if row["status"] == "ok")
-        failures = sum(1 for row in rows if row["status"] in {"failed", "timeout"})
-        durations = sorted(int(row["duration_ms"]) for row in rows if row["duration_ms"] is not None)
+        rows_by_type: dict[str, list[sqlite3.Row]] = {check_type: [] for check_type, _ in trend_types}
+        for row in rows:
+            rows_by_type[str(row["check_type"])].append(row)
         trends.append(
             {
                 "key": key,
                 "label": label,
-                "runs": total,
-                "success_rate": round((successes / total) * 100, 1) if total else None,
-                "failure_count": failures,
-                "duration_p50_ms": _percentile(durations, 0.5),
-                "duration_p95_ms": _percentile(durations, 0.95),
+                "series": [
+                    {
+                        "check_type": check_type,
+                        "label": type_label,
+                        **_overview_trend_metrics(rows_by_type[check_type]),
+                    }
+                    for check_type, type_label in trend_types
+                ],
             }
         )
     return trends
+
+
+def _overview_trend_metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    total = len(rows)
+    successes = sum(1 for row in rows if row["status"] == "ok")
+    failures = sum(1 for row in rows if row["status"] in {"failed", "timeout"})
+    durations = sorted(int(row["duration_ms"]) for row in rows if row["duration_ms"] is not None)
+    return {
+        "runs": total,
+        "success_count": successes,
+        "success_rate": round((successes / total) * 100, 1) if total else None,
+        "failure_count": failures,
+        "duration_p50_ms": _percentile(durations, 0.5),
+        "duration_p95_ms": _percentile(durations, 0.95),
+    }
 
 
 def _percentile(values: list[int], percentile: float) -> int | None:
@@ -1174,10 +1593,48 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
         "notification_channel": "TEXT",
         "notification_error": "TEXT",
         "notification_sent_at": "TEXT",
+        "trigger": "TEXT NOT NULL DEFAULT 'legacy'",
+        "observation_kind": "TEXT NOT NULL DEFAULT 'observation'",
+        "affects_health": "INTEGER NOT NULL DEFAULT 1",
     }
     for name, column_type in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {column_type}")
+
+
+def _ensure_check_status_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(check_status)").fetchall()}
+    columns = {
+        "monitor_status": "TEXT NOT NULL DEFAULT 'unknown'",
+        "consecutive_successes": "INTEGER NOT NULL DEFAULT 0",
+        "last_scheduled_at": "TEXT",
+        "last_scheduled_run_id": "INTEGER",
+        "last_state_changed_at": "TEXT",
+    }
+    for name, column_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE check_status ADD COLUMN {name} {column_type}")
+    conn.execute(
+        """
+        UPDATE check_status
+        SET monitor_status = CASE current_status
+            WHEN 'ok' THEN 'healthy'
+            WHEN 'failed' THEN 'failing'
+            ELSE COALESCE(NULLIF(monitor_status, ''), 'unknown')
+        END
+        WHERE monitor_status = 'unknown' AND current_status IN ('ok', 'failed')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE check_status
+        SET current_status = 'unknown',
+            monitor_status = 'unknown',
+            consecutive_failures = 0,
+            consecutive_successes = 0
+        WHERE current_status = 'suspected' OR monitor_status = 'suspected'
+        """
+    )
 
 
 def _ensure_default_settings(conn: sqlite3.Connection) -> None:
@@ -1187,6 +1644,51 @@ def _ensure_default_settings(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
             (key, json.dumps(value, ensure_ascii=False), timestamp),
         )
+
+
+def _migrate_read_only_tokens(conn: sqlite3.Connection) -> None:
+    legacy_token = str(_read_setting_value(conn, "read_only_token") or "").strip()
+    legacy_name = str(_read_setting_value(conn, "read_only_token_name") or "").strip() or "旧版只读令牌"
+    tokens_value = _read_setting_value(conn, "read_only_tokens")
+    tokens = tokens_value if isinstance(tokens_value, list) else []
+    timestamp = now_iso()
+
+    if legacy_token:
+        normalized_tokens = [token for token in tokens if isinstance(token, dict)]
+        if not any(str(token.get("token") or "") == legacy_token for token in normalized_tokens):
+            normalized_tokens.append(
+                {
+                    "id": f"rot_{uuid.uuid4().hex}",
+                    "name": legacy_name,
+                    "token": legacy_token,
+                    "created_at": timestamp,
+                }
+            )
+        conn.execute(
+            """
+            INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            ("read_only_tokens", json.dumps(normalized_tokens, ensure_ascii=False), timestamp),
+        )
+        conn.execute(
+            """
+            INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            ("read_only_token", json.dumps("", ensure_ascii=False), timestamp),
+        )
+    conn.execute("DELETE FROM settings WHERE key = 'read_only_token_name'")
+
+
+def _read_setting_value(conn: sqlite3.Connection, key: str) -> Any:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["value"])
+    except json.JSONDecodeError:
+        return row["value"]
 
 
 def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
@@ -1253,8 +1755,15 @@ def _normalize_check(row: sqlite3.Row) -> dict[str, Any]:
     data["script"] = data.get("script") or ""
     data["tags"] = data.get("tags") or ""
     data["alert_policy_json"] = data.get("alert_policy_json") or "{}"
-    data["current_status"] = data.get("current_status")
+    if not data["enabled"]:
+        data["monitor_status"] = "disabled"
+    else:
+        data["monitor_status"] = data.get("monitor_status") or "unknown"
+        if data["monitor_status"] not in HEALTH_STATES:
+            data["monitor_status"] = "unknown"
+    data["current_status"] = data["monitor_status"]
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
+    data["consecutive_successes"] = int(data.get("consecutive_successes") or 0)
     data["last_duration_ms"] = data.get("last_duration_ms")
     return data
 
@@ -1264,6 +1773,9 @@ def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:
     data["duration_ms"] = data.get("duration_ms")
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
     data["failure_kind"] = _normalize_failure_kind(data.get("failure_kind"), str(data.get("status") or ""))
+    data["trigger"] = data.get("trigger") or "legacy"
+    data["observation_kind"] = data.get("observation_kind") or "observation"
+    data["affects_health"] = bool(data.get("affects_health"))
     return data
 
 

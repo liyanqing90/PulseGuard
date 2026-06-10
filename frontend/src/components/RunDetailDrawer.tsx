@@ -57,7 +57,7 @@ export function RunDetailDrawer({ runId, onClose, onRerun, returnTo }: Props) {
       open={Boolean(runId)}
       onClose={onClose}
       size={840}
-      destroyOnClose
+      destroyOnHidden
       extra={
         run ? (
           <Space wrap>

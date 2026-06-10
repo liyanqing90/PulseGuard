@@ -45,7 +45,7 @@ export function UiScriptSections({
         },
         {
           key: "script",
-          label: "高级脚本",
+          label: "高级探测脚本",
           children: (
             <CodeEditorPanel
               title="Python 脚本"

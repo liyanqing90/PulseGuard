@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -148,6 +150,41 @@ class RunContextVariableTests(unittest.TestCase):
             await ctx.close(False)
 
         asyncio.run(scenario())
+
+    def test_request_uses_shared_http_pool_without_closing_pool_client(self) -> None:
+        response = httpx.Response(
+            200,
+            json={"ok": True},
+            request=httpx.Request("GET", "https://api.example.com/v1"),
+        )
+        resources = FakeResourcePool(response=response)
+        ctx = RunContext(
+            {
+                "name": "API",
+                "type": "api",
+                "entry_url": "https://api.example.com/v1",
+                "method": "GET",
+                "headers_json": "{}",
+                "body": "",
+                "timeout_ms": 10000,
+            },
+            1,
+            {},
+            artifacts=None,  # type: ignore[arg-type]
+            resources=resources,  # type: ignore[arg-type]
+        )
+
+        async def scenario() -> None:
+            result = await ctx.request()
+            self.assertEqual(result.status_code, 200)
+            await ctx.close(False)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(resources.http_acquired, 1)
+        self.assertEqual(resources.client.requests[0]["url"], "https://api.example.com/v1")
+        self.assertEqual(resources.client.requests[0]["kwargs"]["timeout"], 10)
+        self.assertFalse(resources.client.closed)
 
     def test_runner_masks_secret_values_before_persisting_run_payload(self) -> None:
         secret = "runner-secret-123"
@@ -320,6 +357,45 @@ class RunContextProbeHelperTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class RunContextPoolTests(unittest.TestCase):
+    def test_pooled_browser_keeps_browser_and_closes_isolated_context(self) -> None:
+        resources = FakeResourcePool()
+        ctx = RunContext(
+            {
+                "name": "UI",
+                "type": "ui",
+                "entry_url": "https://example.com",
+                "viewport_mode": "web",
+                "method": "",
+                "headers_json": "{}",
+                "body": "",
+                "timeout_ms": 15000,
+            },
+            1,
+            {"browser_viewport": "1366x768"},
+            artifacts=None,  # type: ignore[arg-type]
+            resources=resources,  # type: ignore[arg-type]
+        )
+
+        async def scenario() -> None:
+            first = await ctx.new_page()
+            second = await ctx.new_page()
+            self.assertIsNot(first, second)
+            await ctx.close(False)
+
+        asyncio.run(scenario())
+
+        browser = resources.browser
+        self.assertEqual(resources.browser_acquired, 1)
+        self.assertEqual(len(browser.contexts), 1)
+        self.assertEqual(browser.contexts[0].options, {"viewport": {"width": 1366, "height": 768}})
+        self.assertEqual(len(browser.contexts[0].pages), 2)
+        self.assertTrue(browser.contexts[0].closed)
+        self.assertFalse(browser.closed)
+        self.assertEqual(resources.released_browser, resources.browser_lease)
+        self.assertTrue(resources.release_healthy)
+
+
 def api_context() -> RunContext:
     return RunContext(
         {
@@ -345,6 +421,104 @@ def variable_settings() -> dict[str, object]:
             {"id": "token", "name": "SERVICE_TOKEN", "value": "token-secret-123", "secret": True},
         ],
     }
+
+
+class FakeHttpClient:
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.requests: list[dict[str, object]] = []
+        self.closed = False
+
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        self.requests.append({"method": method, "url": url, "kwargs": kwargs})
+        return self.response
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FakeTracing:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    async def start(self, **_: object) -> None:
+        self.started = True
+
+    async def stop(self, **_: object) -> None:
+        self.stopped = True
+
+
+class FakePage:
+    def __init__(self) -> None:
+        self.timeout = 0
+        self.handlers: dict[str, object] = {}
+
+    def set_default_timeout(self, timeout: int) -> None:
+        self.timeout = timeout
+
+    def on(self, event: str, handler: object) -> None:
+        self.handlers[event] = handler
+
+
+class FakeBrowserContext:
+    def __init__(self, options: dict[str, object]) -> None:
+        self.options = options
+        self.tracing = FakeTracing()
+        self.pages: list[FakePage] = []
+        self.closed = False
+
+    async def new_page(self) -> FakePage:
+        page = FakePage()
+        self.pages.append(page)
+        return page
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeBrowser:
+    def __init__(self) -> None:
+        self.contexts: list[FakeBrowserContext] = []
+        self.closed = False
+
+    async def new_context(self, **options: object) -> FakeBrowserContext:
+        context = FakeBrowserContext(options)
+        self.contexts.append(context)
+        return context
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def is_connected(self) -> bool:
+        return True
+
+
+class FakeResourcePool:
+    def __init__(self, response: httpx.Response | None = None) -> None:
+        self.client = FakeHttpClient(
+            response
+            or httpx.Response(200, request=httpx.Request("GET", "https://example.com"))
+        )
+        self.http_acquired = 0
+        self.browser = FakeBrowser()
+        self.browser_lease = SimpleNamespace(browser=self.browser, version="chromium 120.0")
+        self.browser_acquired = 0
+        self.released_browser: object | None = None
+        self.release_healthy: bool | None = None
+
+    @asynccontextmanager
+    async def http_client(self):  # type: ignore[no-untyped-def]
+        self.http_acquired += 1
+        yield self.client
+
+    async def acquire_browser(self, settings: dict[str, object]) -> object:
+        self.browser_acquired += 1
+        return self.browser_lease
+
+    async def release_browser(self, lease: object, *, healthy: bool = True) -> None:
+        self.released_browser = lease
+        self.release_healthy = healthy
 
 
 if __name__ == "__main__":

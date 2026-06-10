@@ -29,7 +29,7 @@ class DraftRunnerTests(unittest.TestCase):
         with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
             "backend.app.runner.storage.get_settings",
             return_value={"max_task_runtime_seconds": 60, "browser_type": "chromium", "browser_headless": True},
-        ), patch("backend.app.runner.storage.create_run", return_value=created_run), patch(
+        ), patch("backend.app.runner.storage.create_run", return_value=created_run) as create_run, patch(
             "backend.app.runner.storage.finish_run", return_value=finished_run
         ), patch("backend.app.runner.storage.get_run", return_value=final_run), patch(
             "backend.app.runner.storage.update_run_notification"
@@ -42,6 +42,9 @@ class DraftRunnerTests(unittest.TestCase):
             result = asyncio.run(runner.run_draft(check))
 
         self.assertEqual(result, final_run)
+        draft_payload = create_run.call_args.args[0]
+        self.assertEqual(draft_payload["_run"]["observation_kind"], "draft")
+        self.assertFalse(draft_payload["_run"]["affects_health"])
         update_run_notification.assert_called_once_with(123, "not_required", channel=None, error=None, sent_at=None)
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
@@ -70,7 +73,9 @@ class DraftRunnerTests(unittest.TestCase):
             return_value={"max_task_runtime_seconds": 60, "browser_type": "chromium", "browser_headless": True},
         ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
             "backend.app.runner.storage.create_run", return_value=created_run
-        ), patch("backend.app.runner.storage.finish_run", return_value=finished_run), patch(
+        ) as create_run, patch(
+            "backend.app.runner.storage.finish_run", return_value=finished_run
+        ), patch(
             "backend.app.runner.storage.get_run", return_value=finished_run
         ), patch(
             "backend.app.runner.storage.update_check_status", return_value={"current_status": "ok", "previous_status": None}
@@ -82,9 +87,13 @@ class DraftRunnerTests(unittest.TestCase):
             CheckRunner, "_load_check_function", side_effect=AssertionError("script should not load")
         ):
             runner = CheckRunner()
-            result = asyncio.run(runner.run_check(7))
+            result = asyncio.run(runner.run_check(7, trigger="manual"))
 
         self.assertEqual(result, finished_run)
+        manual_payload = create_run.call_args.args[0]
+        self.assertEqual(manual_payload["_run"]["trigger"], "manual")
+        self.assertEqual(manual_payload["_run"]["observation_kind"], "observation")
+        self.assertTrue(manual_payload["_run"]["affects_health"])
         run_structured_api_check.assert_awaited_once()
         maybe_notify.assert_awaited_once()
 
@@ -142,6 +151,65 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(finish_payload["runner_address"], "10.0.0.8")
         self.assertEqual(finish_payload["runner_region"], "office-lan")
         self.assertEqual(finish_payload["runner_browser_version"], "")
+
+    def test_target_failure_retry_can_recover_with_single_run_record(self) -> None:
+        check = {
+            "id": 19,
+            "name": "Retry API",
+            "type": "api",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/health",
+            "method": "GET",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"status_code","expected_status":200}]',
+            "script": "",
+            "tags": "",
+        }
+        settings = {
+            "max_task_runtime_seconds": 60,
+            "browser_type": "chromium",
+            "browser_headless": True,
+            "api_retry_attempts": 1,
+            "local_runner_name": "office-runner",
+            "local_runner_address": "10.0.0.8",
+            "local_runner_region": "office-lan",
+        }
+        created_run = {"id": 190, "status": "running"}
+        finished_runs: list[dict[str, object]] = []
+
+        def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+            finished = {"id": run_id, "check_id": 19, **data}
+            finished_runs.append(finished)
+            return finished
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
+            "backend.app.runner.storage.get_settings",
+            return_value=settings,
+        ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.create_run", return_value=created_run
+        ) as create_run, patch(
+            "backend.app.runner.storage.finish_run", side_effect=finish_run
+        ), patch(
+            "backend.app.runner.storage.get_run", return_value=None
+        ), patch(
+            "backend.app.runner.storage.update_check_status", return_value={"current_status": "healthy", "previous_status": "unknown"}
+        ), patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ), patch(
+            "backend.app.runner.run_structured_api_check", new_callable=AsyncMock, side_effect=[RunFailure("flaky"), None]
+        ) as run_structured_api_check:
+            runner = CheckRunner()
+            result = asyncio.run(runner.run_check(19))
+
+        self.assertEqual(result["status"], "ok")
+        create_run.assert_called_once()
+        self.assertEqual(run_structured_api_check.await_count, 2)
+        self.assertEqual(len(finished_runs), 1)
+        self.assertEqual(finished_runs[0]["status"], "ok")
+        self.assertIn("本次尝试失败，立即重试：flaky", str(finished_runs[0]["logs"]))
 
     def test_runner_environment_failure_records_runner_failure_kind(self) -> None:
         check = {

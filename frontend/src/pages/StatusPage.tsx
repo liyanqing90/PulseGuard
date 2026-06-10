@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Empty, Skeleton, Space, Statistic, Table, Tag } from "antd";
+import { App, Button, Card, Empty, Skeleton, Space, Statistic, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -91,7 +91,7 @@ export function StatusPage() {
       render: (value: StatusPageIncident["status"]) => <Tag color={runStatusTagColor(value)}>{runStatusLabel(value)}</Tag>
     },
     {
-      title: "归因",
+      title: "失败来源",
       dataIndex: "failure_kind",
       width: 110,
       render: (value?: string | null) => failureKindTag(value)
@@ -129,20 +129,6 @@ export function StatusPage() {
           刷新
         </Button>
       </section>
-
-      {snapshot.maintenance.enabled && (
-        <Alert
-          type="warning"
-          showIcon
-          message={snapshot.maintenance.title || "维护中"}
-          description={[
-            snapshot.maintenance.message,
-            maintenanceWindow(snapshot.maintenance.starts_at, snapshot.maintenance.ends_at)
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-        />
-      )}
 
       <section className="status-summary-grid">
         <Card className="summary-card">
@@ -186,29 +172,28 @@ export function StatusPage() {
 
 function checkStatusLabel(check: StatusPageCheck): string {
   if (!check.enabled) return "已停用";
-  if (check.status === "ok") return "正常";
-  if (check.status === "failed") return "失败";
+  if (check.status === "healthy" || check.status === "ok") return "健康";
+  if (check.status === "failing" || check.status === "failed") return "故障";
+  if (check.status === "suspected_failing") return "疑似故障";
+  if (check.status === "suspected_recovery") return "疑似恢复";
+  if (check.status === "unknown") return "无有效观测";
+  if (check.status === "stale") return "观测过期";
   if (check.status === "timeout") return "超时";
   if (check.status === "never") return "未运行";
-  return "待确认";
+  return "未知状态";
 }
 
 function checkStatusColor(check: StatusPageCheck): string {
   if (!check.enabled) return "default";
-  if (check.status === "ok") return "success";
-  if (check.status === "failed" || check.status === "timeout") return "error";
+  if (check.status === "healthy" || check.status === "ok") return "success";
+  if (check.status === "failing" || check.status === "failed" || check.status === "timeout") return "error";
+  if (check.status === "suspected_failing" || check.status === "suspected_recovery" || check.status === "stale") return "warning";
+  if (check.status === "unknown") return "processing";
   return "default";
 }
 
 function failureKindTag(value?: string | null) {
-  if (value === "target") return <Tag color="red">目标</Tag>;
-  if (value === "runner") return <Tag color="orange">Runner</Tag>;
-  return <Tag>未归因</Tag>;
-}
-
-function maintenanceWindow(startsAt?: string, endsAt?: string): string {
-  const start = startsAt ? formatDate(startsAt) : "";
-  const end = endsAt ? formatDate(endsAt) : "";
-  if (start && end) return `${start} - ${end}`;
-  return start || end;
+  if (value === "target") return <Tag color="red">目标页面/API</Tag>;
+  if (value === "runner") return <Tag color="orange">执行环境</Tag>;
+  return <Tag>未记录</Tag>;
 }

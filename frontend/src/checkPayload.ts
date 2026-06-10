@@ -155,6 +155,7 @@ function normalizeAlertPolicyJson(value?: string | null): string {
       alert_cooldown_minutes?: unknown;
       recovery_notification?: unknown;
       notification_channel_ids?: unknown;
+      member_ids?: unknown;
     };
     const normalized: Record<string, unknown> = {};
     if (typeof policy.alert_cooldown_minutes === "number" && Number.isFinite(policy.alert_cooldown_minutes)) {
@@ -167,6 +168,9 @@ function normalizeAlertPolicyJson(value?: string | null): string {
       normalized.notification_channel_ids = Array.from(
         new Set(policy.notification_channel_ids.map((item) => String(item || "").trim()).filter(Boolean))
       );
+    }
+    if (Array.isArray(policy.member_ids)) {
+      normalized.member_ids = Array.from(new Set(policy.member_ids.map((item) => String(item || "").trim()).filter(Boolean)));
     }
     return JSON.stringify(normalized);
   } catch {

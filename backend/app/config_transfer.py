@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
@@ -122,8 +123,10 @@ def _export_settings(settings: dict[str, Any], *, redact: bool) -> dict[str, Any
         return exported
 
     exported["notification_channels"] = [_redact_channel(channel) for channel in exported.get("notification_channels") or []]
+    exported["members"] = []
     exported["environment_variables"] = [_redact_variable(variable) for variable in exported.get("environment_variables") or []]
     exported["read_only_token"] = ""
+    exported["read_only_tokens"] = []
     if _proxy_has_credentials(str(exported.get("browser_proxy") or "")):
         exported["browser_proxy"] = ""
     return exported
@@ -133,7 +136,19 @@ def _export_check(check: dict[str, Any], settings: dict[str, Any], *, redact: bo
     exported = {field: check.get(field) for field in CHECK_EXPORT_FIELDS}
     if not redact:
         return exported
+    exported["alert_policy_json"] = _redact_member_references(exported.get("alert_policy_json"))
     return mask_data(exported, settings)
+
+
+def _redact_member_references(value: Any) -> str:
+    try:
+        policy = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return "{}"
+    if not isinstance(policy, dict):
+        return "{}"
+    policy.pop("member_ids", None)
+    return json.dumps(policy, ensure_ascii=False)
 
 
 def _redact_channel(channel: Any) -> Any:

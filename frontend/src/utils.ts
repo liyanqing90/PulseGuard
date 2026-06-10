@@ -4,16 +4,18 @@ export type SemanticTagColor = "default" | "blue" | "success" | "warning" | "err
 
 export function taskStatus(check: Check): TaskSurfaceStatus {
   if (!check.enabled) return "disabled";
-  if (!check.current_status) return "never";
-  return check.current_status;
+  return normalizedTaskStatus(check.monitor_status || check.current_status || "unknown");
 }
 
 export function taskStatusLabel(status: TaskSurfaceStatus): string {
   return {
-    ok: "正常",
-    failed: "失败",
-    never: "未运行",
-    disabled: "禁用"
+    healthy: "健康",
+    suspected_failing: "疑似故障",
+    failing: "故障",
+    suspected_recovery: "疑似恢复",
+    unknown: "无有效观测",
+    stale: "观测过期",
+    disabled: "已停用"
   }[status];
 }
 
@@ -36,10 +38,26 @@ export function runStatusTone(status: RunStatus): "ok" | "failed" | "neutral" | 
 }
 
 export function taskStatusTagColor(status: TaskSurfaceStatus): SemanticTagColor {
-  if (status === "ok") return "success";
-  if (status === "failed") return "error";
-  if (status === "never") return "processing";
+  if (status === "healthy") return "success";
+  if (status === "failing") return "error";
+  if (status === "suspected_failing" || status === "suspected_recovery" || status === "stale") return "warning";
+  if (status === "unknown") return "processing";
   return "default";
+}
+
+function normalizedTaskStatus(status: string): TaskSurfaceStatus {
+  if (
+    status === "healthy" ||
+    status === "suspected_failing" ||
+    status === "failing" ||
+    status === "suspected_recovery" ||
+    status === "unknown" ||
+    status === "stale" ||
+    status === "disabled"
+  ) {
+    return status;
+  }
+  return "unknown";
 }
 
 export function runStatusTagColor(status: RunStatus): SemanticTagColor {

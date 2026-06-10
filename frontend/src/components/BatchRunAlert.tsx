@@ -68,7 +68,7 @@ export function BatchRunActions({
         </Button>
       )}
       <Button size="small" icon={<History size={14} />} onClick={() => onOpenHistory(batchRunHistoryPath(notice))}>
-        执行历史
+        运行记录
       </Button>
     </div>
   ) : (

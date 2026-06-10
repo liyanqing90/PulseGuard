@@ -10,6 +10,7 @@ from jsonschema import ValidationError, validate
 
 from . import network_checks
 from .artifacts import ArtifactStore
+from .resource_pool import ProbeResourcePool, ResourcePoolError
 from .variables import mask_data, resolve_data, resolve_text
 from .viewport import browser_context_options, normalize_viewport_mode, viewport_for_mode
 
@@ -23,14 +24,16 @@ class RunnerEnvironmentFailure(RunFailure):
 
 
 class PulseHttpClient:
-    def __init__(self, ctx: "RunContext") -> None:
+    def __init__(self, ctx: "RunContext", resources: ProbeResourcePool | None = None) -> None:
         self.ctx = ctx
-        self._client = httpx.AsyncClient(timeout=ctx.timeout_ms / 1000, follow_redirects=True)
+        self._resources = resources
+        self._client = None if resources is not None else httpx.AsyncClient(follow_redirects=True)
         self.last_response: httpx.Response | None = None
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         resolved_url = resolve_text(url, self.ctx.settings)
         resolved_kwargs = resolve_data(kwargs, self.ctx.settings)
+        resolved_kwargs.setdefault("timeout", self.ctx.timeout_ms / 1000)
         self.ctx.request_snapshot = mask_data(
             {
                 "method": method.upper(),
@@ -41,7 +44,13 @@ class PulseHttpClient:
             self.ctx.settings,
         )
         try:
-            response = await self._client.request(method, resolved_url, **resolved_kwargs)
+            if self._resources is not None:
+                async with self._resources.http_client() as client:
+                    response = await client.request(method, resolved_url, **resolved_kwargs)
+            elif self._client is not None:
+                response = await self._client.request(method, resolved_url, **resolved_kwargs)
+            else:
+                raise RuntimeError("HTTP client 未初始化")
         except httpx.RequestError as exc:
             raise RunFailure(f"请求目标失败：{exc}") from exc
         self.last_response = response
@@ -61,7 +70,8 @@ class PulseHttpClient:
         return await self.request("DELETE", url, **kwargs)
 
     async def close(self) -> None:
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
 
     @staticmethod
     def _snapshot_body(kwargs: dict[str, Any]) -> Any:
@@ -78,13 +88,23 @@ class PulseHttpClient:
 
 
 class RunContext:
-    def __init__(self, check: dict[str, Any], run_id: int, settings: dict[str, Any], artifacts: ArtifactStore) -> None:
+    def __init__(
+        self,
+        check: dict[str, Any],
+        run_id: int,
+        settings: dict[str, Any],
+        artifacts: ArtifactStore,
+        resources: ProbeResourcePool | None = None,
+    ) -> None:
         self.check = check
         self.run_id = run_id
         self.settings = settings
         self.artifacts = artifacts
+        self.resources = resources
         self.entry_url = resolve_text(check.get("entry_url") or "", settings)
         self.viewport_mode = normalize_viewport_mode(check.get("viewport_mode"))
+        self.viewport_width = self._optional_int(check.get("viewport_width"))
+        self.viewport_height = self._optional_int(check.get("viewport_height"))
         self.method = (check.get("method") or "GET").upper()
         self.headers = self._parse_headers(resolve_text(check.get("headers_json") or "{}", settings))
         self.body = resolve_text(check.get("body") or "", settings)
@@ -98,10 +118,11 @@ class RunContext:
         self.request_snapshot: dict[str, Any] | None = None
         self.response_snapshot: dict[str, Any] | None = None
         self.browser_version: str | None = None
-        self.http = PulseHttpClient(self)
+        self.http = PulseHttpClient(self, resources)
 
         self._playwright: Any = None
         self._browser: Any = None
+        self._browser_lease: Any = None
         self._browser_context: Any = None
         self._trace_started = False
         self._pages: list[Any] = []
@@ -169,39 +190,56 @@ class RunContext:
         return heartbeat
 
     async def new_page(self) -> Any:
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            raise RunnerEnvironmentFailure("Playwright 未安装，请先安装后再执行 UI 探活") from exc
-
-        if self._playwright is None:
+        if self._browser_context is None:
             try:
-                self._playwright = await async_playwright().start()
-                browser_type_name = str(self.settings.get("browser_type") or "chromium")
-                browser_type = getattr(self._playwright, browser_type_name, None)
-                if browser_type is None:
-                    raise RunnerEnvironmentFailure(f"不支持的浏览器类型：{browser_type_name}")
+                if self.resources is not None:
+                    self._browser_lease = await self.resources.acquire_browser(self.settings)
+                    self._browser = self._browser_lease.browser
+                    self.browser_version = self._browser_lease.version
+                else:
+                    try:
+                        from playwright.async_api import async_playwright
+                    except ImportError as exc:
+                        raise RunnerEnvironmentFailure("Playwright 未安装，请先安装后再执行 UI 探活") from exc
 
-                proxy_url = resolve_text(self.settings.get("browser_proxy") or "", self.settings).strip()
-                launch_options: dict[str, Any] = {
-                    "headless": bool(self.settings.get("browser_headless", True)),
-                }
-                if proxy_url:
-                    launch_options["proxy"] = {"server": proxy_url}
+                    self._playwright = await async_playwright().start()
+                    browser_type_name = str(self.settings.get("browser_type") or "chromium")
+                    browser_type = getattr(self._playwright, browser_type_name, None)
+                    if browser_type is None:
+                        raise RunnerEnvironmentFailure(f"不支持的浏览器类型：{browser_type_name}")
 
-                self._browser = await browser_type.launch(**launch_options)
-                raw_version = getattr(self._browser, "version", "")
-                if callable(raw_version):
-                    raw_version = raw_version()
-                self.browser_version = " ".join(
-                    part for part in (browser_type_name, str(raw_version or "").strip()) if part
-                )
+                    proxy_url = resolve_text(self.settings.get("browser_proxy") or "", self.settings).strip()
+                    launch_options: dict[str, Any] = {
+                        "headless": bool(self.settings.get("browser_headless", True)),
+                    }
+                    if proxy_url:
+                        launch_options["proxy"] = {"server": proxy_url}
+
+                    self._browser = await browser_type.launch(**launch_options)
+                    raw_version = getattr(self._browser, "version", "")
+                    if callable(raw_version):
+                        raw_version = raw_version()
+                    self.browser_version = " ".join(
+                        part for part in (browser_type_name, str(raw_version or "").strip()) if part
+                    )
                 self._browser_context = await self._browser.new_context(**self._browser_context_options())
                 await self._browser_context.tracing.start(screenshots=True, snapshots=True, sources=True)
                 self._trace_started = True
             except RunnerEnvironmentFailure:
+                if self._browser_lease is not None and self.resources is not None:
+                    await self.resources.release_browser(self._browser_lease, healthy=False)
+                    self._browser_lease = None
+                    self._browser = None
                 raise
+            except ResourcePoolError as exc:
+                self._browser_lease = None
+                self._browser = None
+                raise RunnerEnvironmentFailure(str(exc)) from exc
             except Exception as exc:
+                if self._browser_lease is not None and self.resources is not None:
+                    await self.resources.release_browser(self._browser_lease, healthy=False)
+                    self._browser_lease = None
+                    self._browser = None
                 raise RunnerEnvironmentFailure(f"浏览器环境启动失败：{exc}") from exc
 
         page = await self._browser_context.new_page()
@@ -307,13 +345,27 @@ class RunContext:
             except Exception as exc:
                 self.log(f"响应体保存失败：{exc}")
 
+        browser_context_error: Exception | None = None
         if self._browser_context:
-            await self._browser_context.close()
-        if self._browser:
+            try:
+                await self._browser_context.close()
+            except Exception as exc:
+                browser_context_error = exc
+            finally:
+                self._browser_context = None
+        if self._browser_lease is not None and self.resources is not None:
+            await self.resources.release_browser(self._browser_lease, healthy=browser_context_error is None)
+            self._browser_lease = None
+            self._browser = None
+        elif self._browser:
             await self._browser.close()
+            self._browser = None
         if self._playwright:
             await self._playwright.stop()
+            self._playwright = None
         await self.http.close()
+        if browser_context_error is not None:
+            raise browser_context_error
 
     def response_snapshot_from(self, response: httpx.Response, include_body: bool = False) -> dict[str, Any]:
         body_text = response.text
@@ -337,7 +389,7 @@ class RunContext:
             self.log(f"Console {message_type}: {message_text}")
 
     def _viewport(self) -> dict[str, int]:
-        return viewport_for_mode(self.viewport_mode, self.settings)
+        return viewport_for_mode(self.viewport_mode, self.settings, self.viewport_width, self.viewport_height)
 
     def _browser_context_options(self) -> dict[str, Any]:
         return browser_context_options(self.viewport_mode, self._viewport())
@@ -360,3 +412,12 @@ class RunContext:
             return {"json": json.loads(body)}
         except json.JSONDecodeError:
             return {"content": self.body}
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value in {None, ""}:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None

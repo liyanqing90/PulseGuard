@@ -8,12 +8,18 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } fro
 import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import type { CheckType, NotificationStatus, Run, RunStatus } from "../types";
+import type { CheckType, NotificationStatus, ObservationKind, Run, RunStatus } from "../types";
 import { formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, notificationStatusTagColor, runStatusLabel, runStatusTagColor } from "../utils";
 
 const { RangePicker } = DatePicker;
 const HISTORY_PAGE_SIZE = 12;
 const NOTIFICATION_STATUS_VALUES = ["sent", "failed", "suppressed", "disabled", "not_required"] as const;
+const OBSERVATION_KIND_OPTIONS: Array<{ label: string; value: ObservationKind | "" }> = [
+  { label: "全部来源", value: "" },
+  { label: "正式运行", value: "observation" },
+  { label: "历史人工验证", value: "verification" },
+  { label: "配置试运行", value: "draft" }
+];
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
 
 const runPaginationItemRender: PaginationProps["itemRender"] = (_, itemType, originalElement) => {
@@ -80,6 +86,9 @@ export function RunsPage() {
   const [notificationStatus, setNotificationStatus] = useState<NotificationStatus | "">(() =>
     parseNotificationStatusParam(searchParams.get("notification_status"))
   );
+  const [observationKind, setObservationKind] = useState<ObservationKind | "">(
+    () => (searchParams.get("observation_kind") as ObservationKind | null) || ""
+  );
   const [q, setQ] = useState(() => searchParams.get("q") || "");
   const [dateRange, setDateRange] = useState<[Dayjs | null, Dayjs | null] | null>(() => parseDateRangeParams(searchParams));
   const [error, setError] = useState<string | null>(null);
@@ -88,26 +97,30 @@ export function RunsPage() {
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
   const [isNarrowTable, setIsNarrowTable] = useState(false);
   const [isCompactList, setIsCompactList] = useState(() => window.matchMedia("(max-width: 720px)").matches);
-  const [compactPage, setCompactPage] = useState(1);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
   const checkId = searchParams.get("check_id");
   const normalizedQ = q.trim();
-  const hasFilters = Boolean(type || status || notificationStatus || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
+  const hasFilters = Boolean(type || status || notificationStatus || observationKind || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
   const scopedCheckName = checkId ? runs.find((run) => String(run.check_id) === checkId)?.check_name : null;
 
   async function load() {
     setLoading(true);
     try {
-      setRuns(
-        await api.runs({
+      const result = await api.runsPage({
           type,
           status,
           notification_status: notificationStatus,
+          observation_kind: observationKind,
           q: normalizedQ,
           check_id: checkId,
           start: dateRange?.[0]?.startOf("day").toISOString(),
-          end: dateRange?.[1]?.endOf("day").toISOString()
-        })
-      );
+          end: dateRange?.[1]?.endOf("day").toISOString(),
+          page,
+          page_size: HISTORY_PAGE_SIZE
+        });
+      setRuns(result.items);
+      setTotal(result.total);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -120,12 +133,14 @@ export function RunsPage() {
     const nextType = parseCheckTypeParam(searchParams.get("type"));
     const nextStatus = parseRunStatusParam(searchParams.get("status"));
     const nextNotificationStatus = parseNotificationStatusParam(searchParams.get("notification_status"));
+    const nextObservationKind = (searchParams.get("observation_kind") as ObservationKind | null) || "";
     const nextQ = searchParams.get("q") || "";
     const nextDateRange = parseDateRangeParams(searchParams);
 
     if (type !== nextType) setType(nextType);
     if (status !== nextStatus) setStatus(nextStatus);
     if (notificationStatus !== nextNotificationStatus) setNotificationStatus(nextNotificationStatus);
+    if (observationKind !== nextObservationKind) setObservationKind(nextObservationKind);
     if (q !== nextQ) setQ(nextQ);
     if (!sameDateRange(dateRange, nextDateRange)) setDateRange(nextDateRange);
   }, [searchParams]);
@@ -135,6 +150,7 @@ export function RunsPage() {
     if (type) next.set("type", type);
     if (status) next.set("status", status);
     if (notificationStatus) next.set("notification_status", notificationStatus);
+    if (observationKind) next.set("observation_kind", observationKind);
     if (normalizedQ) next.set("q", normalizedQ);
     if (dateRange?.[0]) next.set("start", dateRange[0].format("YYYY-MM-DD"));
     if (dateRange?.[1]) next.set("end", dateRange[1].format("YYYY-MM-DD"));
@@ -143,15 +159,15 @@ export function RunsPage() {
     if (next.toString() !== searchParams.toString()) {
       setSearchParams(next, { replace: true });
     }
-  }, [checkId, dateRange, normalizedQ, notificationStatus, searchParams, setSearchParams, status, type]);
+  }, [checkId, dateRange, normalizedQ, notificationStatus, observationKind, searchParams, setSearchParams, status, type]);
 
   useEffect(() => {
     load();
-  }, [type, status, notificationStatus, normalizedQ, dateRange, checkId]);
+  }, [type, status, notificationStatus, observationKind, normalizedQ, dateRange, checkId, page]);
 
   useEffect(() => {
-    setCompactPage(1);
-  }, [type, status, notificationStatus, normalizedQ, dateRange, checkId]);
+    setPage(1);
+  }, [type, status, notificationStatus, observationKind, normalizedQ, dateRange, checkId]);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 820px)");
@@ -190,6 +206,7 @@ export function RunsPage() {
     setType("");
     setStatus("");
     setNotificationStatus("");
+    setObservationKind("");
     setQ("");
     setDateRange(null);
     setSearchParams(new URLSearchParams(), { replace: true });
@@ -231,7 +248,14 @@ export function RunsPage() {
     },
     { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 92, align: "center" },
     {
-      title: "归因",
+      title: "来源",
+      dataIndex: "observation_kind",
+      render: (_, run) => <Tag color={run.affects_health ? "blue" : "default"}>{observationKindLabel(run.observation_kind)}</Tag>,
+      width: 96,
+      align: "center"
+    },
+    {
+      title: "失败来源",
       dataIndex: "failure_kind",
       render: (_, run) => failureKindTag(run),
       width: 92,
@@ -311,6 +335,12 @@ export function RunsPage() {
             onChange={(value) => setNotificationStatus(value)}
             options={NOTIFICATION_FILTER_OPTIONS}
           />
+          <Select
+            value={observationKind}
+            className="history-filter-control"
+            onChange={(value) => setObservationKind(value)}
+            options={OBSERVATION_KIND_OPTIONS}
+          />
           <RangePicker
             value={dateRange}
             onChange={(value) => setDateRange(value)}
@@ -339,11 +369,12 @@ export function RunsPage() {
 
       <div className="history-result-bar">
         <span>当前结果</span>
-        <strong>{runs.length}</strong>
+        <strong>{total}</strong>
         <span>条</span>
         {type && <Tag>{type === "ui" ? "UI" : "API"}</Tag>}
         {status && <Tag>{runStatusFilterLabel(status)}</Tag>}
         {notificationStatus && <Tag>告警：{notificationStatusMeta(notificationStatus).label}</Tag>}
+        {observationKind && <Tag>来源：{observationKindLabel(observationKind)}</Tag>}
         {checkId && (
           <Tag
             closable
@@ -364,11 +395,12 @@ export function RunsPage() {
         <CompactRunList
           hasFilters={hasFilters}
           loading={loading}
-          page={compactPage}
+          page={page}
+          total={total}
           rerunningId={rerunningId}
           runs={runs}
           onOpen={(run) => setDetailRunId(run.id)}
-          onPageChange={setCompactPage}
+          onPageChange={setPage}
           onRerun={rerun}
         />
       ) : (
@@ -379,7 +411,14 @@ export function RunsPage() {
           loading={loading}
           className="history-table"
           locale={{ emptyText: <Empty description={hasFilters ? "没有符合筛选条件的执行记录" : "暂无执行记录"} /> }}
-          pagination={{ pageSize: HISTORY_PAGE_SIZE, showSizeChanger: false, itemRender: runPaginationItemRender }}
+          pagination={{
+            current: page,
+            pageSize: HISTORY_PAGE_SIZE,
+            total,
+            showSizeChanger: false,
+            itemRender: runPaginationItemRender,
+            onChange: setPage
+          }}
           scroll={{ x: 950 }}
         />
       )}
@@ -396,6 +435,7 @@ interface CompactRunListProps {
   hasFilters: boolean;
   loading: boolean;
   page: number;
+  total: number;
   rerunningId: number | null;
   runs: Run[];
   onOpen: (run: Run) => void;
@@ -403,10 +443,10 @@ interface CompactRunListProps {
   onRerun: (run: Run) => void;
 }
 
-function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, onPageChange, onRerun }: CompactRunListProps) {
+function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, onOpen, onPageChange, onRerun }: CompactRunListProps) {
   if (loading) {
     return (
-      <section className="history-card-list" aria-label="执行历史加载中">
+      <section className="history-card-list" aria-label="运行记录加载中">
         {[0, 1, 2].map((item) => (
           <article className="history-card history-card-loading" key={item}>
             <Skeleton active paragraph={{ rows: 4 }} title={{ width: "76%" }} />
@@ -424,12 +464,9 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
     );
   }
 
-  const start = (page - 1) * HISTORY_PAGE_SIZE;
-  const pageRuns = runs.slice(start, start + HISTORY_PAGE_SIZE);
-
   return (
-    <section className="history-card-list" aria-label="执行历史列表">
-      {pageRuns.map((run) => {
+    <section className="history-card-list" aria-label="运行记录列表">
+      {runs.map((run) => {
         const notification = notificationStatusMeta(run.notification_status);
         return (
           <article className={`history-card history-card-${run.status}`} key={run.id}>
@@ -454,6 +491,7 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
 
             <div className="history-card-meta">
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
+              <HistoryMeta label="记录来源" value={observationKindLabel(run.observation_kind)} />
               <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
               <HistoryMeta label="Runner" value={runnerSummary(run)} />
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
@@ -477,14 +515,14 @@ function CompactRunList({ hasFilters, loading, page, rerunningId, runs, onOpen, 
           </article>
         );
       })}
-      {runs.length > HISTORY_PAGE_SIZE && (
+      {total > HISTORY_PAGE_SIZE && (
         <Pagination
           className="history-card-pagination"
           current={page}
           pageSize={HISTORY_PAGE_SIZE}
           simple
           showSizeChanger={false}
-          total={runs.length}
+          total={total}
           itemRender={runPaginationItemRender}
           onChange={onPageChange}
         />
@@ -519,11 +557,19 @@ function runnerTooltip(run: Run): string {
 
 function failureKindTag(run: Run) {
   const kind = run.failure_kind || "none";
-  if (kind === "target") return <Tag color="red">目标</Tag>;
-  if (kind === "runner") return <Tag color="orange">Runner</Tag>;
+  if (kind === "target") return <Tag color="red">目标页面/API</Tag>;
+  if (kind === "runner") return <Tag color="orange">执行环境</Tag>;
   return <span className="history-empty-cell">-</span>;
 }
 
 function runStatusFilterLabel(status: RunStatus): string {
   return status === "failed" ? "失败/超时" : runStatusLabel(status);
+}
+
+function observationKindLabel(kind: ObservationKind): string {
+  return {
+    observation: "正式运行",
+    verification: "历史人工验证",
+    draft: "配置试运行"
+  }[kind];
 }

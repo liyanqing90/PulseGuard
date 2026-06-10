@@ -7,6 +7,9 @@ from backend.app import ui_assertions
 from backend.app.context import RunFailure
 
 
+PlaywrightTimeoutError = type("TimeoutError", (Exception,), {"__module__": "playwright.async_api"})
+
+
 class FakeLocator:
     def __init__(self, *, visible: bool = True, count: int = 1) -> None:
         self.first = self
@@ -24,6 +27,33 @@ class FakeLocator:
 
     async def evaluate(self, script: str) -> dict[str, object]:
         return {"text": "卡片内容", "hasMedia": False, "visibleChildCount": 0, "width": 120, "height": 80}
+
+
+class TimeoutLocator(FakeLocator):
+    def __init__(self) -> None:
+        super().__init__(visible=False, count=1)
+        self.timeouts: list[int] = []
+
+    async def wait_for(self, state: str, timeout: int) -> None:
+        self.timeouts.append(timeout)
+        raise PlaywrightTimeoutError()
+
+
+class ConcurrentLocator(FakeLocator):
+    def __init__(self, page: "ConcurrentPage") -> None:
+        super().__init__()
+        self.page = page
+
+    async def wait_for(self, state: str, timeout: int) -> None:
+        self.page.active_waits += 1
+        self.page.started_waits += 1
+        self.page.max_active_waits = max(self.page.max_active_waits, self.page.active_waits)
+        if self.page.started_waits >= 2:
+            self.page.release_waits.set()
+        try:
+            await asyncio.wait_for(self.page.release_waits.wait(), timeout=0.2)
+        finally:
+            self.page.active_waits -= 1
 
 
 class FakePage:
@@ -56,6 +86,27 @@ class FakePage:
 
     async def title(self) -> str:
         return "PulseGuard 首页"
+
+
+class TimeoutPage(FakePage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeout_locator = TimeoutLocator()
+
+    def locator(self, selector: str) -> TimeoutLocator:
+        return self.timeout_locator
+
+
+class ConcurrentPage(FakePage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_waits = 0
+        self.started_waits = 0
+        self.max_active_waits = 0
+        self.release_waits = asyncio.Event()
+
+    def locator(self, selector: str) -> ConcurrentLocator:
+        return ConcurrentLocator(self)
 
 
 class FakeContext:
@@ -161,6 +212,34 @@ class UiAssertionTests(unittest.TestCase):
             asyncio.run(ui_assertions.run_structured_ui_check(ctx))  # type: ignore[arg-type]
 
         self.assertEqual(ctx.response_snapshot["assertions"][0]["status"], "failed")
+
+    def test_structured_ui_check_uses_configured_timeout_for_assertion_wait(self) -> None:
+        ctx = FakeContext('[{"type":"element_visible","selector":"#slow"}]')
+        ctx.timeout_ms = 5000
+        ctx.page = TimeoutPage()
+
+        with self.assertRaisesRegex(RunFailure, "UI 结构化校验失败"):
+            asyncio.run(ui_assertions.run_structured_ui_check(ctx))  # type: ignore[arg-type]
+
+        self.assertGreater(ctx.page.timeout_locator.timeouts[0], 1500)
+        message = ctx.response_snapshot["assertions"][0]["message"]
+        self.assertNotIn("1500ms", message)
+        self.assertIn("变为可见", message)
+
+    def test_structured_ui_check_runs_assertions_concurrently(self) -> None:
+        ctx = FakeContext(
+            """
+            [
+              {"type":"element_visible","selector":"#first"},
+              {"type":"element_visible","selector":"#second"}
+            ]
+            """
+        )
+        ctx.page = ConcurrentPage()
+
+        asyncio.run(ui_assertions.run_structured_ui_check(ctx))  # type: ignore[arg-type]
+
+        self.assertGreaterEqual(ctx.page.max_active_waits, 2)
 
     def test_setup_script_runs_on_same_page_before_assertions(self) -> None:
         ctx = FakeContext('[{"type":"title_contains","expected_text":"${EXPECTED_TITLE}"}]')

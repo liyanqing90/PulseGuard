@@ -17,7 +17,7 @@ from backend.app import notifier
 class DingtalkNotifierTests(unittest.TestCase):
     def test_disabled_alerts_do_not_record_unused_channel(self) -> None:
         run = {"id": 42, "status": "failed"}
-        transition = {"current_status": "failed", "previous_status": "ok"}
+        transition = {"current_status": "failing", "previous_status": "healthy"}
         settings = {
             "alerts_enabled": False,
             "notification_channels": [
@@ -40,7 +40,7 @@ class DingtalkNotifierTests(unittest.TestCase):
 
     def test_not_required_alerts_do_not_record_unused_channel(self) -> None:
         run = {"id": 43, "status": "skipped"}
-        transition = {"current_status": "skipped", "previous_status": "ok"}
+        transition = {"current_status": "unknown", "previous_status": "healthy"}
         settings = {
             "alerts_enabled": True,
             "notification_channels": [
@@ -63,7 +63,7 @@ class DingtalkNotifierTests(unittest.TestCase):
 
     def test_maybe_notify_sends_to_all_enabled_configured_channels(self) -> None:
         run = {"id": 44, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
-        transition = {"current_status": "failed", "previous_status": "ok", "consecutive_failures": 1}
+        transition = {"current_status": "failing", "previous_status": "suspected_failing", "consecutive_failures": 2}
         settings = {
             "alerts_enabled": True,
             "alert_cooldown_minutes": 30,
@@ -118,12 +118,12 @@ class DingtalkNotifierTests(unittest.TestCase):
         )
         update_last_notified.assert_called_once_with(11, "2026-06-05T10:00:01+08:00")
 
-    def test_manual_failure_bypasses_continuous_failure_cooldown(self) -> None:
+    def test_manual_failure_obeys_continuous_failure_cooldown(self) -> None:
         run = {"id": 45, "status": "failed", "started_at": "2026-06-05T10:05:00+08:00"}
         transition = {
-            "current_status": "failed",
-            "previous_status": "failed",
-            "last_notified_at": "2026-06-05T10:00:00+08:00",
+            "current_status": "failing",
+            "previous_status": "failing",
+            "last_notified_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "consecutive_failures": 3,
             "trigger": "manual",
         }
@@ -149,23 +149,53 @@ class DingtalkNotifierTests(unittest.TestCase):
         ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
             self.run_async(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
 
-        send_webhook_alert.assert_awaited_once()
-        self.assertIn("http://10.168.78.49:8787/runs/45?from=%2Fruns%3Fcheck_id%3D11", send_webhook_alert.await_args.args[2])
-        update_run_notification.assert_called_once_with(
-            45,
-            "sent",
-            channel="值班群",
-            error=None,
-            sent_at="2026-06-05T10:05:01+08:00",
-        )
-        update_last_notified.assert_called_once_with(11, "2026-06-05T10:05:01+08:00")
+        send_webhook_alert.assert_not_awaited()
+        update_last_notified.assert_not_called()
+        update_run_notification.assert_called_once()
+        self.assertEqual(update_run_notification.call_args.args[:2], (45, "suppressed"))
+        self.assertIn("冷却窗口", update_run_notification.call_args.kwargs["error"])
+
+    def test_manual_failure_does_not_send_while_fault_is_still_unconfirmed(self) -> None:
+        run = {"id": 54, "status": "failed", "started_at": "2026-06-05T10:06:00+08:00"}
+        transition = {
+            "current_status": "suspected_failing",
+            "previous_status": "healthy",
+            "last_notified_at": None,
+            "consecutive_failures": 1,
+            "trigger": "manual",
+        }
+        settings = {
+            "alerts_enabled": True,
+            "notification_channels": [
+                {
+                    "id": "ding",
+                    "name": "值班群",
+                    "type": "dingtalk",
+                    "enabled": True,
+                    "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=token",
+                }
+            ],
+        }
+
+        with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
+            notifier, "send_webhook_alert", new_callable=AsyncMock
+        ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:06:01+08:00"), patch.object(
+            notifier.storage, "update_run_notification"
+        ) as update_run_notification, patch.object(notifier.storage, "update_last_notified") as update_last_notified:
+            self.run_async(notifier.maybe_notify({"id": 11, "type": "ui", "name": "商品详情"}, run, transition))
+
+        send_webhook_alert.assert_not_awaited()
+        update_last_notified.assert_not_called()
+        update_run_notification.assert_called_once()
+        self.assertEqual(update_run_notification.call_args.args[:2], (54, "suppressed"))
+        self.assertIn("故障确认", update_run_notification.call_args.kwargs["error"])
 
     def test_scheduled_continuous_failure_records_cooldown_suppression_reason(self) -> None:
         run = {"id": 46, "status": "failed", "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}
         last_notified_at = datetime.now().astimezone().isoformat(timespec="seconds")
         transition = {
-            "current_status": "failed",
-            "previous_status": "failed",
+            "current_status": "failing",
+            "previous_status": "failing",
             "last_notified_at": last_notified_at,
             "consecutive_failures": 4,
             "trigger": "scheduled",
@@ -200,8 +230,8 @@ class DingtalkNotifierTests(unittest.TestCase):
     def test_check_alert_policy_overrides_cooldown_and_channel_selection_without_secret_material(self) -> None:
         run = {"id": 48, "status": "failed", "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}
         transition = {
-            "current_status": "failed",
-            "previous_status": "failed",
+            "current_status": "failing",
+            "previous_status": "failing",
             "last_notified_at": (datetime.now().astimezone() - timedelta(minutes=2)).isoformat(timespec="seconds"),
             "consecutive_failures": 3,
             "trigger": "scheduled",
@@ -266,7 +296,7 @@ class DingtalkNotifierTests(unittest.TestCase):
 
     def test_check_alert_policy_can_disable_recovery_notifications(self) -> None:
         run = {"id": 49, "status": "ok", "started_at": "2026-06-05T10:21:00+08:00"}
-        transition = {"current_status": "ok", "previous_status": "failed", "consecutive_failures": 0}
+        transition = {"current_status": "healthy", "previous_status": "suspected_recovery", "consecutive_failures": 0}
         settings = {
             "alerts_enabled": True,
             "alert_cooldown_minutes": 30,
@@ -304,8 +334,8 @@ class DingtalkNotifierTests(unittest.TestCase):
     def test_alert_tag_policy_overrides_global_cooldown_and_channels_for_matching_tag(self) -> None:
         run = {"id": 50, "status": "failed", "started_at": datetime.now().astimezone().isoformat(timespec="seconds")}
         transition = {
-            "current_status": "failed",
-            "previous_status": "failed",
+            "current_status": "failing",
+            "previous_status": "failing",
             "last_notified_at": (datetime.now().astimezone() - timedelta(minutes=2)).isoformat(timespec="seconds"),
             "consecutive_failures": 5,
             "trigger": "scheduled",
@@ -362,7 +392,7 @@ class DingtalkNotifierTests(unittest.TestCase):
 
     def test_alert_tag_policy_can_disable_recovery_notifications_for_matching_tag(self) -> None:
         run = {"id": 51, "status": "ok", "started_at": "2026-06-05T10:23:00+08:00"}
-        transition = {"current_status": "ok", "previous_status": "failed", "consecutive_failures": 0}
+        transition = {"current_status": "healthy", "previous_status": "suspected_recovery", "consecutive_failures": 0}
         settings = {
             "alerts_enabled": True,
             "alert_cooldown_minutes": 30,
@@ -401,7 +431,7 @@ class DingtalkNotifierTests(unittest.TestCase):
 
     def test_check_alert_policy_takes_priority_over_matching_tag_policy(self) -> None:
         run = {"id": 52, "status": "failed", "started_at": "2026-06-05T10:24:00+08:00"}
-        transition = {"current_status": "failed", "previous_status": "ok", "consecutive_failures": 1}
+        transition = {"current_status": "failing", "previous_status": "suspected_failing", "consecutive_failures": 2}
         settings = {
             "alerts_enabled": True,
             "alert_cooldown_minutes": 30,
@@ -471,6 +501,91 @@ class DingtalkNotifierTests(unittest.TestCase):
             sent_at="2026-06-05T10:24:01+08:00",
         )
         update_last_notified.assert_called_once_with(16, "2026-06-05T10:24:01+08:00")
+
+    def test_maybe_notify_resolves_selected_member_accounts_per_channel(self) -> None:
+        run = {"id": 53, "status": "failed", "started_at": "2026-06-05T10:25:00+08:00"}
+        transition = {"current_status": "failing", "previous_status": "healthy", "consecutive_failures": 2}
+        settings = {
+            "alerts_enabled": True,
+            "alert_cooldown_minutes": 30,
+            "notification_channels": [
+                {"id": "fei", "name": "Feishu", "type": "feishu", "enabled": True, "webhook_url": "https://example.test/fei"},
+                {"id": "wx", "name": "WeCom", "type": "wecom", "enabled": True, "webhook_url": "https://example.test/wx"},
+                {"id": "ding", "name": "Ding", "type": "dingtalk", "enabled": True, "webhook_url": "https://example.test/ding"},
+            ],
+            "members": [
+                {
+                    "id": "alice",
+                    "name": "Alice",
+                    "feishu_open_id": "ou_alice",
+                    "wecom_user_id": "alice.wx",
+                    "wecom_mobile": "13800000001",
+                    "dingtalk_user_id": "alice.ding",
+                    "dingtalk_mobile": "13900000001",
+                },
+                {
+                    "id": "bob",
+                    "name": "Bob",
+                    "feishu_open_id": "ou_bob",
+                    "wecom_user_id": "bob.wx",
+                    "wecom_mobile": "",
+                    "dingtalk_user_id": "",
+                    "dingtalk_mobile": "",
+                },
+            ],
+        }
+        check = {
+            "id": 17,
+            "type": "api",
+            "name": "API",
+            "alert_policy_json": json.dumps({"member_ids": ["alice"]}),
+        }
+
+        with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
+            notifier, "send_webhook_alert", new_callable=AsyncMock
+        ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:25:01+08:00"), patch.object(
+            notifier.storage, "update_run_notification"
+        ), patch.object(notifier.storage, "update_last_notified"):
+            self.run_async(notifier.maybe_notify(check, run, transition))
+
+        channels = {call.args[0]["id"]: call.args[0] for call in send_webhook_alert.await_args_list}
+        self.assertEqual(channels["fei"]["mentions"], [{"name": "Alice", "user_id": "ou_alice"}])
+        self.assertEqual(
+            channels["wx"]["mentions"],
+            [{"name": "Alice", "user_id": "alice.wx", "mobile": "13800000001"}],
+        )
+        self.assertEqual(
+            channels["ding"]["mentions"],
+            [{"name": "Alice", "user_id": "alice.ding", "mobile": "13900000001"}],
+        )
+
+    def test_webhook_payload_uses_native_mention_fields_for_each_channel(self) -> None:
+        feishu = notifier._webhook_payload(
+            "feishu",
+            "Alert",
+            "Body",
+            [{"name": "Alice", "user_id": "ou_alice"}],
+        )
+        wecom = notifier._webhook_payload(
+            "wecom",
+            "Alert",
+            "Body",
+            [{"name": "Alice", "user_id": "alice.wx", "mobile": "13800000001"}],
+        )
+        dingtalk = notifier._webhook_payload(
+            "dingtalk",
+            "Alert",
+            "Body",
+            [{"name": "Alice", "user_id": "alice.ding", "mobile": "13900000001"}],
+        )
+
+        self.assertIn('<at id="ou_alice"></at>', feishu["content"]["text"])
+        self.assertEqual(wecom["text"]["mentioned_list"], ["alice.wx"])
+        self.assertEqual(wecom["text"]["mentioned_mobile_list"], ["13800000001"])
+        self.assertIn("@Alice", wecom["text"]["content"])
+        self.assertEqual(dingtalk["at"]["atUserIds"], ["alice.ding"])
+        self.assertEqual(dingtalk["at"]["atMobiles"], ["13900000001"])
+        self.assertIn("@13900000001", dingtalk["markdown"]["text"])
 
     def test_dingtalk_request_url_adds_expected_signature_without_preserving_stale_values(self) -> None:
         settings = {"dingtalk_secret": "SECabc123"}
@@ -558,7 +673,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         token = "token-secret-123"
         secret = "SECsecret456789"
         run = {"id": 47, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
-        transition = {"current_status": "failed", "previous_status": "ok", "consecutive_failures": 1}
+        transition = {"current_status": "failing", "previous_status": "suspected_failing", "consecutive_failures": 2}
         settings = {
             **variable_settings(token, secret),
             "alerts_enabled": True,

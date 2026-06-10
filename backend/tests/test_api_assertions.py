@@ -85,6 +85,8 @@ class ApiAssertionTests(unittest.TestCase):
         asyncio.run(run_structured_api_check(ctx))  # type: ignore[arg-type]
 
         self.assertEqual(ctx.response_snapshot["assertions"][0]["status"], "ok")
+        self.assertIn("duration_ms", ctx.response_snapshot)
+        self.assertIn("request_ms", ctx.response_snapshot["timings"])
 
 
 class FakeApiContext:

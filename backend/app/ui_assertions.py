@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from typing import Any
 
 from .context import RunContext, RunFailure
@@ -28,20 +29,43 @@ SELECTOR_ASSERTION_TYPES = {"element_visible", "element_hidden", "element_not_em
 TEXT_ASSERTION_TYPES = {"text_present", "text_absent", "title_contains", "url_contains"}
 COUNT_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte"}
 SELECTOR_STABILITY_LEVELS = {"high", "medium", "low"}
-ASSERTION_WAIT_MIN_MS = 500
-ASSERTION_WAIT_MAX_MS = 1500
 
 
 async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any], ctx: RunContext | None = None, setup_func: Any | None = None) -> dict[str, Any]:
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise RunFailure("Playwright 未安装，请先安装后再扫描页面") from exc
-
     entry_url = resolve_text(payload.get("entry_url") or "", settings).strip()
     timeout_ms = int(payload.get("timeout_ms") or 15000)
     if not entry_url:
         raise ValueError("页面 URL 不能为空")
+    viewport = viewport_for_mode(payload.get("viewport_mode"), settings, payload.get("viewport_width"), payload.get("viewport_height"))
+
+    if ctx is not None:
+        page = await ctx.new_page()
+        if setup_func is not None:
+            ctx.log("执行 UI 扫描前置脚本")
+            await _run_phase_with_timeout(setup_func(ctx, page), timeout_ms, "扫描前置脚本执行超时")
+            if _page_is_closed(page):
+                raise RunFailure("前置脚本关闭了扫描页面")
+            ctx.log("UI 扫描前置脚本完成")
+
+        await _goto_ui_page(page, entry_url, timeout_ms, "页面扫描加载超时")
+        await _prepare_full_page(page)
+
+        candidates = await page.evaluate(UI_SCAN_SCRIPT)
+        screenshot = await page.screenshot(type="jpeg", quality=72, full_page=True)
+        return {
+            "title": await page.title(),
+            "url": mask_text(page.url, settings),
+            "viewport": candidates.get("viewport") or viewport,
+            "page_size": candidates.get("page_size") or candidates.get("viewport") or viewport,
+            "candidates": mask_data(candidates.get("candidates") or [], settings),
+            "screenshot": f"data:image/jpeg;base64,{base64.b64encode(screenshot).decode('ascii')}",
+            "logs": mask_text("\n".join(ctx.logs), settings),
+        }
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RunFailure("Playwright 未安装，请先安装后再扫描页面") from exc
 
     playwright = await async_playwright().start()
     browser = None
@@ -58,7 +82,6 @@ async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any], ctx
             launch_options["proxy"] = {"server": proxy_url}
 
         browser = await browser_type.launch(**launch_options)
-        viewport = viewport_for_mode(payload.get("viewport_mode"), settings, payload.get("viewport_width"), payload.get("viewport_height"))
         context_options = browser_context_options(payload.get("viewport_mode"), viewport)
         context = await browser.new_context(**context_options)
         page = await context.new_page()
@@ -67,7 +90,7 @@ async def inspect_ui_page(payload: dict[str, Any], settings: dict[str, Any], ctx
             if ctx is None:
                 raise RunFailure("扫描前置脚本缺少运行上下文")
             ctx.log("执行 UI 扫描前置脚本")
-            await setup_func(ctx, page)
+            await _run_phase_with_timeout(setup_func(ctx, page), timeout_ms, "扫描前置脚本执行超时")
             if _page_is_closed(page):
                 raise RunFailure("前置脚本关闭了扫描页面")
             ctx.log("UI 扫描前置脚本完成")
@@ -173,15 +196,35 @@ async def inspect_ui_selector_rules(raw: str | None, page: Any, settings: dict[s
 
 
 async def inspect_ui_rule_selectors(payload: dict[str, Any], settings: dict[str, Any], ctx: RunContext | None = None, setup_func: Any | None = None) -> dict[str, Any]:
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise RunFailure("Playwright 未安装，请先安装后再检测规则") from exc
-
     entry_url = resolve_text(payload.get("entry_url") or "", settings).strip()
     timeout_ms = int(payload.get("timeout_ms") or 15000)
     if not entry_url:
         raise ValueError("页面 URL 不能为空")
+    viewport = viewport_for_mode(payload.get("viewport_mode"), settings, payload.get("viewport_width"), payload.get("viewport_height"))
+
+    if ctx is not None:
+        page = await ctx.new_page()
+        if setup_func is not None:
+            ctx.log("执行 UI 规则检测前置脚本")
+            await _run_phase_with_timeout(setup_func(ctx, page), timeout_ms, "规则检测前置脚本执行超时")
+            if _page_is_closed(page):
+                raise RunFailure("前置脚本关闭了规则检测页面")
+            ctx.log("UI 规则检测前置脚本完成")
+
+        await _goto_ui_page(page, entry_url, timeout_ms, "规则检测页面加载超时")
+        await _prepare_full_page(page)
+        results = await inspect_ui_selector_rules(payload.get("assertions_json"), page, settings)
+        return {
+            "title": await page.title(),
+            "url": mask_text(page.url, settings),
+            "results": mask_data(results, settings),
+            "logs": mask_text("\n".join(ctx.logs), settings),
+        }
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RunFailure("Playwright 未安装，请先安装后再检测规则") from exc
 
     playwright = await async_playwright().start()
     browser = None
@@ -198,7 +241,6 @@ async def inspect_ui_rule_selectors(payload: dict[str, Any], settings: dict[str,
             launch_options["proxy"] = {"server": proxy_url}
 
         browser = await browser_type.launch(**launch_options)
-        viewport = viewport_for_mode(payload.get("viewport_mode"), settings, payload.get("viewport_width"), payload.get("viewport_height"))
         context_options = browser_context_options(payload.get("viewport_mode"), viewport)
         context = await browser.new_context(**context_options)
         page = await context.new_page()
@@ -207,7 +249,7 @@ async def inspect_ui_rule_selectors(payload: dict[str, Any], settings: dict[str,
             if ctx is None:
                 raise RunFailure("规则检测前置脚本缺少运行上下文")
             ctx.log("执行 UI 规则检测前置脚本")
-            await setup_func(ctx, page)
+            await _run_phase_with_timeout(setup_func(ctx, page), timeout_ms, "规则检测前置脚本执行超时")
             if _page_is_closed(page):
                 raise RunFailure("前置脚本关闭了规则检测页面")
             ctx.log("UI 规则检测前置脚本完成")
@@ -241,22 +283,37 @@ async def run_structured_ui_check(ctx: RunContext, setup_func: Any | None = None
     page = await ctx.new_page()
     if setup_func is not None:
         ctx.log("执行 UI 前置脚本")
-        await setup_func(ctx, page)
+        await _run_phase_with_timeout(setup_func(ctx, page), ctx.timeout_ms, "前置脚本执行超时")
         if _page_is_closed(page):
             raise RunFailure("前置脚本关闭了校验页面")
         ctx.log("UI 前置脚本完成")
 
+    page_load_started = time.perf_counter()
     await _goto_ui_page(page, ctx.entry_url, ctx.timeout_ms, "页面加载超时")
+    page_load_ms = max(0, int((time.perf_counter() - page_load_started) * 1000))
+    ctx.log(f"页面加载完成：{page_load_ms} ms")
 
-    assertion_results: list[dict[str, Any]] = []
-    for assertion in assertions:
-        result = await _evaluate_assertion(assertion, page, ctx)
-        assertion_results.append(result)
+    assertion_deadline = _deadline_from_now(ctx.timeout_ms)
+    assertion_started = time.perf_counter()
+    ctx.log(f"并发执行 UI 校验：{len(assertions)} 项，单项最长等待 {ctx.timeout_ms}ms")
+    assertion_results = list(
+        await asyncio.gather(
+            *(_evaluate_assertion(assertion, page, ctx, assertion_deadline) for assertion in assertions)
+        )
+    )
+    assertion_ms = max(0, int((time.perf_counter() - assertion_started) * 1000))
 
     page_title = await page.title()
     page_url = page.url
     ctx.response_snapshot = {
-        "page": {"title": page_title, "url": page_url, "wait_until": "domcontentloaded", "viewport_mode": ctx.viewport_mode},
+        "page": {
+            "title": page_title,
+            "url": page_url,
+            "wait_until": "domcontentloaded",
+            "viewport_mode": ctx.viewport_mode,
+            "load_ms": page_load_ms,
+        },
+        "timings": {"page_load_ms": page_load_ms, "assertions_ms": assertion_ms, "assertion_timeout_ms": ctx.timeout_ms},
         "assertions": assertion_results,
     }
 
@@ -265,10 +322,10 @@ async def run_structured_ui_check(ctx: RunContext, setup_func: Any | None = None
         raise RunFailure(f"UI 结构化校验失败：{failed[0].get('message') or failed[0].get('rule')}")
 
 
-async def _evaluate_assertion(assertion: dict[str, Any], page: Any, ctx: RunContext) -> dict[str, Any]:
+async def _evaluate_assertion(assertion: dict[str, Any], page: Any, ctx: RunContext, deadline: float | None = None) -> dict[str, Any]:
     assertion_type = assertion["type"]
     label = assertion_label(assertion)
-    wait_ms = _assertion_wait_ms(ctx)
+    wait_ms = _assertion_wait_ms(ctx, deadline)
 
     try:
         if assertion_type == "element_visible":
@@ -296,7 +353,7 @@ async def _evaluate_assertion(assertion: dict[str, Any], page: Any, ctx: RunCont
                         actual,
                         "",
                         "隐藏或不存在",
-                        f"校验失败：元素在 {wait_ms}ms 内仍未隐藏：{selector}",
+                        f"元素未在 {wait_ms}ms 内隐藏：{selector}",
                     )
                 raise
             return _result(label, selector, "ok", "隐藏或不存在", "", "隐藏", "元素隐藏或不存在")
@@ -553,9 +610,32 @@ def _page_is_closed(page: Any) -> bool:
     return bool(is_closed()) if callable(is_closed) else False
 
 
-def _assertion_wait_ms(ctx: RunContext) -> int:
+async def _run_phase_with_timeout(awaitable: Any, timeout_ms: int, timeout_label: str) -> Any:
+    timeout = _timeout_seconds(timeout_ms)
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise asyncio.TimeoutError(f"{timeout_label}：{_configured_timeout_ms(timeout_ms)}ms") from exc
+
+
+def _configured_timeout_ms(timeout_ms: int | None) -> int:
+    return max(1, int(timeout_ms or 15000))
+
+
+def _timeout_seconds(timeout_ms: int | None) -> float:
+    return max(0.001, _configured_timeout_ms(timeout_ms) / 1000)
+
+
+def _deadline_from_now(timeout_ms: int | None) -> float:
+    return time.monotonic() + _timeout_seconds(timeout_ms)
+
+
+def _assertion_wait_ms(ctx: RunContext, deadline: float | None = None) -> int:
     configured = max(1, int(ctx.timeout_ms or 15000))
-    return max(ASSERTION_WAIT_MIN_MS, min(ASSERTION_WAIT_MAX_MS, configured // 5, configured))
+    if deadline is None:
+        return configured
+    remaining = int((deadline - time.monotonic()) * 1000)
+    return max(1, min(configured, remaining))
 
 
 def _is_playwright_timeout(exc: Exception) -> bool:
@@ -566,10 +646,10 @@ async def _selector_wait_failure(page: Any, label: str, selector: str, expected:
     count = await _safe_locator_count(page, selector)
     if count == 0:
         actual = "未找到"
-        message = f"校验失败：元素未找到：{selector}"
+        message = f"未找到元素：{selector}"
     else:
         actual = f"匹配 {count} 个，未可见"
-        message = f"校验失败：元素在 {wait_ms}ms 内未达到{expected}状态：{selector}"
+        message = f"元素未在 {wait_ms}ms 内变为{expected}：{selector}"
     return _result(label, selector, "failed", actual, "", expected, message)
 
 

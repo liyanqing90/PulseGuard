@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.playwright-mcp/
 *.tsbuildinfo
 node_modules/
 dist/
@@ -14,6 +15,7 @@ frontend/vite.config.d.ts
 data/*.db
 data/*.db-*
 data/*.db.backup-*
+data/backups/*
 reports/screenshots/*
 reports/traces/*
 reports/responses/*
