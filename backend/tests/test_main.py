@@ -666,7 +666,7 @@ class OperationsRouteTests(unittest.TestCase):
         with patch("backend.app.main.storage.get_settings", return_value=settings), patch(
             "backend.app.main.storage.get_overview", return_value={"failing_count": 1, "today_runs": 3}
         ), patch("backend.app.main.storage.list_checks", return_value=checks), patch(
-            "backend.app.main.storage.list_runs", return_value=runs
+            "backend.app.main.storage.list_recent_business_incidents", return_value=runs
         ):
             response = TestClient(app).get("/api/status-page")
 
@@ -699,7 +699,7 @@ class OperationsRouteTests(unittest.TestCase):
         with patch("backend.app.main.storage.get_settings", return_value={}), patch(
             "backend.app.main.storage.get_overview", return_value={}
         ), patch("backend.app.main.storage.list_checks", return_value=[]), patch(
-            "backend.app.main.storage.list_runs", return_value=runs
+            "backend.app.main.storage.list_recent_business_incidents", return_value=[]
         ):
             response = TestClient(app).get("/api/status-page")
 

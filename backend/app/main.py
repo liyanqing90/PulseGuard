@@ -1083,9 +1083,8 @@ def _status_page_payload() -> dict[str, Any]:
     checks = [_status_check_payload(check, settings) for check in storage.list_checks()]
     incidents = [
         _status_incident_payload(run, settings)
-        for run in storage.list_runs(limit=100)
-        if run.get("status") in {"failed", "timeout"} and run.get("affects_health", True)
-    ][:20]
+        for run in storage.list_recent_business_incidents(limit=20)
+    ]
     return {
         "generated_at": storage.now_iso(),
         "summary": {

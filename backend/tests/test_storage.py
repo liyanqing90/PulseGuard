@@ -44,6 +44,80 @@ class OverviewStorageTests(unittest.TestCase):
         self.assertEqual(overview["latest_run"]["id"], saved_run["id"])
         self.assertNotIn(draft_run["id"], [run["id"] for run in overview["recent_failures"]])
 
+    def test_overview_excludes_runner_failures_from_business_failure_metrics(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            storage.update_settings({"api_failure_confirmation_count": 1})
+            target_check = storage.create_check(api_check_data("Target API"))
+            runner_check = storage.create_check(api_check_data("Runner API"))
+
+            target_run = storage.create_run(target_check)
+            target_finished = storage.finish_run(int(target_run["id"]), run_payload("failed", "target failed"))
+            assert target_finished is not None
+            storage.update_check_status(int(target_check["id"]), target_finished)
+
+            runner_run = storage.create_run(
+                {
+                    **runner_check,
+                    "_runner": storage.runner_metadata(
+                        {"runner_id": "edge-1", "name": "Edge 1"},
+                        failure_kind="runner",
+                    ),
+                }
+            )
+            runner_finished = storage.finish_run(
+                int(runner_run["id"]),
+                {
+                    **run_payload("failed", "runner failed"),
+                    **storage.runner_metadata({"runner_id": "edge-1", "name": "Edge 1"}, failure_kind="runner"),
+                },
+            )
+            assert runner_finished is not None
+            storage.update_check_status(int(runner_check["id"]), runner_finished)
+
+            overview = storage.get_overview()
+
+        trend_24h = {item["check_type"]: item for item in overview["trends"][0]["series"]}
+        self.assertEqual(overview["failing_count"], 1)
+        self.assertEqual([run["id"] for run in overview["recent_failures"]], [target_run["id"]])
+        self.assertEqual(trend_24h["api"]["runs"], 1)
+        self.assertEqual(trend_24h["api"]["failure_count"], 1)
+
+    def test_recent_business_incidents_exclude_runner_and_non_health_failures(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            check = storage.create_check(api_check_data("Incident API"))
+            target_run = storage.create_run(check)
+            storage.finish_run(int(target_run["id"]), run_payload("failed", "legacy target failure"))
+
+            runner_run = storage.create_run(
+                {
+                    **check,
+                    "_runner": storage.runner_metadata(
+                        {"runner_id": "edge-1", "name": "Edge 1"},
+                        failure_kind="runner",
+                    ),
+                }
+            )
+            storage.finish_run(
+                int(runner_run["id"]),
+                {
+                    **run_payload("failed", "runner failed"),
+                    **storage.runner_metadata({"runner_id": "edge-1", "name": "Edge 1"}, failure_kind="runner"),
+                },
+            )
+
+            draft_run = storage.create_run({"id": 0, "name": "Draft API", "type": "api"})
+            storage.finish_run(int(draft_run["id"]), run_payload("failed", "draft failure"))
+
+            incidents = storage.list_recent_business_incidents(limit=10)
+
+        self.assertEqual([run["id"] for run in incidents], [target_run["id"]])
+
     def test_overview_trends_split_ui_and_api_windows_and_ignore_invalid_runs(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -58,6 +132,7 @@ class OverviewStorageTests(unittest.TestCase):
             insert_trend_run(api_check_id, "api", "ok", now - timedelta(hours=1), 100)
             insert_trend_run(api_check_id, "api", "failed", now - timedelta(hours=2), 300)
             insert_trend_run(api_check_id, "api", "timeout", now - timedelta(hours=3), 500)
+            insert_trend_run(api_check_id, "api", "failed", now - timedelta(hours=3, minutes=30), 900, failure_kind="runner")
             insert_trend_run(api_check_id, "api", "ok", now - timedelta(hours=4), 700)
             insert_trend_run(api_check_id, "api", "ok", now - timedelta(days=2), 200)
             insert_trend_run(api_check_id, "api", "failed", now - timedelta(days=3), 400)
@@ -797,6 +872,7 @@ def insert_trend_run(
     status: str,
     started_at: datetime,
     duration_ms: int | None,
+    failure_kind: str | None = None,
 ) -> None:
     timestamp = started_at.isoformat(timespec="seconds")
     finished_at = None if status in {"pending", "running"} else timestamp
@@ -805,8 +881,8 @@ def insert_trend_run(
             """
             INSERT INTO runs (
                 check_id, check_name, check_type, status, started_at, finished_at,
-                duration_ms, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                duration_ms, failure_kind, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 check_id,
@@ -816,6 +892,7 @@ def insert_trend_run(
                 timestamp,
                 finished_at,
                 duration_ms,
+                failure_kind,
                 timestamp,
             ),
         )

@@ -26,6 +26,35 @@ LOCAL_RUNNER_ID = "local"
 RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 120
 RUNNER_ROLES = {"local", "child"}
 RUNNER_SELECTION_MODES = {"selected_parallel", "round_robin_all"}
+RUN_SUMMARY_COLUMNS = (
+    "id",
+    "check_id",
+    "check_name",
+    "check_type",
+    "status",
+    "started_at",
+    "finished_at",
+    "duration_ms",
+    "error_message",
+    "screenshot_path",
+    "trace_path",
+    "response_path",
+    "runner_id",
+    "runner_name",
+    "runner_address",
+    "runner_region",
+    "runner_browser_version",
+    "failure_kind",
+    "notification_status",
+    "notification_channel",
+    "notification_error",
+    "notification_sent_at",
+    "trigger",
+    "observation_kind",
+    "affects_health",
+    "run_group_id",
+    "created_at",
+)
 
 
 def now_iso() -> str:
@@ -230,6 +259,20 @@ def init_db() -> None:
         _ensure_local_probe_runner(conn)
         _mark_interrupted_runs(conn)
         _seed_demo_checks(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_health_started_check ON runs(affects_health, started_at DESC, check_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_trend_cover ON runs(affects_health, check_type, status, started_at DESC, check_id, failure_kind, duration_ms)"
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runs_business_failures_started
+            ON runs(started_at DESC, id DESC)
+            WHERE check_id > 0
+              AND affects_health = 1
+              AND status IN ('failed', 'timeout')
+              AND (failure_kind IS NULL OR failure_kind = 'target')
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_runner_id ON runs(runner_id, started_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(run_group_id, started_at DESC)")
 
@@ -1240,6 +1283,25 @@ def get_previous_successful_run(run: dict[str, Any]) -> dict[str, Any] | None:
     return _normalize_run(row) if row else None
 
 
+def list_recent_business_incidents(limit: int = 20) -> list[dict[str, Any]]:
+    limit = max(1, min(100, int(limit)))
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT {_run_summary_select()}
+            FROM runs INDEXED BY idx_runs_business_failures_started
+            WHERE check_id > 0
+              AND affects_health = 1
+              AND status IN ('failed', 'timeout')
+              AND (failure_kind IS NULL OR failure_kind = 'target')
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_normalize_run(row) for row in rows]
+
+
 def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[dict[str, Any]]:
     filters = filters or {}
     clauses: list[str] = []
@@ -1674,7 +1736,7 @@ def get_overview() -> dict[str, Any]:
             (today,),
         ).fetchone()["count"]
         latest_run = conn.execute(
-            "SELECT * FROM runs WHERE check_id > 0 AND affects_health = 1 ORDER BY started_at DESC, id DESC LIMIT 1"
+            f"SELECT {_run_summary_select()} FROM runs WHERE check_id > 0 AND affects_health = 1 ORDER BY started_at DESC, id DESC LIMIT 1"
         ).fetchone()
         recovered = conn.execute(
             """
@@ -1689,14 +1751,15 @@ def get_overview() -> dict[str, Any]:
             """
         ).fetchone()
         failures = conn.execute(
-            """
-            SELECT r.*, s.consecutive_failures
+            f"""
+            SELECT {_run_summary_select("r")}, s.consecutive_failures
             FROM check_status s
             JOIN runs r ON r.id = s.last_scheduled_run_id
             JOIN checks c ON c.id = s.check_id
             WHERE c.enabled = 1
               AND s.monitor_status = 'failing'
               AND r.status IN ('failed', 'timeout')
+              AND (r.failure_kind IS NULL OR r.failure_kind = 'target')
             ORDER BY r.started_at DESC, r.id DESC
             LIMIT 8
             """
@@ -1740,6 +1803,7 @@ def _overview_trends(conn: sqlite3.Connection, now: datetime | None = None) -> l
               AND started_at <= ?
               AND check_type IN ('ui', 'api')
               AND status IN ('ok', 'failed', 'timeout')
+              AND (status = 'ok' OR failure_kind IS NULL OR failure_kind = 'target')
             """,
             (cutoff.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
         ).fetchall()
@@ -2169,6 +2233,11 @@ def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:
     data["affects_health"] = bool(data.get("affects_health"))
     data["run_group_id"] = data.get("run_group_id") or ""
     return data
+
+
+def _run_summary_select(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return ", ".join(f"{prefix}{column}" for column in RUN_SUMMARY_COLUMNS)
 
 
 def _normalize_failure_kind(value: Any, status: str) -> str:

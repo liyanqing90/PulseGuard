@@ -77,7 +77,7 @@ export function runnerExecutionMeta(status: RunStatus, failureKind?: FailureKind
   if ((status === "failed" || status === "timeout") && failureKind === "target") {
     return { label: "目标失败", color: "error" };
   }
-  if (status === "ok") return { label: "成功", color: "success" };
+  if (status === "ok") return { label: "正常", color: "success" };
   if (status === "skipped") return { label: "已跳过", color: "warning" };
   if (status === "failed" || status === "timeout") return { label: runStatusLabel(status), color: "error" };
   return { label: runStatusLabel(status), color: runStatusTagColor(status) };

@@ -25,6 +25,11 @@ interface StageTiming {
   value: number;
 }
 
+interface MetaItemData {
+  label: string;
+  value: string | number;
+}
+
 interface RunGroupSummary {
   total: number;
   ok: number;
@@ -37,9 +42,10 @@ interface Props {
   run: Run | null;
   mode?: RunResultMode;
   showGroupResults?: boolean;
+  showSummary?: boolean;
 }
 
-export function RunResultPanel({ run, mode = "detail", showGroupResults = true }: Props) {
+export function RunResultPanel({ run, mode = "detail", showGroupResults = true, showSummary = true }: Props) {
   const [activeTab, setActiveTab] = useState("overview");
   const [activeGroupRunId, setActiveGroupRunId] = useState<number | null>(null);
   const [comparison, setComparison] = useState<RunComparison | null>(null);
@@ -57,8 +63,10 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true }
   const assertionResults = useMemo(() => extractAssertionResults(responseSnapshot), [responseSnapshot]);
   const stageTimings = useMemo(() => extractStageTimings(responseSnapshot, run?.check_type), [responseSnapshot, run?.check_type]);
   const groupSummary = useMemo(() => summarizeRunGroup(groupRuns), [groupRuns]);
-  const showComparison = Boolean(run && mode === "detail" && run.check_id > 0 && ["failed", "timeout"].includes(run.status));
-  const showFailureSummary = Boolean(run && mode === "detail" && run.check_id > 0 && ["failed", "timeout", "skipped"].includes(run.status));
+  const groupMetaItems = useMemo(() => summarizeRunGroupMeta(run, groupRuns), [groupRuns, run]);
+  const hasGroupResults = Boolean(showGroupResults && mode === "detail" && run?.run_group_id);
+  const showComparison = Boolean(run && mode === "detail" && !hasGroupResults && run.check_id > 0 && ["failed", "timeout"].includes(run.status));
+  const showFailureSummary = Boolean(run && mode === "detail" && !hasGroupResults && run.check_id > 0 && ["failed", "timeout", "skipped"].includes(run.status));
   const showDiagnostics = mode === "debug";
 
   useEffect(() => {
@@ -170,22 +178,20 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true }
   }
 
   const isDraftRun = run.check_id <= 0;
-  const showMergedAssertions = mode === "detail" && assertionResults.length > 0;
+  const compactNodeDetail = mode === "detail" && !showSummary;
+  const showMergedAssertions = mode === "detail" && assertionResults.length > 0 && !hasGroupResults;
+  const showErrorTab = Boolean(!hasGroupResults && (run.error_message || showDiagnostics));
   const overviewPanel = (
     <Space orientation="vertical" size={14} className="drawer-stack">
       {showFailureSummary && <FailureSummaryPanel summary={failureSummary} error={failureSummaryError} loading={failureSummaryLoading} />}
-      <DetailSection title="运行概览">
+      <DetailSection title={compactNodeDetail ? "节点信息" : "运行信息"}>
         <Descriptions bordered column={2} size="small">
-          <Descriptions.Item label="状态">
-            <RunStatusTag status={run.status} />
-          </Descriptions.Item>
-          <Descriptions.Item label="节点执行状态">
+          <Descriptions.Item label="执行结果">
             <RunnerExecutionTag run={run} />
           </Descriptions.Item>
-          <Descriptions.Item label="任务 ID">{isDraftRun ? "草稿调试" : run.check_id}</Descriptions.Item>
-          <Descriptions.Item label="任务名称">{run.check_name}</Descriptions.Item>
+          {!compactNodeDetail && <Descriptions.Item label="任务 ID">{isDraftRun ? "草稿调试" : run.check_id}</Descriptions.Item>}
           <Descriptions.Item label="运行记录">#{run.id}</Descriptions.Item>
-          <Descriptions.Item label="运行分组">{run.run_group_id || "-"}</Descriptions.Item>
+          {!compactNodeDetail && run.run_group_id && <Descriptions.Item label="运行分组">{run.run_group_id}</Descriptions.Item>}
           <Descriptions.Item label="开始时间">{formatDate(run.started_at)}</Descriptions.Item>
           <Descriptions.Item label="结束时间">{formatDate(run.finished_at)}</Descriptions.Item>
           <Descriptions.Item label="耗时">{formatDuration(run.duration_ms)}</Descriptions.Item>
@@ -194,13 +200,13 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true }
               {formatDuration(item.value)}
             </Descriptions.Item>
           ))}
-          <Descriptions.Item label="连续失败">{run.consecutive_failures || "-"}</Descriptions.Item>
-          <Descriptions.Item label="失败来源">{failureKindTag(run.failure_kind)}</Descriptions.Item>
+          {!compactNodeDetail && Boolean(run.consecutive_failures) && <Descriptions.Item label="连续失败">{run.consecutive_failures}</Descriptions.Item>}
+          {hasFailureKind(run.failure_kind) && <Descriptions.Item label="失败来源">{failureKindTag(run.failure_kind)}</Descriptions.Item>}
           <Descriptions.Item label="执行节点">{runnerSummary(run)}</Descriptions.Item>
-          <Descriptions.Item label="节点 ID">{run.runner_id || "local"}</Descriptions.Item>
-          <Descriptions.Item label="节点地址">{run.runner_address || "-"}</Descriptions.Item>
-          <Descriptions.Item label="网络区域">{run.runner_region || "-"}</Descriptions.Item>
-          <Descriptions.Item label="浏览器版本">{run.runner_browser_version || "-"}</Descriptions.Item>
+          {!compactNodeDetail && <Descriptions.Item label="节点 ID">{run.runner_id || "local"}</Descriptions.Item>}
+          {run.runner_address && <Descriptions.Item label="节点地址">{run.runner_address}</Descriptions.Item>}
+          {run.runner_region && <Descriptions.Item label="网络区域">{run.runner_region}</Descriptions.Item>}
+          {run.runner_browser_version && <Descriptions.Item label="浏览器版本">{run.runner_browser_version}</Descriptions.Item>}
         </Descriptions>
       </DetailSection>
       {showGroupResults && run.run_group_id && (
@@ -242,8 +248,9 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true }
       ]
     : [];
   const assertionTab = mode === "detail" || !assertionResults.length ? [] : [{ key: "assertions", label: "校验", children: <AssertionResultsPanel results={assertionResults} /> }];
+  const errorTab = showErrorTab ? [{ key: "error", label: "错误", children: errorPanel }] : [];
   const apiTabs = [
-    { key: "overview", label: "概览", children: overviewPanel },
+    { key: "overview", label: "执行信息", children: overviewPanel },
     ...comparisonTab,
     ...assertionTab,
     ...(showDiagnostics
@@ -262,36 +269,47 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true }
           { key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> }
         ]
       : []),
-    { key: "error", label: "原始错误", children: errorPanel }
+    ...errorTab
   ];
   const uiTabs = [
-    { key: "overview", label: "概览", children: overviewPanel },
+    { key: "overview", label: "执行信息", children: overviewPanel },
     ...comparisonTab,
     ...assertionTab,
-    { key: "evidence", label: "页面证据", children: <EvidencePanel run={run} diagnosticsEnabled={showDiagnostics} onOpenResponse={() => setActiveTab("response")} /> },
+    ...(!hasGroupResults ? [{ key: "evidence", label: "页面证据", children: <EvidencePanel run={run} diagnosticsEnabled={showDiagnostics} onOpenResponse={() => setActiveTab("response")} /> }] : []),
     ...(showDiagnostics ? [{ key: "logs", label: "日志", children: <StructuredViewer title="日志" value={run.logs} defaultMode="text" /> }] : []),
-    { key: "error", label: "原始错误", children: errorPanel }
+    ...errorTab
   ];
   const tabItems = run.check_type === "api" ? apiTabs : uiTabs;
-  const content = (
+  const groupContent = hasGroupResults ? (
     <Space orientation="vertical" size={16} className="drawer-stack">
-      <section className={`run-detail-summary run-detail-${run.status}`}>
-        <div className="run-detail-title">
-          <RunStatusTag status={run.status} />
-          <RunnerExecutionTag run={run} />
-          {isDraftRun && <Tag color="blue">草稿调试</Tag>}
-          <div>
-            <strong>{run.check_name}</strong>
-            <span>运行记录 #{run.id}</span>
-          </div>
-        </div>
-        <div className="run-detail-meta">
-          <MetaItem label="类型" value={run.check_type === "ui" ? "UI" : "API"} />
-          <MetaItem label="耗时" value={formatDuration(run.duration_ms)} />
-          <MetaItem label="开始" value={formatDate(run.started_at)} />
-          <MetaItem label="结束" value={formatDate(run.finished_at)} />
-        </div>
-      </section>
+      <RunDetailSummary
+        run={run}
+        isDraftRun={isDraftRun}
+        metaItems={groupMetaItems}
+        status={<RunGroupSummaryTag summary={groupSummary} />}
+        subtitle={run.run_group_id ? `运行分组 ${run.run_group_id}` : `运行记录 #${run.id}`}
+      />
+      <RunGroupPanel
+        activeRunId={activeGroupRunId}
+        currentRunId={run.id}
+        runs={groupRuns}
+        loading={groupLoading}
+        error={groupError}
+        onSelectRun={setActiveGroupRunId}
+      />
+    </Space>
+  ) : null;
+  const content = groupContent || (
+    <Space orientation="vertical" size={16} className="drawer-stack">
+      {showSummary && (
+        <RunDetailSummary
+          run={run}
+          isDraftRun={isDraftRun}
+          metaItems={singleRunMetaItems(run)}
+          status={<RunnerExecutionTag run={run} />}
+          subtitle={`运行记录 #${run.id}`}
+        />
+      )}
 
       <Tabs
         activeKey={activeTab}
@@ -509,6 +527,38 @@ function ComparisonAssertionCell({
   );
 }
 
+function RunDetailSummary({
+  isDraftRun,
+  metaItems,
+  run,
+  status,
+  subtitle
+}: {
+  isDraftRun: boolean;
+  metaItems: MetaItemData[];
+  run: Run;
+  status: ReactNode;
+  subtitle: string;
+}) {
+  return (
+    <section className={`run-detail-summary run-detail-${run.status}`}>
+      <div className="run-detail-title">
+        {status}
+        {isDraftRun && <Tag color="blue">草稿调试</Tag>}
+        <div>
+          <strong>{run.check_name}</strong>
+          <span>{subtitle}</span>
+        </div>
+      </div>
+      <div className="run-detail-meta">
+        {metaItems.map((item) => (
+          <MetaItem key={item.label} label={item.label} value={item.value} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function MetaItem({ label, value }: { label: string; value: string | number }) {
   return (
     <div>
@@ -540,7 +590,7 @@ function RunGroupSummaryTag({ summary }: { summary: RunGroupSummary }) {
   if (summary.running) return <Tag color="processing">{summary.running} 执行中 / {summary.total}</Tag>;
   if (summary.targetFailures) return <Tag color="error">{summary.targetFailures} 目标失败 / {summary.total}</Tag>;
   if (summary.runnerFailures) return <Tag color="warning">{summary.runnerFailures} 节点异常 / {summary.total}</Tag>;
-  return <Tag color="success">{summary.ok} 成功 / {summary.total}</Tag>;
+  return <Tag color="success">{summary.ok} 正常 / {summary.total}</Tag>;
 }
 
 function RunGroupPanel({
@@ -576,25 +626,11 @@ function RunGroupPanel({
       )
     },
     {
-      title: "节点结果",
+      title: "执行结果",
       dataIndex: "failure_kind",
       width: 108,
       align: "center",
       render: (_, item) => <RunnerExecutionTag run={item} />
-    },
-    {
-      title: "运行状态",
-      dataIndex: "status",
-      width: 88,
-      align: "center",
-      render: (_, item) => <RunStatusTag status={item.status} />
-    },
-    {
-      title: "失败来源",
-      dataIndex: "failure_kind",
-      width: 120,
-      align: "center",
-      render: (_, item) => failureKindTag(item.failure_kind)
     },
     {
       title: "耗时",
@@ -618,55 +654,43 @@ function RunGroupPanel({
       key: "artifacts",
       width: 150,
       render: (_, item) => <RunnerEvidenceLinks run={item} />
-    },
-    {
-      title: "详情",
-      key: "detail",
-      width: 86,
-      align: "center",
-      render: (_, item) =>
-        item.id === selectedRun.id ? (
-          <Tag color="blue">已选中</Tag>
-        ) : (
-          <Button size="small" onClick={() => onSelectRun(item.id)}>
-            查看
-          </Button>
-        )
     }
   ];
 
   return (
-    <Space orientation="vertical" size={12} className="drawer-stack">
-      <Table
-        rowKey="id"
-        size="small"
-        pagination={false}
-        columns={columns}
-        dataSource={runs}
-        scroll={{ x: 1080 }}
-      />
-      <Tabs
-        activeKey={String(selectedRun.id)}
-        className="run-group-detail-tabs"
-        destroyOnHidden
-        moreIcon={<span className="tabs-more-label">更多</span>}
-        onChange={(key) => onSelectRun(Number(key))}
-        items={runs.map((item) => ({
-          key: String(item.id),
-          label: <RunGroupTabLabel current={item.id === currentRunId} run={item} />,
-          children: item.id === selectedRun.id ? <RunResultPanel run={item} mode="detail" showGroupResults={false} /> : null
-        }))}
-      />
+    <Space orientation="vertical" size={14} className="drawer-stack">
+      <DetailSection title="节点列表">
+        <Table
+          rowKey="id"
+          size="small"
+          pagination={false}
+          columns={columns}
+          dataSource={runs}
+          scroll={{ x: 760 }}
+        />
+      </DetailSection>
+      <DetailSection title="节点详情">
+        <Tabs
+          activeKey={String(selectedRun.id)}
+          className="run-group-detail-tabs"
+          destroyOnHidden
+          moreIcon={<span className="tabs-more-label">更多</span>}
+          onChange={(key) => onSelectRun(Number(key))}
+          items={runs.map((item) => ({
+            key: String(item.id),
+            label: <RunGroupTabLabel run={item} />,
+            children: item.id === selectedRun.id ? <RunResultPanel run={item} mode="detail" showGroupResults={false} showSummary={false} /> : null
+          }))}
+        />
+      </DetailSection>
     </Space>
   );
 }
 
-function RunGroupTabLabel({ current, run }: { current: boolean; run: Run }) {
+function RunGroupTabLabel({ run }: { run: Run }) {
   return (
     <span className="run-group-node-tab">
-      <RunStatusTag status={run.status} />
       <span>{runnerSummary(run)}</span>
-      {current && <Tag color="blue">当前</Tag>}
     </span>
   );
 }
@@ -757,9 +781,10 @@ function EvidencePanel({
   onOpenResponse: () => void;
   run: Run;
 }) {
+  const showDiagnosticArtifacts = diagnosticsEnabled || shouldShowEvidence(run);
   const screenshotHref = artifactHref(run.screenshot_path);
-  const traceHref = diagnosticsEnabled ? artifactHref(run.trace_path) : null;
-  const responseHref = diagnosticsEnabled ? artifactHref(run.response_path) : null;
+  const traceHref = showDiagnosticArtifacts ? artifactHref(run.trace_path) : null;
+  const responseHref = showDiagnosticArtifacts ? artifactHref(run.response_path) : null;
   const hasArtifacts = Boolean(screenshotHref || traceHref || responseHref);
 
   return (
@@ -807,7 +832,7 @@ function EvidencePanel({
             href={screenshotHref}
             actionLabel="打开原图"
           />
-          {diagnosticsEnabled && (
+          {showDiagnosticArtifacts && (
             <>
               <EvidenceAction
                 icon={<Archive size={16} />}
@@ -896,6 +921,43 @@ function extractStageTimings(value: unknown, checkType?: Run["check_type"]): Sta
   if (pageLoadMs !== null) result.push({ label: "页面加载", value: pageLoadMs });
   if (assertionsMs !== null) result.push({ label: "校验耗时", value: assertionsMs });
   return result;
+}
+
+function singleRunMetaItems(run: Run): MetaItemData[] {
+  return [
+    { label: "类型", value: run.check_type === "ui" ? "UI" : "API" },
+    { label: "耗时", value: formatDuration(run.duration_ms) },
+    { label: "开始", value: formatDate(run.started_at) },
+    { label: "结束", value: formatDate(run.finished_at) }
+  ];
+}
+
+function summarizeRunGroupMeta(run: Run | null, runs: Run[]): MetaItemData[] {
+  const source = runs.length ? runs : run ? [run] : [];
+  const startedAt = earliestDate(source.map((item) => item.started_at));
+  const finishedAt = latestDate(source.map((item) => item.finished_at).filter(Boolean) as string[]);
+  return [
+    { label: "类型", value: run?.check_type === "api" ? "API" : "UI" },
+    { label: "节点", value: source.length ? `${source.length} 个` : "-" },
+    { label: "开始", value: formatDate(startedAt || run?.started_at) },
+    { label: "结束", value: formatDate(finishedAt || run?.finished_at) }
+  ];
+}
+
+function earliestDate(values: Array<string | null | undefined>): string | null {
+  return values.reduce<string | null>((current, value) => {
+    if (!value) return current;
+    if (!current) return value;
+    return new Date(value).getTime() < new Date(current).getTime() ? value : current;
+  }, null);
+}
+
+function latestDate(values: Array<string | null | undefined>): string | null {
+  return values.reduce<string | null>((current, value) => {
+    if (!value) return current;
+    if (!current) return value;
+    return new Date(value).getTime() > new Date(current).getTime() ? value : current;
+  }, null);
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
@@ -999,7 +1061,7 @@ function summarizeRunGroup(runs: Run[]): RunGroupSummary {
 
 function runnerResultMessage(run: Run): string {
   if (run.error_message) return run.error_message;
-  if (run.status === "ok") return "执行成功";
+  if (run.status === "ok") return "-";
   if (run.status === "running" || run.status === "pending") return "等待完成";
   if (run.logs) return run.logs.split("\n").find((line) => line.trim()) || "-";
   return "-";
@@ -1009,6 +1071,18 @@ function runnerSummary(run: Run): string {
   const name = (run.runner_name || "local").trim();
   const region = (run.runner_region || "").trim();
   return region && region !== name ? `${name} · ${region}` : name;
+}
+
+function hasFailureKind(value?: string | null): boolean {
+  return Boolean(value && value !== "none");
+}
+
+function runHasEvidence(run: Run): boolean {
+  return Boolean(run.screenshot_path || run.trace_path || run.response_path);
+}
+
+function shouldShowEvidence(run: Run): boolean {
+  return runHasEvidence(run) || ["failed", "timeout", "skipped"].includes(run.status);
 }
 
 function failureKindTag(value?: string | null) {
