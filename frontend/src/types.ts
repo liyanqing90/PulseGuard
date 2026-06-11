@@ -284,6 +284,23 @@ export interface ProbeRunnerPayload {
   token?: string;
 }
 
+export interface RunnerUpdateRequest {
+  target_image?: string;
+  update_id?: string;
+  force?: boolean;
+}
+
+export interface RunnerUpdateStatus {
+  status?: string;
+  update_id?: string;
+  target_image?: string;
+  previous_image?: string;
+  started_at?: string;
+  finished_at?: string;
+  updated_at?: string;
+  message?: string;
+}
+
 export interface StatusPageSnapshot {
   generated_at: string;
   summary: {

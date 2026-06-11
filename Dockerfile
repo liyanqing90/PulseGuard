@@ -9,6 +9,8 @@ RUN npm run build
 FROM ghcr.io/astral-sh/uv:0.9.30 AS uv-bin
 
 FROM mcr.microsoft.com/playwright/python:v1.49.1-noble AS runtime-base
+ARG PULSEGUARD_VERSION=0.1.0
+ARG PULSEGUARD_BUILD_SHA=unknown
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
@@ -22,6 +24,8 @@ ENV PULSEGUARD_ALERT_DETAIL_BASE_URL=http://localhost:8787
 ENV PULSEGUARD_DATA_DIR=/app/data
 ENV PULSEGUARD_REPORTS_DIR=/app/reports
 ENV PULSEGUARD_STATIC_DIR=/app/frontend/dist
+ENV PULSEGUARD_VERSION=${PULSEGUARD_VERSION}
+ENV PULSEGUARD_BUILD_SHA=${PULSEGUARD_BUILD_SHA}
 
 COPY --from=uv-bin /uv /uvx /bin/
 COPY pyproject.toml uv.lock /app/

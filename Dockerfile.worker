@@ -1,6 +1,11 @@
-FROM ghcr.io/astral-sh/uv:0.9.30 AS uv-bin
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.30
+ARG PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright/python:v1.49.1-noble
+ARG PULSEGUARD_VERSION=0.1.0
+ARG PULSEGUARD_BUILD_SHA=unknown
 
-FROM mcr.microsoft.com/playwright/python:v1.49.1-noble
+FROM ${UV_IMAGE} AS uv-bin
+
+FROM ${PLAYWRIGHT_IMAGE}
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
@@ -14,6 +19,8 @@ ENV PULSEGUARD_PORT=8788
 ENV PULSEGUARD_DATA_DIR=/app/data
 ENV PULSEGUARD_REPORTS_DIR=/app/reports
 ENV PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
+ENV PULSEGUARD_VERSION=${PULSEGUARD_VERSION}
+ENV PULSEGUARD_BUILD_SHA=${PULSEGUARD_BUILD_SHA}
 
 COPY --from=uv-bin /uv /uvx /bin/
 COPY pyproject.toml uv.lock /app/

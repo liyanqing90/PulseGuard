@@ -4,6 +4,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+
 from backend.app.runner import CheckRunner, RunFailure, RunnerEnvironmentFailure
 
 
@@ -472,6 +474,41 @@ class RunnerQueueTests(unittest.TestCase):
 
 
 class DistributedRunnerTests(unittest.TestCase):
+    def test_remote_runner_timeout_covers_retry_budget(self) -> None:
+        runner = CheckRunner()
+        timeout = runner._remote_runner_timeout_seconds(
+            {"type": "ui", "timeout_ms": 10000},
+            {"max_task_runtime_seconds": 60, "ui_retry_attempts": 1},
+        )
+
+        self.assertEqual(timeout, 135.0)
+
+    def test_remote_runner_timeout_error_is_actionable(self) -> None:
+        class TimeoutClient:
+            async def __aenter__(self) -> "TimeoutClient":
+                return self
+
+            async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+                return None
+
+            async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+                raise httpx.ReadTimeout("")
+
+        async def scenario() -> None:
+            with patch(
+                "backend.app.runner.storage.get_settings",
+                return_value={"max_task_runtime_seconds": 60, "ui_retry_attempts": 1},
+            ), patch("backend.app.runner.httpx.AsyncClient", return_value=TimeoutClient()):
+                await CheckRunner()._call_remote_runner(
+                    {"runner_id": "edge-1", "address": "http://10.0.0.8:8788", "_token": "pgrn_token"},
+                    {"id": 31, "name": "Remote timeout", "type": "ui", "timeout_ms": 10000},
+                    "manual",
+                    310,
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "执行节点调用超时，等待 135 秒后未返回"):
+            asyncio.run(scenario())
+
     def test_disabled_local_runner_is_skipped_without_executing_probe(self) -> None:
         check = {
             "id": 31,

@@ -3,3 +3,8 @@ services:
     build:
       context: "${PULSEGUARD_WORKER_BUILD_CONTEXT:-https://github.com/liyanqing90/PulseGuard.git#main}"
       dockerfile: Dockerfile.worker
+      args:
+        UV_IMAGE: "${PULSEGUARD_UV_IMAGE:-ghcr.io/astral-sh/uv:0.9.30}"
+        PLAYWRIGHT_IMAGE: "${PULSEGUARD_PLAYWRIGHT_IMAGE:-mcr.microsoft.com/playwright/python:v1.49.1-noble}"
+        PULSEGUARD_VERSION: "${PULSEGUARD_VERSION:-0.1.0}"
+        PULSEGUARD_BUILD_SHA: "${PULSEGUARD_BUILD_SHA:-local}"

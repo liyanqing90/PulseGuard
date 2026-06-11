@@ -39,6 +39,7 @@ import type {
   NotificationChannel,
   ProbeRunner,
   ProbeRunnerPayload,
+  RunnerUpdateStatus,
   SettingsValues,
   WebhookType
 } from "../types";
@@ -1055,6 +1056,36 @@ const emptyRunnerDraft: ProbeRunnerPayload = {
   token: ""
 };
 
+function runnerMetaText(runner: ProbeRunner, key: string): string {
+  const value = runner.metadata?.[key];
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function runnerMetaBool(runner: ProbeRunner, key: string): boolean {
+  return runner.metadata?.[key] === true;
+}
+
+function runnerImageSummary(image: string): string {
+  if (!image) return "-";
+  const parts = image.split("/");
+  return parts[parts.length - 1] || image;
+}
+
+function updateStatusLines(status?: RunnerUpdateStatus): Record<string, unknown> {
+  if (!status) return { 状态: "暂无状态" };
+  return {
+    状态: status.status || "-",
+    目标镜像: status.target_image || "-",
+    原镜像: status.previous_image || "-",
+    开始时间: status.started_at || "-",
+    完成时间: status.finished_at || "-",
+    更新时间: status.updated_at || "-",
+    消息: status.message || "-"
+  };
+}
+
 function RunnerNodePanel() {
   const { message } = App.useApp();
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
@@ -1210,6 +1241,51 @@ function RunnerNodePanel() {
     }
   }
 
+  function confirmRunnerUpdate(runner: ProbeRunner) {
+    const targetImage = runnerMetaText(runner, "update_target_image");
+    const currentImage = runnerMetaText(runner, "image");
+    Modal.confirm({
+      title: "更新执行节点",
+      content: (
+        <Space orientation="vertical" size={8}>
+          <span>主节点会向子节点下发受控更新请求，由子节点 updater 拉取镜像并重建 worker 服务。</span>
+          <span>当前镜像：{currentImage || "-"}</span>
+          <span>目标镜像：{targetImage || "子节点默认目标镜像"}</span>
+        </Space>
+      ),
+      okText: "下发更新",
+      cancelText: "取消",
+      onOk: async () => {
+        setBusyId(runner.runner_id);
+        try {
+          const result = await api.updateRunnerNode(runner.runner_id, targetImage ? { target_image: targetImage } : {});
+          message.success(result.message || "节点更新任务已下发");
+          await loadRunners();
+        } catch (err) {
+          message.error((err as Error).message);
+        } finally {
+          setBusyId(null);
+        }
+      }
+    });
+  }
+
+  async function showRunnerUpdateStatus(runner: ProbeRunner) {
+    setBusyId(runner.runner_id);
+    try {
+      const result = await api.runnerUpdateStatus(runner.runner_id);
+      Modal.info({
+        title: "节点更新状态",
+        width: 620,
+        content: <StructuredViewer value={updateStatusLines(result.worker?.update)} />
+      });
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   return (
     <SettingsPanel title="执行节点" icon={<Monitor size={18} />} className="settings-panel-wide">
       <Space orientation="vertical" size={14} className="drawer-stack">
@@ -1237,57 +1313,88 @@ function RunnerNodePanel() {
           <Empty description="暂无执行节点" />
         ) : (
           <Space orientation="vertical" size={10} className="drawer-stack">
-            {runners.map((runner) => (
-              <Card size="small" key={runner.runner_id}>
-                <div className="read-only-token-card">
-                  <div>
+            {runners.map((runner) => {
+              const version = runnerMetaText(runner, "version");
+              const buildSha = runnerMetaText(runner, "build_sha");
+              const image = runnerMetaText(runner, "image");
+              const targetImage = runnerMetaText(runner, "update_target_image");
+              const updateSupported = runnerMetaBool(runner, "update_supported");
+              const updateAvailable = runnerMetaBool(runner, "update_available");
+              return (
+                <Card size="small" key={runner.runner_id}>
+                  <div className="read-only-token-card">
+                    <div>
+                      <Space size={8} wrap>
+                        <strong>{runner.name || runner.runner_id}</strong>
+                        <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
+                        <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
+                        <Tag color={runner.available ? "success" : "error"}>{runner.available ? "可用" : "不可用"}</Tag>
+                        <Tag>{runner.network_region || "local"}</Tag>
+                        {version && <Tag color="blue">v{version}</Tag>}
+                        {runner.role !== "local" && (
+                          <Tag color={updateSupported ? (updateAvailable ? "warning" : "processing") : "default"}>
+                            {updateSupported ? (updateAvailable ? "有可更新镜像" : "支持平台更新") : "未启用 updater"}
+                          </Tag>
+                        )}
+                      </Space>
+                      <span>
+                        {runner.address || "-"} · 最近心跳 {runner.last_seen_at ? formatDate(runner.last_seen_at) : "无"}
+                      </span>
+                      <span>
+                        token {runner.token_set ? runner.token_hint || "已配置" : "未配置"}
+                        {image ? ` · 镜像 ${runnerImageSummary(image)}` : ""}
+                        {buildSha && buildSha !== "unknown" ? ` · ${buildSha.slice(0, 8)}` : ""}
+                      </span>
+                      {targetImage && targetImage !== image && <span>目标镜像 {runnerImageSummary(targetImage)}</span>}
+                    </div>
                     <Space size={8} wrap>
-                      <strong>{runner.name || runner.runner_id}</strong>
-                      <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
-                      <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
-                      <Tag color={runner.available ? "success" : "error"}>{runner.available ? "可用" : "不可用"}</Tag>
-                      <Tag>{runner.network_region || "local"}</Tag>
-                    </Space>
-                    <span>
-                      {runner.address || "-"} · 最近心跳 {runner.last_seen_at ? formatDate(runner.last_seen_at) : "无"}
-                    </span>
-                    <span>token {runner.token_set ? runner.token_hint || "已配置" : "未配置"}</span>
-                  </div>
-                  <Space size={8} wrap>
-                    <Switch
-                      checked={runner.enabled}
-                      loading={busyId === runner.runner_id}
-                      onChange={(enabled) => updateRunnerEnabled(runner, enabled)}
-                      aria-label={`切换执行节点 ${runner.runner_id}`}
-                    />
-                    <Button icon={<Pencil size={15} />} loading={busyId === runner.runner_id} onClick={() => openEditDrawer(runner)}>
-                      编辑
-                    </Button>
-                    <Button loading={busyId === runner.runner_id} onClick={() => testRunner(runner)}>
-                      测试连接
-                    </Button>
-                    {runner.role !== "local" && (
-                      <Button icon={<KeyRound size={15} />} loading={busyId === runner.runner_id} onClick={() => setAuthRunner({ runner, token: "" })}>
-                        更新认证
+                      <Switch
+                        checked={runner.enabled}
+                        loading={busyId === runner.runner_id}
+                        onChange={(enabled) => updateRunnerEnabled(runner, enabled)}
+                        aria-label={`切换执行节点 ${runner.runner_id}`}
+                      />
+                      <Button icon={<Pencil size={15} />} loading={busyId === runner.runner_id} onClick={() => openEditDrawer(runner)}>
+                        编辑
                       </Button>
-                    )}
-                    {runner.role !== "local" && (
-                      <Popconfirm
-                        title="删除执行节点"
-                        description="删除后，仍引用该节点的任务会在执行时回退到可用节点。"
-                        okText="删除"
-                        cancelText="取消"
-                        onConfirm={() => deleteRunner(runner)}
-                      >
-                        <Button danger icon={<Trash2 size={15} />} loading={busyId === runner.runner_id}>
-                          删除
+                      <Button loading={busyId === runner.runner_id} onClick={() => testRunner(runner)}>
+                        测试连接
+                      </Button>
+                      {runner.role !== "local" && (
+                        <Button icon={<KeyRound size={15} />} loading={busyId === runner.runner_id} onClick={() => setAuthRunner({ runner, token: "" })}>
+                          更新认证
                         </Button>
-                      </Popconfirm>
-                    )}
-                  </Space>
-                </div>
-              </Card>
-            ))}
+                      )}
+                      {runner.role !== "local" && (
+                        <Tooltip title={updateSupported ? "由子节点 updater 执行 docker pull 和重建 worker" : "启动子节点时启用 updater profile 后可用"}>
+                          <Button icon={<Download size={15} />} disabled={!updateSupported || !runner.available} loading={busyId === runner.runner_id} onClick={() => confirmRunnerUpdate(runner)}>
+                            更新节点
+                          </Button>
+                        </Tooltip>
+                      )}
+                      {runner.role !== "local" && (
+                        <Button icon={<Info size={15} />} disabled={!updateSupported} loading={busyId === runner.runner_id} onClick={() => showRunnerUpdateStatus(runner)}>
+                          更新状态
+                        </Button>
+                      )}
+                      {runner.role !== "local" && (
+                        <Popconfirm
+                          title="删除执行节点"
+                          description="删除后，仍引用该节点的任务会在执行时回退到可用节点。"
+                          okText="删除"
+                          cancelText="取消"
+                          onConfirm={() => deleteRunner(runner)}
+                        >
+                          <Button danger icon={<Trash2 size={15} />} loading={busyId === runner.runner_id}>
+                            删除
+                          </Button>
+                        </Popconfirm>
+                      )}
+                    </Space>
+                  </div>
+                </Card>
+              );
+            })}
           </Space>
         )}
       </Space>
@@ -1308,17 +1415,17 @@ function RunnerNodePanel() {
           <Form.Item label="节点名称" required>
             <Input value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
           </Form.Item>
-          <Form.Item label="节点地址" required>
+          <Form.Item label="节点地址" required help="可填写裸 IP/域名，系统会按 worker 默认端口补成 http://地址:8788。">
             <Input
               value={draft.address}
-              placeholder="http://10.0.0.12:8788"
+              placeholder="10.0.0.12 或 http://10.0.0.12:8788"
               onChange={(event) => setDraft((current) => ({ ...current, address: event.target.value }))}
             />
           </Form.Item>
-          <Form.Item label="认证信息" required>
+          <Form.Item label="认证信息" required help="粘贴 pgrn_ 开头的 token；也可以粘贴日志里的 token: pgrn_... 整行。">
             <Input.Password
               value={draft.token}
-              placeholder="粘贴子节点启动日志输出的 token"
+              placeholder="pgrn_..."
               onChange={(event) => setDraft((current) => ({ ...current, token: event.target.value }))}
             />
           </Form.Item>
@@ -1358,10 +1465,10 @@ function RunnerNodePanel() {
               }
             />
           </Form.Item>
-          <Form.Item label="节点地址" required>
+          <Form.Item label="节点地址" required help="可填写裸 IP/域名，系统会按 worker 默认端口补成 http://地址:8788。">
             <Input
               value={editRunner?.draft.address || ""}
-              placeholder={editRunner?.runner.role === "local" ? "127.0.0.1" : "http://10.0.0.12:8788"}
+              placeholder={editRunner?.runner.role === "local" ? "127.0.0.1" : "10.0.0.12 或 http://10.0.0.12:8788"}
               onChange={(event) =>
                 setEditRunner((current) =>
                   current ? { ...current, draft: { ...current.draft, address: event.target.value } } : current
@@ -1401,24 +1508,57 @@ function RunnerNodePanel() {
         onCancel={() => setAuthRunner(null)}
       >
         <Form layout="vertical" autoComplete="off">
-          <Form.Item label="认证信息" required>
+          <Form.Item label="认证信息" required help="粘贴 pgrn_ 开头的 token；也可以粘贴日志里的 token: pgrn_... 整行。">
             <Input.Password
               value={authRunner?.token || ""}
-              placeholder="粘贴子节点启动日志输出的 token"
+              placeholder="pgrn_..."
               onChange={(event) => setAuthRunner((current) => (current ? { ...current, token: event.target.value } : current))}
             />
           </Form.Item>
         </Form>
       </Modal>
 
-      <Modal title="创建子节点" open={helpOpen} footer={null} onCancel={() => setHelpOpen(false)} width={720}>
+      <Modal title="创建子节点" open={helpOpen} footer={null} onCancel={() => setHelpOpen(false)} width={820}>
         <Space orientation="vertical" size={12} className="drawer-stack">
           <span>子节点不会主动注册。先在子节点服务器启动 worker，再回到这里点击“新增子节点”，填写子节点地址和日志输出的 token。</span>
           <div className="worker-help-block">
-            <strong>Docker 一行启动</strong>
-            <pre>{`curl -fsSL "http://<可访问地址>/docker-compose.worker.yml" -o docker-compose.worker.yml
+            <strong>推荐部署：预构建镜像（Windows PowerShell）</strong>
+            <pre>{`mkdir pulseguard-worker -Force; cd pulseguard-worker
+Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.yml" -OutFile docker-compose.worker.yml
+$env:PULSEGUARD_WORKER_NAME = $env:COMPUTERNAME
+$env:PULSEGUARD_WORKER_REGION = "default"
+$env:PULSEGUARD_WORKER_IMAGE = "ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+docker compose -f docker-compose.worker.yml pull
 docker compose -f docker-compose.worker.yml up -d
-docker logs -f pulseguard-worker`}</pre>
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker`}</pre>
+            <span>这条命令会后台启动容器并设置 Docker 自启策略，不会在子节点源码构建，也不会额外拉取 uv 镜像。</span>
+          </div>
+          <div className="worker-help-block">
+            <strong>启用管理平台推送更新（可选）</strong>
+            <pre>{`$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+$env:COMPOSE_PROFILES = "updater"
+$env:PULSEGUARD_WORKER_UPDATER_URL = "http://pulseguard-worker-updater:8790"
+$env:PULSEGUARD_WORKER_UPDATE_IMAGE = "ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+docker compose -f docker-compose.worker.yml pull
+docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updater`}</pre>
+            <span>updater 会后台运行并跟随 Docker 自启；它会挂载宿主机 Docker socket，只允许更新当前 worker 服务，不支持任意命令。</span>
+          </div>
+          <div className="worker-help-block">
+            <strong>中国内地网络加速下载 compose（Windows PowerShell）</strong>
+            <pre>{`mkdir pulseguard-worker -Force; cd pulseguard-worker
+Invoke-WebRequest -UseBasicParsing "https://gh-proxy.org/https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.yml" -OutFile docker-compose.worker.yml
+$env:PULSEGUARD_WORKER_NAME = $env:COMPUTERNAME
+$env:PULSEGUARD_WORKER_REGION = "default"
+$env:PULSEGUARD_WORKER_IMAGE = "ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+docker compose -f docker-compose.worker.yml pull
+docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker`}</pre>
+            <span>加速链接仅用于中国内地服务器访问 GitHub Raw 较慢或不稳定的场景；命令会后台启动并设置自启。镜像拉取慢时，把 worker 镜像同步到内网或国内镜像仓库后替换 PULSEGUARD_WORKER_IMAGE。</span>
           </div>
           <div className="worker-help-block">
             <strong>刷新子节点 token</strong>

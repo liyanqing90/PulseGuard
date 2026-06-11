@@ -2644,6 +2644,25 @@ tr:last-child td {
   min-height: 260px;
 }
 
+.run-group-detail-tabs {
+  width: 100%;
+}
+
+.run-group-node-tab {
+  display: inline-flex;
+  max-width: 240px;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.run-group-node-tab > span:not(.ant-tag) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .assertion-results-table .ant-table {
   border: 1px solid var(--line);
   border-radius: var(--radius);

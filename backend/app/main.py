@@ -20,10 +20,10 @@ from pydantic import ValidationError
 from .api_assertions import inspect_api_response
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
-from .config import NODE_ROLE, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, ensure_runtime_dirs
+from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
-from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest
+from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
 from .variables import mask_data, mask_text
 
 
@@ -136,6 +136,8 @@ def health() -> dict[str, str]:
 @app.get("/api/worker/health")
 def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
     _verify_worker_token(_bearer_token(authorization))
+    update_supported = bool(WORKER_UPDATER_URL)
+    update_target = WORKER_UPDATE_IMAGE or WORKER_IMAGE
     return {
         "ok": True,
         "role": NODE_ROLE,
@@ -145,7 +147,15 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
         "network_region": WORKER_REGION,
         "browser_version": "",
         "status": "ok",
-        "metadata": {"node_role": NODE_ROLE},
+        "metadata": {
+            "node_role": NODE_ROLE,
+            "version": APP_VERSION,
+            "build_sha": BUILD_SHA,
+            "image": WORKER_IMAGE,
+            "update_supported": update_supported,
+            "update_target_image": update_target,
+            "update_available": bool(update_supported and WORKER_IMAGE and update_target and WORKER_IMAGE != update_target),
+        },
     }
 
 
@@ -163,6 +173,18 @@ async def worker_run(request: Request, authorization: str = Header(default="")) 
     run_id = int(raw.get("run_id") or 0)
     result = await request.app.state.runner.execute_worker_run(check, trigger, run_id, settings)
     return {"ok": True, "run": result, "artifacts": _worker_artifacts(result)}
+
+
+@app.post("/api/worker/update")
+async def worker_update(payload: WorkerUpdateRequest, authorization: str = Header(default="")) -> dict[str, Any]:
+    _verify_worker_token(_bearer_token(authorization))
+    return await _worker_updater_request("POST", "/update", payload.model_dump(exclude_none=True))
+
+
+@app.get("/api/worker/update-status")
+async def worker_update_status(authorization: str = Header(default="")) -> dict[str, Any]:
+    _verify_worker_token(_bearer_token(authorization))
+    return await _worker_updater_request("GET", "/status")
 
 
 @app.post("/api/heartbeats/{key}")
@@ -206,6 +228,8 @@ def runtime_status(request: Request) -> dict[str, Any]:
     scheduler = request.app.state.scheduler
     payload["scheduler"] = scheduler.runtime_status() if hasattr(scheduler, "runtime_status") else {"running": False, "scheduled_checks": 0, "next_due_at": None, "overdue_jobs": 0}
     payload["node_role"] = NODE_ROLE
+    payload["version"] = APP_VERSION
+    payload["build_sha"] = BUILD_SHA
     return payload
 
 
@@ -235,8 +259,14 @@ def runner_heartbeat(payload: RunnerHeartbeatRequest, authorization: str = Heade
 
 @app.put("/api/runners/{runner_id}")
 def update_runner(runner_id: str, payload: ProbeRunnerUpdate) -> dict[str, Any]:
+    current = storage.get_probe_runner(runner_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    data = payload.model_dump(exclude_none=True)
+    if str(current.get("role")) != "local" and data.get("address") is not None:
+        data["address"] = _runner_address(data["address"], required=True)
     try:
-        runner = storage.update_probe_runner(runner_id, payload.model_dump(exclude_none=True))
+        runner = storage.update_probe_runner(runner_id, data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not runner:
@@ -264,6 +294,29 @@ def rotate_runner_token(runner_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Runner 不存在")
     storage.record_audit_event("updated", "runner", runner.get("runner_id"), runner.get("name", ""), "轮换执行节点令牌")
     return _runner_response(runner)
+
+
+@app.post("/api/runners/{runner_id}/update")
+async def update_runner_node(runner_id: str, payload: WorkerUpdateRequest) -> dict[str, Any]:
+    runner = storage.get_probe_runner(runner_id)
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    if str(runner.get("role") or "") == "local":
+        raise HTTPException(status_code=400, detail="本机 Runner 不支持远程更新")
+    result = await _worker_request(runner, "POST", "/api/worker/update", payload.model_dump(exclude_none=True), timeout=10)
+    storage.record_audit_event("updated", "runner", runner_id, runner.get("name", ""), "推送执行节点更新", {"target_image": payload.target_image or ""})
+    return {"ok": True, "message": "节点更新任务已下发", "worker": result}
+
+
+@app.get("/api/runners/{runner_id}/update-status")
+async def runner_update_status(runner_id: str) -> dict[str, Any]:
+    runner = storage.get_probe_runner(runner_id)
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    if str(runner.get("role") or "") == "local":
+        raise HTTPException(status_code=400, detail="本机 Runner 不支持远程更新")
+    result = await _worker_request(runner, "GET", "/api/worker/update-status", timeout=10)
+    return {"ok": True, "worker": result}
 
 
 @app.post("/api/runners/{runner_id}/test")
@@ -849,18 +902,82 @@ def _runner_response(runner: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _fetch_runner_health(runner: dict[str, Any]) -> dict[str, Any]:
+    payload = await _worker_request(runner, "GET", "/api/worker/health", timeout=5)
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError("Runner health response is invalid")
+    return payload
+
+
+async def _worker_request(
+    runner: dict[str, Any],
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
     runner_id = str(runner.get("runner_id") or "")
     token = storage.get_probe_runner_token(runner_id)
     address = str(runner.get("address") or "").strip().rstrip("/")
     if not address or not token:
         raise RuntimeError("Runner address or token is not configured")
-    async with httpx.AsyncClient(timeout=5) as client:
-        response = await client.get(f"{address}/api/worker/health", headers={"Authorization": f"Bearer {token}"})
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        raise RuntimeError("Runner health response is invalid")
-    return payload
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(
+                method,
+                f"{address}{path}",
+                json=payload if method.upper() != "GET" else None,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=400, detail=f"Runner 请求超时：{int(timeout)} 秒内未返回") from exc
+    except httpx.RequestError as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        raise HTTPException(status_code=400, detail=f"Runner 请求失败：{detail}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Runner 请求失败：HTTP {response.status_code}: {_http_response_detail(response)}")
+    data = response.json()
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Runner 响应格式无效")
+    return data
+
+
+async def _worker_updater_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not WORKER_UPDATER_URL:
+        raise HTTPException(status_code=503, detail="子节点未启用 updater，不能由平台推送更新")
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="子节点 token 不可用，不能调用 updater")
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.request(
+                method,
+                f"{WORKER_UPDATER_URL}{path}",
+                json=payload if method.upper() != "GET" else None,
+                headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="updater 请求超时") from exc
+    except httpx.RequestError as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        raise HTTPException(status_code=503, detail=f"updater 不可用：{detail}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code if response.status_code < 500 else 503, detail=_http_response_detail(response))
+    data = response.json()
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=503, detail="updater 响应格式无效")
+    return data
+
+
+def _http_response_detail(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        text = response.text.strip()
+    else:
+        if isinstance(data, dict):
+            text = str(data.get("detail") or data.get("message") or "").strip()
+        else:
+            text = str(data).strip()
+    return text[:500] if text else "远程服务返回错误"
 
 
 async def _runner_health_poll_loop() -> None:

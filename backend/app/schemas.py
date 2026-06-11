@@ -366,6 +366,16 @@ class ProbeRunnerCreate(BaseModel):
     enabled: bool = True
     token: str = Field(min_length=1, max_length=4096)
 
+    @field_validator("address")
+    @classmethod
+    def address_must_be_worker_base_url(cls, value: str) -> str:
+        return _runner_address(value, required=True) or ""
+
+    @field_validator("token")
+    @classmethod
+    def token_must_be_worker_token(cls, value: str) -> str:
+        return _worker_token(value, required=True) or ""
+
 
 class ProbeRunnerUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
@@ -373,6 +383,43 @@ class ProbeRunnerUpdate(BaseModel):
     network_region: str | None = Field(default=None, max_length=120)
     enabled: bool | None = None
     token: str | None = Field(default=None, max_length=4096)
+
+    @field_validator("token")
+    @classmethod
+    def token_must_be_worker_token(cls, value: str | None) -> str | None:
+        return _worker_token(value, required=False)
+
+
+class WorkerUpdateRequest(BaseModel):
+    target_image: str | None = Field(default=None, max_length=512)
+    update_id: str | None = Field(default=None, max_length=120)
+    force: bool = False
+
+    @field_validator("target_image")
+    @classmethod
+    def target_image_must_be_image_reference(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if len(text) > 512:
+            raise ValueError("目标镜像地址过长")
+        if any(char.isspace() for char in text) or text.startswith("-"):
+            raise ValueError("目标镜像地址格式无效")
+        return text
+
+    @field_validator("update_id")
+    @classmethod
+    def update_id_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}", text):
+            raise ValueError("更新批次 ID 格式无效")
+        return text
 
 
 class ReadOnlyTokenCreate(BaseModel):
@@ -454,6 +501,65 @@ def _absolute_http_url(key: str, value: Any) -> str:
     if parts.query or parts.fragment:
         raise ValueError(f"{_setting_label(key)}不能包含查询参数或锚点")
     return text
+
+
+_WORKER_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])pgrn_[A-Za-z0-9_-]{16,256}(?![A-Za-z0-9_-])")
+
+
+def _runner_address(value: Any, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError("节点地址不能为空")
+        return None
+    if not isinstance(value, str):
+        raise ValueError("节点地址必须是字符串")
+    text = value.strip().rstrip("/")
+    if not text:
+        if required:
+            raise ValueError("节点地址不能为空")
+        return None
+    if len(text) > 2048:
+        raise ValueError("节点地址过长")
+    if "://" not in text:
+        if "/" in text or "?" in text or "#" in text:
+            raise ValueError("节点地址不能包含路径、查询参数或锚点")
+        text = f"http://{text}"
+    parts = urlsplit(text)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("节点地址必须是 http(s) 地址，或填写子节点 IP/域名")
+    if parts.username or parts.password:
+        raise ValueError("节点地址不能包含用户名或密码")
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        raise ValueError("节点地址不能包含路径、查询参数或锚点")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("节点地址端口无效") from exc
+    hostname = parts.hostname
+    if not hostname:
+        raise ValueError("节点地址必须包含主机名或 IP")
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{parts.scheme}://{host}:{port or 8788}"
+
+
+def _worker_token(value: Any, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError("认证信息不能为空")
+        return None
+    if not isinstance(value, str):
+        raise ValueError("认证信息必须是字符串")
+    text = value.strip()
+    if not text:
+        if required:
+            raise ValueError("认证信息不能为空")
+        return None
+    matches = list(dict.fromkeys(_WORKER_TOKEN_PATTERN.findall(text)))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("认证信息只能包含一个 worker token")
+    raise ValueError("认证信息必须包含 pgrn_ 开头的 worker token")
 
 
 def _dingtalk_secret(value: Any) -> str:

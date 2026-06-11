@@ -696,24 +696,54 @@ class CheckRunner:
             raise RuntimeError("Runner address is empty")
         if not token:
             token = self._runner_token_from_row(runner)
+        settings = storage.get_settings()
         payload = {
             "check": self._worker_check_payload(check),
             "trigger": trigger,
             "run_id": run_id,
-            "settings": self._worker_settings(storage.get_settings()),
+            "settings": self._worker_settings(settings),
         }
-        async with httpx.AsyncClient(timeout=max(5.0, float(check.get("timeout_ms") or 15000) / 1000 + 10.0)) as client:
-            response = await client.post(
-                f"{address}/api/worker/run",
-                json=payload,
-                headers={"Authorization": f"Bearer {token}"},
-            )
+        timeout_seconds = self._remote_runner_timeout_seconds(check, settings)
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.post(
+                    f"{address}/api/worker/run",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"执行节点调用超时，等待 {int(timeout_seconds)} 秒后未返回") from exc
+        except httpx.RequestError as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            raise RuntimeError(f"执行节点请求失败：{detail}") from exc
         if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code}")
+            raise RuntimeError(f"HTTP {response.status_code}: {self._response_error_detail(response)}")
         data = response.json()
         if not isinstance(data, dict) or not data.get("ok"):
             raise RuntimeError(str(data.get("message") if isinstance(data, dict) else "invalid response"))
         return data
+
+    def _remote_runner_timeout_seconds(self, check: dict[str, Any], settings: dict[str, Any]) -> float:
+        check_timeout = max(0.5, float(check.get("timeout_ms") or 15000) / 1000)
+        try:
+            max_runtime = max(check_timeout, float(settings.get("max_task_runtime_seconds") or 60))
+        except (TypeError, ValueError):
+            max_runtime = max(check_timeout, 60.0)
+        attempts = self._max_attempts(check, settings)
+        return min(3600.0, max(30.0, max_runtime * attempts + 15.0))
+
+    @staticmethod
+    def _response_error_detail(response: httpx.Response) -> str:
+        try:
+            data = response.json()
+        except ValueError:
+            text = response.text.strip()
+        else:
+            if isinstance(data, dict):
+                text = str(data.get("detail") or data.get("message") or "").strip()
+            else:
+                text = str(data).strip()
+        return text[:500] if text else "远程服务返回错误"
 
     def _remote_result_to_finish_payload(self, result: dict[str, Any], run_id: int, runner: dict[str, Any]) -> dict[str, Any]:
         data = result.get("run") if isinstance(result.get("run"), dict) else {}

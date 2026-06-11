@@ -18,6 +18,8 @@ import type {
   Overview,
   ProbeRunner,
   ProbeRunnerPayload,
+  RunnerUpdateRequest,
+  RunnerUpdateStatus,
   CreatedReadOnlyToken,
   Run,
   RunArchive,
@@ -218,6 +220,13 @@ export const api = {
       `/api/runners/${encodeURIComponent(runnerId)}/test`,
       { method: "POST" }
     ),
+  updateRunnerNode: (runnerId: string, payload: RunnerUpdateRequest = {}) =>
+    request<{ ok: boolean; message: string; worker?: unknown }>(`/api/runners/${encodeURIComponent(runnerId)}/update`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  runnerUpdateStatus: (runnerId: string) =>
+    request<{ ok: boolean; worker?: { update?: RunnerUpdateStatus } }>(`/api/runners/${encodeURIComponent(runnerId)}/update-status`),
   checkVersions: (id: number) => request<CheckVersion[]>(`/api/checks/${id}/versions`),
   restoreCheckVersion: (versionId: number) =>
     request<Check>(`/api/check-versions/${versionId}/restore`, { method: "POST" }),

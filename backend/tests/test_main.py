@@ -305,11 +305,48 @@ class HeartbeatRouteTests(unittest.TestCase):
 
 
 class RunnerRouteTests(unittest.TestCase):
+    def test_worker_health_reports_version_and_update_metadata(self) -> None:
+        token = "pgrn_workerhealthtoken1234567890"
+        with patch("backend.app.main.WORKER_TOKEN", token), patch("backend.app.main.APP_VERSION", "0.2.0"), patch(
+            "backend.app.main.BUILD_SHA", "abc123"
+        ), patch("backend.app.main.WORKER_IMAGE", "ghcr.io/liyanqing90/pulseguard-worker:old"), patch(
+            "backend.app.main.WORKER_UPDATE_IMAGE", "ghcr.io/liyanqing90/pulseguard-worker:new"
+        ), patch("backend.app.main.WORKER_UPDATER_URL", "http://pulseguard-worker-updater:8790"):
+            response = TestClient(app).get("/api/worker/health", headers={"Authorization": f"Bearer {token}"})
+
+        self.assertEqual(response.status_code, 200)
+        metadata = response.json()["metadata"]
+        self.assertEqual(metadata["version"], "0.2.0")
+        self.assertEqual(metadata["build_sha"], "abc123")
+        self.assertTrue(metadata["update_supported"])
+        self.assertTrue(metadata["update_available"])
+
+    def test_worker_update_requires_auth_and_proxies_to_updater(self) -> None:
+        token = "pgrn_workerupdatetoken1234567890"
+        result = {"ok": True, "message": "accepted"}
+        with patch("backend.app.main.WORKER_TOKEN", token), patch(
+            "backend.app.main._worker_updater_request", new=AsyncMock(return_value=result)
+        ) as worker_updater_request:
+            response = TestClient(app).post(
+                "/api/worker/update",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"target_image": "ghcr.io/liyanqing90/pulseguard-worker:new", "update_id": "upd-1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), result)
+        worker_updater_request.assert_awaited_once_with(
+            "POST",
+            "/update",
+            {"target_image": "ghcr.io/liyanqing90/pulseguard-worker:new", "update_id": "upd-1", "force": False},
+        )
+
     def test_create_runner_stores_supplied_token_without_returning_secret(self) -> None:
+        token = "pgrn_abcdefghijklmnopqrstuvwxyzABCDE1234567890_-"
         runner = {
             "runner_id": "office-1",
             "name": "Office Runner",
-            "address": "http://10.0.0.8:8787",
+            "address": "http://10.0.0.8:8788",
             "network_region": "office-lan",
             "browser_version": "",
             "status": "offline",
@@ -317,8 +354,8 @@ class RunnerRouteTests(unittest.TestCase):
             "role": "child",
             "available": False,
             "token_set": True,
-            "token_hint": "secret",
-            "token_value": "runner-token-secret",
+            "token_hint": "90_-",
+            "token_value": token,
         }
 
         with patch("backend.app.main.storage.create_probe_runner", return_value=runner) as create_probe_runner, patch(
@@ -330,9 +367,9 @@ class RunnerRouteTests(unittest.TestCase):
                 "/api/runners",
                 json={
                     "name": "Office Runner",
-                    "address": "http://10.0.0.8:8787",
+                    "address": "10.0.0.8",
                     "network_region": "office-lan",
-                    "token": "runner-token-secret",
+                    "token": f"token: {token}",
                 },
             )
 
@@ -342,8 +379,69 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertNotIn("token_value", payload)
         create_probe_runner.assert_called_once()
         self.assertEqual(create_probe_runner.call_args.args[0]["role"], "child")
-        self.assertEqual(create_probe_runner.call_args.args[0]["token"], "runner-token-secret")
+        self.assertEqual(create_probe_runner.call_args.args[0]["address"], "http://10.0.0.8:8788")
+        self.assertEqual(create_probe_runner.call_args.args[0]["token"], token)
         record_audit_event.assert_called_once()
+
+    def test_create_runner_rejects_non_worker_token(self) -> None:
+        response = TestClient(app).post(
+            "/api/runners",
+            json={
+                "name": "Office Runner",
+                "address": "10.0.0.8",
+                "network_region": "office-lan",
+                "token": "token: 复制整段日志但没有有效令牌",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("pgrn_", response.text)
+
+    def test_update_child_runner_normalizes_bare_address(self) -> None:
+        current = {"runner_id": "office-1", "name": "Office Runner", "role": "child"}
+        updated = {
+            "runner_id": "office-1",
+            "name": "Office Runner",
+            "address": "http://10.0.0.8:8788",
+            "network_region": "office-lan",
+            "role": "child",
+        }
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=current), patch(
+            "backend.app.main.storage.update_probe_runner", return_value=updated
+        ) as update_probe_runner, patch("backend.app.main.storage.record_audit_event"), patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).put(
+                "/api/runners/office-1",
+                json={"name": "Office Runner", "address": "10.0.0.8", "network_region": "office-lan"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(update_probe_runner.call_args.args[1]["address"], "http://10.0.0.8:8788")
+
+    def test_update_local_runner_preserves_local_address(self) -> None:
+        current = {"runner_id": "local", "name": "local", "role": "local"}
+        updated = {
+            "runner_id": "local",
+            "name": "local",
+            "address": "127.0.0.1",
+            "network_region": "local",
+            "role": "local",
+        }
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=current), patch(
+            "backend.app.main.storage.update_probe_runner", return_value=updated
+        ) as update_probe_runner, patch("backend.app.main.storage.record_audit_event"), patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).put(
+                "/api/runners/local",
+                json={"name": "local", "address": "127.0.0.1", "network_region": "local"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(update_probe_runner.call_args.args[1]["address"], "127.0.0.1")
 
     def test_rotate_runner_token_returns_new_one_time_token_response(self) -> None:
         runner = {
@@ -374,6 +472,34 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(payload["token"], "runner-token-secret-2")
         self.assertNotIn("token_value", payload)
         rotate_probe_runner_token.assert_called_once_with("office-1")
+        record_audit_event.assert_called_once()
+
+    def test_runner_update_route_pushes_update_to_child_worker(self) -> None:
+        runner = {
+            "runner_id": "office-1",
+            "name": "Office Runner",
+            "address": "http://10.0.0.8:8788",
+            "role": "child",
+        }
+        worker_result = {"ok": True, "message": "accepted"}
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=runner), patch(
+            "backend.app.main._worker_request", new=AsyncMock(return_value=worker_result)
+        ) as worker_request, patch("backend.app.main.storage.record_audit_event") as record_audit_event:
+            response = TestClient(app).post(
+                "/api/runners/office-1/update",
+                json={"target_image": "ghcr.io/liyanqing90/pulseguard-worker:new"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["worker"], worker_result)
+        worker_request.assert_awaited_once_with(
+            runner,
+            "POST",
+            "/api/worker/update",
+            {"target_image": "ghcr.io/liyanqing90/pulseguard-worker:new", "force": False},
+            timeout=10,
+        )
         record_audit_event.assert_called_once()
 
     def test_runner_heartbeat_route_upserts_runner(self) -> None:

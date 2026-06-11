@@ -108,7 +108,7 @@ PulseGuard 默认保留并启用内置 `local` 节点。子节点是独立部署
 结果展示：
 
 - 多选并行时，同一次触发会为每个节点创建一条运行记录，并写入同一个 `run_group_id`。
-- 运行详情和运行抽屉会在“多节点执行结果”中展示同组所有节点的节点执行状态、运行状态、失败来源、耗时、错误摘要和证据文件入口。
+- 运行详情和运行抽屉会在“多节点执行结果”中展示同组所有节点的节点执行状态、运行状态、失败来源、耗时、错误摘要和证据文件入口；点击下方节点详情 Tab 可在当前详情内切换不同节点的完整结果。
 - 多节点聚合只更新一次任务健康状态：任一可用节点出现目标失败/超时，本轮任务失败；全部可用节点成功才算成功；节点不可用只记录 `failure_kind=runner`，不计入目标失败。
 - 运行记录页可按执行节点筛选；需要按一次触发查看全量节点结果时，可用 `run_group_id` 查询同组运行记录。
 
@@ -135,33 +135,102 @@ PulseGuard worker node is ready.
 
 如果没有显式传入 `--token` 或 `PULSEGUARD_WORKER_TOKEN`，worker 会把 token 保存到 `PULSEGUARD_WORKER_TOKEN_FILE`，默认是数据目录下的 `worker-token`，后续重启会复用同一个 token。
 
-Docker 子节点不需要复制完整源码。把 `docker-compose.worker.yml` 复制到子节点服务器任意目录，让它指向一个主节点可用的 worker 镜像，然后一行命令启动：
+Docker 子节点不需要复制完整源码，也不建议默认在子节点从源码构建。推荐直接运行预构建 worker 镜像；这样启动时只拉取 worker 镜像，不会在子节点额外拉取 `uv` 镜像或执行 `uv sync`。
+
+Windows PowerShell 直连 GitHub 可直接执行：
 
 ```powershell
-$env:PULSEGUARD_WORKER_IMAGE="registry.example.com/pulseguard-worker:latest"; docker compose -f docker-compose.worker.yml up -d
+mkdir pulseguard-worker -Force; cd pulseguard-worker
+Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.yml" -OutFile docker-compose.worker.yml
+$env:PULSEGUARD_WORKER_NAME = $env:COMPUTERNAME
+$env:PULSEGUARD_WORKER_REGION = "default"
+$env:PULSEGUARD_WORKER_IMAGE = "ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+docker compose -f docker-compose.worker.yml pull
+docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker
 ```
 
 Linux shell 可用：
 
 ```sh
-PULSEGUARD_WORKER_IMAGE="registry.example.com/pulseguard-worker:latest" docker compose -f docker-compose.worker.yml up -d
+mkdir -p pulseguard-worker && cd pulseguard-worker
+curl -fsSL "https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.yml" -o docker-compose.worker.yml
+export PULSEGUARD_WORKER_NAME="$(hostname)"
+export PULSEGUARD_WORKER_REGION="default"
+export PULSEGUARD_WORKER_IMAGE="ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+export COMPOSE_PROJECT_NAME="pulseguard-worker"
+docker compose -f docker-compose.worker.yml pull
+docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker
 ```
 
-后台启动后用 `docker logs pulseguard-worker` 查看认证 token。默认 `docker-compose.worker.yml` 不包含源码构建配置，不会隐式访问 GitHub。
+命令默认后台启动容器并设置 Docker 自启策略。启动后用 `docker logs --tail 80 pulseguard-worker` 查看认证 token；需要持续观察日志时再执行 `docker logs -f pulseguard-worker`。默认 `docker-compose.worker.yml` 不包含源码构建配置，不会隐式访问 GitHub。
+
+worker 会在 `/api/worker/health` 上报版本、构建 SHA、当前镜像和是否启用平台更新。管理平台“执行节点”列表会展示这些信息。
+
+如果希望管理平台可以主动向子节点推送更新，需要显式启用 updater profile。updater 会挂载宿主机 Docker socket，因此只允许更新当前 `pulseguard-worker` 服务，不支持任意命令：
+
+```powershell
+$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+$env:COMPOSE_PROFILES = "updater"
+$env:PULSEGUARD_WORKER_UPDATER_URL = "http://pulseguard-worker-updater:8790"
+$env:PULSEGUARD_WORKER_UPDATE_IMAGE = "ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+docker compose -f docker-compose.worker.yml pull
+docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updater
+```
+
+启用后，主节点“执行节点”列表会显示“支持平台更新”，可以点击“更新节点”。更新过程由子节点 updater 执行：拉取目标镜像、重建 worker、检查 `/api/worker/health`，失败时尝试回滚到旧镜像。
+
+中国内地服务器访问 GitHub Raw 较慢或不稳定时，可以使用加速链接下载 compose 文件。这个加速链接只用于中国内地网络场景，并且只加速 compose 文件下载，不加速容器镜像拉取：
+
+```powershell
+mkdir pulseguard-worker -Force; cd pulseguard-worker
+Invoke-WebRequest -UseBasicParsing "https://gh-proxy.org/https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.yml" -OutFile docker-compose.worker.yml
+$env:PULSEGUARD_WORKER_NAME = $env:COMPUTERNAME
+$env:PULSEGUARD_WORKER_REGION = "default"
+$env:PULSEGUARD_WORKER_IMAGE = "ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish"
+$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+docker compose -f docker-compose.worker.yml pull
+docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker
+```
+
+如果中国内地服务器拉取 GHCR 镜像较慢，推荐先把 `ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish` 同步到内网或国内镜像仓库，再把命令里的 `PULSEGUARD_WORKER_IMAGE` 替换成你的镜像地址。
 
 如果子节点服务器不能访问 GitHub，建议在可访问的位置放一份定制的 `docker-compose.worker.yml`，让这个 compose 文件直接指向内网镜像。子节点服务器只需要下载这份 compose 文件再启动：
 
 ```sh
 curl -fsSL "http://<可访问地址>/docker-compose.worker.yml" -o docker-compose.worker.yml
 docker compose -f docker-compose.worker.yml up -d
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker
 ```
 
-如果没有预构建镜像，需要从源码构建 worker 镜像，再额外复制或下载 `docker-compose.worker.build.yml`，并显式叠加 build 文件：
+只有在没有预构建镜像或内网镜像时，才建议使用源码构建备用路径。该路径会拉取 Playwright 基础镜像和 `uv` 镜像，国内网络下通常更慢：
 
-```sh
-curl -fsSL "http://<可访问地址>/docker-compose.worker.yml" -o docker-compose.worker.yml
-curl -fsSL "http://<可访问地址>/docker-compose.worker.build.yml" -o docker-compose.worker.build.yml
-PULSEGUARD_WORKER_BUILD_CONTEXT="https://git.example.com/PulseGuard.git#main" docker compose -f docker-compose.worker.yml -f docker-compose.worker.build.yml up --build
+```powershell
+mkdir pulseguard-worker -Force; cd pulseguard-worker
+Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.yml" -OutFile docker-compose.worker.yml
+Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/liyanqing90/PulseGuard/codex/github-publish/docker-compose.worker.build.yml" -OutFile docker-compose.worker.build.yml
+$env:PULSEGUARD_WORKER_NAME = $env:COMPUTERNAME
+$env:PULSEGUARD_WORKER_REGION = "default"
+$env:PULSEGUARD_WORKER_BUILD_CONTEXT = "https://github.com/liyanqing90/PulseGuard.git#codex/github-publish"
+$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+docker compose -f docker-compose.worker.yml -f docker-compose.worker.build.yml up --build -d
+docker update --restart unless-stopped pulseguard-worker
+docker logs --tail 80 pulseguard-worker
+```
+
+源码构建时如需使用内网或国内镜像仓库，可以在构建前覆盖基础镜像：
+
+```powershell
+$env:PULSEGUARD_UV_IMAGE = "registry.example.com/astral-sh/uv:0.9.30"
+$env:PULSEGUARD_PLAYWRIGHT_IMAGE = "registry.example.com/playwright/python:v1.49.1-noble"
 ```
 
 Token 存储与刷新：
@@ -268,8 +337,10 @@ async def setup(ctx):
 - `GET /api/metrics`：Prometheus 指标
 - `GET /api/read-only/snapshot`：只读快照，需要配置只读令牌
 - `GET /api/runners` / `POST /api/runners`：执行节点列表和创建
+- `POST /api/runners/{runner_id}/update` / `GET /api/runners/{runner_id}/update-status`：主节点向子节点推送受控镜像更新和查询更新状态
 - `POST /api/runners/heartbeat`：旧版 Runner 主动心跳兼容接口，新子节点默认不需要配置
 - `GET /api/worker/health` / `POST /api/worker/run`：子节点健康检查和执行入口
+- `POST /api/worker/update` / `GET /api/worker/update-status`：子节点受控更新入口，需要启用 updater profile
 - `GET /api/runs?runner_id=...`：按执行节点筛选运行记录
 - `GET /api/runs?run_group_id=...`：按一次多节点触发分组查看所有节点运行结果
 - `GET /api/runs-page?run_group_id=...`：分页查看同组运行结果
@@ -285,6 +356,7 @@ reports/                 截图、Trace、Response Body 和归档摘要
 docs/                    路线图和设计/功能文档
 Dockerfile               主节点生产镜像构建
 Dockerfile.worker        子节点独立 worker 镜像构建
+Dockerfile.worker-updater 子节点 updater 镜像构建
 docker-compose.yml       主节点单实例部署
 docker-compose.worker.yml 子节点 worker 部署
 pyproject.toml           后端依赖定义

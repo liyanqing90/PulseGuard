@@ -1,6 +1,6 @@
 services:
   pulseguard-worker:
-    image: ${PULSEGUARD_WORKER_IMAGE:-pulseguard-worker:latest}
+    image: ${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
     container_name: pulseguard-worker
     restart: unless-stopped
     ports:
@@ -17,8 +17,33 @@ services:
       - PULSEGUARD_DATA_DIR=/app/data
       - PULSEGUARD_REPORTS_DIR=/app/reports
       - PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
+      - PULSEGUARD_WORKER_IMAGE=${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_UPDATE_IMAGE=${PULSEGUARD_WORKER_UPDATE_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_UPDATER_URL=${PULSEGUARD_WORKER_UPDATER_URL:-}
     mem_limit: 1g
     cpus: 1.0
+
+  pulseguard-worker-updater:
+    image: ${PULSEGUARD_WORKER_UPDATER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker-updater:codex-github-publish}
+    container_name: pulseguard-worker-updater
+    restart: unless-stopped
+    profiles:
+      - updater
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-compose.worker.yml:/workspace/docker-compose.worker.yml:ro
+      - pulseguard-worker-data:/app/data
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-pulseguard-worker}
+      - PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
+      - PULSEGUARD_WORKER_COMPOSE_FILE=/workspace/docker-compose.worker.yml
+      - PULSEGUARD_WORKER_SERVICE=pulseguard-worker
+      - PULSEGUARD_WORKER_CONTAINER=pulseguard-worker
+      - PULSEGUARD_WORKER_IMAGE=${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_UPDATE_IMAGE=${PULSEGUARD_WORKER_UPDATE_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES=${PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES:-ghcr.io/liyanqing90/pulseguard-worker}
+      - PULSEGUARD_WORKER_HEALTH_URL=http://pulseguard-worker:${PULSEGUARD_PORT:-8788}/api/worker/health
 
 volumes:
   pulseguard-worker-data:

@@ -36,10 +36,12 @@ interface RunGroupSummary {
 interface Props {
   run: Run | null;
   mode?: RunResultMode;
+  showGroupResults?: boolean;
 }
 
-export function RunResultPanel({ run, mode = "detail" }: Props) {
+export function RunResultPanel({ run, mode = "detail", showGroupResults = true }: Props) {
   const [activeTab, setActiveTab] = useState("overview");
+  const [activeGroupRunId, setActiveGroupRunId] = useState<number | null>(null);
   const [comparison, setComparison] = useState<RunComparison | null>(null);
   const [comparisonLoading, setComparisonLoading] = useState(false);
   const [comparisonError, setComparisonError] = useState<string | null>(null);
@@ -123,10 +125,11 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
   }, [run?.id, showFailureSummary]);
 
   useEffect(() => {
-    if (!run?.run_group_id || mode !== "detail") {
+    if (!showGroupResults || !run?.run_group_id || mode !== "detail") {
       setGroupRuns([]);
       setGroupError(null);
       setGroupLoading(false);
+      setActiveGroupRunId(null);
       return;
     }
     let cancelled = false;
@@ -149,7 +152,18 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [mode, run?.id, run?.run_group_id]);
+  }, [mode, run?.id, run?.run_group_id, showGroupResults]);
+
+  useEffect(() => {
+    if (!groupRuns.length) {
+      setActiveGroupRunId(null);
+      return;
+    }
+    setActiveGroupRunId((current) => {
+      if (current && groupRuns.some((item) => item.id === current)) return current;
+      return groupRuns.find((item) => item.id === run?.id)?.id ?? groupRuns[0].id;
+    });
+  }, [groupRuns, run?.id]);
 
   if (!run) {
     return <Empty description={false} />;
@@ -189,9 +203,16 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
           <Descriptions.Item label="浏览器版本">{run.runner_browser_version || "-"}</Descriptions.Item>
         </Descriptions>
       </DetailSection>
-      {run.run_group_id && (
+      {showGroupResults && run.run_group_id && (
         <DetailSection title="多节点执行结果" extra={<RunGroupSummaryTag summary={groupSummary} />}>
-          <RunGroupPanel currentRunId={run.id} runs={groupRuns} loading={groupLoading} error={groupError} />
+          <RunGroupPanel
+            activeRunId={activeGroupRunId}
+            currentRunId={run.id}
+            runs={groupRuns}
+            loading={groupLoading}
+            error={groupError}
+            onSelectRun={setActiveGroupRunId}
+          />
         </DetailSection>
       )}
       {showMergedAssertions && (
@@ -523,20 +544,25 @@ function RunGroupSummaryTag({ summary }: { summary: RunGroupSummary }) {
 }
 
 function RunGroupPanel({
+  activeRunId,
   currentRunId,
   error,
   loading,
+  onSelectRun,
   runs
 }: {
+  activeRunId: number | null;
   currentRunId: number;
   error: string | null;
   loading: boolean;
+  onSelectRun: (runId: number) => void;
   runs: Run[];
 }) {
   if (loading) return <Skeleton active paragraph={{ rows: 4 }} />;
   if (error) return <Alert type="error" message="节点执行结果加载失败" description={error} showIcon />;
   if (!runs.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无节点执行结果" />;
 
+  const selectedRun = runs.find((item) => item.id === activeRunId) ?? runs.find((item) => item.id === currentRunId) ?? runs[0];
   const columns: ColumnsType<Run> = [
     {
       title: "执行节点",
@@ -599,25 +625,49 @@ function RunGroupPanel({
       width: 86,
       align: "center",
       render: (_, item) =>
-        item.id === currentRunId ? (
-          <Tag color="blue">当前</Tag>
+        item.id === selectedRun.id ? (
+          <Tag color="blue">已选中</Tag>
         ) : (
-          <Button size="small" href={`/runs/${item.id}`}>
-            打开
+          <Button size="small" onClick={() => onSelectRun(item.id)}>
+            查看
           </Button>
         )
     }
   ];
 
   return (
-    <Table
-      rowKey="id"
-      size="small"
-      pagination={false}
-      columns={columns}
-      dataSource={runs}
-      scroll={{ x: 1080 }}
-    />
+    <Space orientation="vertical" size={12} className="drawer-stack">
+      <Table
+        rowKey="id"
+        size="small"
+        pagination={false}
+        columns={columns}
+        dataSource={runs}
+        scroll={{ x: 1080 }}
+      />
+      <Tabs
+        activeKey={String(selectedRun.id)}
+        className="run-group-detail-tabs"
+        destroyOnHidden
+        moreIcon={<span className="tabs-more-label">更多</span>}
+        onChange={(key) => onSelectRun(Number(key))}
+        items={runs.map((item) => ({
+          key: String(item.id),
+          label: <RunGroupTabLabel current={item.id === currentRunId} run={item} />,
+          children: item.id === selectedRun.id ? <RunResultPanel run={item} mode="detail" showGroupResults={false} /> : null
+        }))}
+      />
+    </Space>
+  );
+}
+
+function RunGroupTabLabel({ current, run }: { current: boolean; run: Run }) {
+  return (
+    <span className="run-group-node-tab">
+      <RunStatusTag status={run.status} />
+      <span>{runnerSummary(run)}</span>
+      {current && <Tag color="blue">当前</Tag>}
+    </span>
   );
 }
 
