@@ -25,6 +25,14 @@ interface StageTiming {
   value: number;
 }
 
+interface RunGroupSummary {
+  total: number;
+  ok: number;
+  targetFailures: number;
+  runnerFailures: number;
+  running: number;
+}
+
 interface Props {
   run: Run | null;
   mode?: RunResultMode;
@@ -38,11 +46,15 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
   const [failureSummary, setFailureSummary] = useState<RunFailureSummary | null>(null);
   const [failureSummaryLoading, setFailureSummaryLoading] = useState(false);
   const [failureSummaryError, setFailureSummaryError] = useState<string | null>(null);
+  const [groupRuns, setGroupRuns] = useState<Run[]>([]);
+  const [groupLoading, setGroupLoading] = useState(false);
+  const [groupError, setGroupError] = useState<string | null>(null);
   const requestSnapshot = useMemo(() => parseSnapshot(run?.request_snapshot), [run?.request_snapshot]);
   const responseSnapshot = useMemo(() => parseSnapshot(run?.response_snapshot), [run?.response_snapshot]);
   const responseBody = useMemo(() => extractResponseBody(responseSnapshot), [responseSnapshot]);
   const assertionResults = useMemo(() => extractAssertionResults(responseSnapshot), [responseSnapshot]);
   const stageTimings = useMemo(() => extractStageTimings(responseSnapshot, run?.check_type), [responseSnapshot, run?.check_type]);
+  const groupSummary = useMemo(() => summarizeRunGroup(groupRuns), [groupRuns]);
   const showComparison = Boolean(run && mode === "detail" && run.check_id > 0 && ["failed", "timeout"].includes(run.status));
   const showFailureSummary = Boolean(run && mode === "detail" && run.check_id > 0 && ["failed", "timeout", "skipped"].includes(run.status));
   const showDiagnostics = mode === "debug";
@@ -110,6 +122,35 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
     };
   }, [run?.id, showFailureSummary]);
 
+  useEffect(() => {
+    if (!run?.run_group_id || mode !== "detail") {
+      setGroupRuns([]);
+      setGroupError(null);
+      setGroupLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setGroupLoading(true);
+    setGroupError(null);
+    api
+      .runs({ run_group_id: run.run_group_id, limit: 500 })
+      .then((runs) => {
+        if (!cancelled) setGroupRuns(sortGroupRuns(runs, run.id));
+      })
+      .catch((err: Error) => {
+        if (!cancelled) {
+          setGroupRuns([]);
+          setGroupError(err.message);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setGroupLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, run?.id, run?.run_group_id]);
+
   if (!run) {
     return <Empty description={false} />;
   }
@@ -127,6 +168,7 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
           <Descriptions.Item label="任务 ID">{isDraftRun ? "草稿调试" : run.check_id}</Descriptions.Item>
           <Descriptions.Item label="任务名称">{run.check_name}</Descriptions.Item>
           <Descriptions.Item label="运行记录">#{run.id}</Descriptions.Item>
+          <Descriptions.Item label="运行分组">{run.run_group_id || "-"}</Descriptions.Item>
           <Descriptions.Item label="开始时间">{formatDate(run.started_at)}</Descriptions.Item>
           <Descriptions.Item label="结束时间">{formatDate(run.finished_at)}</Descriptions.Item>
           <Descriptions.Item label="耗时">{formatDuration(run.duration_ms)}</Descriptions.Item>
@@ -138,11 +180,17 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
           <Descriptions.Item label="连续失败">{run.consecutive_failures || "-"}</Descriptions.Item>
           <Descriptions.Item label="失败来源">{failureKindTag(run.failure_kind)}</Descriptions.Item>
           <Descriptions.Item label="Runner">{runnerSummary(run)}</Descriptions.Item>
+          <Descriptions.Item label="Runner ID">{run.runner_id || "local"}</Descriptions.Item>
           <Descriptions.Item label="Runner 地址">{run.runner_address || "-"}</Descriptions.Item>
           <Descriptions.Item label="网络区域">{run.runner_region || "-"}</Descriptions.Item>
           <Descriptions.Item label="浏览器版本">{run.runner_browser_version || "-"}</Descriptions.Item>
         </Descriptions>
       </DetailSection>
+      {run.run_group_id && (
+        <DetailSection title="多节点执行结果" extra={<RunGroupSummaryTag summary={groupSummary} />}>
+          <RunGroupPanel currentRunId={run.id} runs={groupRuns} loading={groupLoading} error={groupError} />
+        </DetailSection>
+      )}
       {showMergedAssertions && (
         <DetailSection title="校验结果" extra={<AssertionSummaryTag results={assertionResults} />}>
           <AssertionResultsPanel results={assertionResults} />
@@ -462,6 +510,124 @@ function AssertionSummaryTag({ results }: { results: AssertionResult[] }) {
   return <Tag color={failed ? "error" : "success"}>{results.length - failed} 通过 / {failed} 失败</Tag>;
 }
 
+function RunGroupSummaryTag({ summary }: { summary: RunGroupSummary }) {
+  if (!summary.total) return <Tag>加载中</Tag>;
+  if (summary.running) return <Tag color="processing">{summary.running} 执行中 / {summary.total}</Tag>;
+  if (summary.targetFailures) return <Tag color="error">{summary.targetFailures} 目标失败 / {summary.total}</Tag>;
+  if (summary.runnerFailures) return <Tag color="warning">{summary.runnerFailures} 节点异常 / {summary.total}</Tag>;
+  return <Tag color="success">{summary.ok} 成功 / {summary.total}</Tag>;
+}
+
+function RunGroupPanel({
+  currentRunId,
+  error,
+  loading,
+  runs
+}: {
+  currentRunId: number;
+  error: string | null;
+  loading: boolean;
+  runs: Run[];
+}) {
+  if (loading) return <Skeleton active paragraph={{ rows: 4 }} />;
+  if (error) return <Alert type="error" message="节点执行结果加载失败" description={error} showIcon />;
+  if (!runs.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无节点执行结果" />;
+
+  const columns: ColumnsType<Run> = [
+    {
+      title: "执行节点",
+      dataIndex: "runner_name",
+      width: 190,
+      render: (_, item) => (
+        <div className="assertion-result-rule">
+          <strong>{runnerSummary(item)}</strong>
+          <span>{item.runner_id || "local"}</span>
+        </div>
+      )
+    },
+    {
+      title: "状态",
+      dataIndex: "status",
+      width: 88,
+      align: "center",
+      render: (_, item) => <RunStatusTag status={item.status} />
+    },
+    {
+      title: "失败来源",
+      dataIndex: "failure_kind",
+      width: 120,
+      align: "center",
+      render: (_, item) => failureKindTag(item.failure_kind)
+    },
+    {
+      title: "耗时",
+      dataIndex: "duration_ms",
+      width: 96,
+      render: (value: number | null | undefined) => formatDuration(value)
+    },
+    {
+      title: "结束时间",
+      dataIndex: "finished_at",
+      width: 156,
+      render: (value: string | null | undefined) => formatDate(value)
+    },
+    {
+      title: "结果摘要",
+      dataIndex: "error_message",
+      render: (_, item) => runnerResultMessage(item)
+    },
+    {
+      title: "证据",
+      key: "artifacts",
+      width: 150,
+      render: (_, item) => <RunnerEvidenceLinks run={item} />
+    },
+    {
+      title: "详情",
+      key: "detail",
+      width: 86,
+      align: "center",
+      render: (_, item) =>
+        item.id === currentRunId ? (
+          <Tag color="blue">当前</Tag>
+        ) : (
+          <Button size="small" href={`/runs/${item.id}`}>
+            打开
+          </Button>
+        )
+    }
+  ];
+
+  return (
+    <Table
+      rowKey="id"
+      size="small"
+      pagination={false}
+      columns={columns}
+      dataSource={runs}
+      scroll={{ x: 1080 }}
+    />
+  );
+}
+
+function RunnerEvidenceLinks({ run }: { run: Run }) {
+  const links = [
+    { key: "screenshot", label: "截图", href: artifactHref(run.screenshot_path) },
+    { key: "trace", label: "Trace", href: artifactHref(run.trace_path) },
+    { key: "response", label: "响应", href: artifactHref(run.response_path) }
+  ].filter((item) => item.href);
+  if (!links.length) return <Tag>无</Tag>;
+  return (
+    <Space size={4} wrap>
+      {links.map((item) => (
+        <Button key={item.key} size="small" href={item.href || undefined} target="_blank">
+          {item.label}
+        </Button>
+      ))}
+    </Space>
+  );
+}
+
 function AssertionResultsPanel({ results }: { results: AssertionResult[] }) {
   if (!results.length) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={false} />;
@@ -743,6 +909,36 @@ function assertionStatusColor(value?: string | null): string {
   return "error";
 }
 
+function sortGroupRuns(runs: Run[], currentRunId: number): Run[] {
+  return [...runs].sort((left, right) => {
+    if (left.id === currentRunId) return -1;
+    if (right.id === currentRunId) return 1;
+    return left.id - right.id;
+  });
+}
+
+function summarizeRunGroup(runs: Run[]): RunGroupSummary {
+  return runs.reduce<RunGroupSummary>(
+    (summary, run) => {
+      summary.total += 1;
+      if (run.status === "ok") summary.ok += 1;
+      if (["running", "pending"].includes(run.status)) summary.running += 1;
+      if (run.failure_kind === "target" && ["failed", "timeout"].includes(run.status)) summary.targetFailures += 1;
+      if (run.failure_kind === "runner" || (run.status === "skipped" && run.failure_kind !== "target")) summary.runnerFailures += 1;
+      return summary;
+    },
+    { total: 0, ok: 0, targetFailures: 0, runnerFailures: 0, running: 0 }
+  );
+}
+
+function runnerResultMessage(run: Run): string {
+  if (run.error_message) return run.error_message;
+  if (run.status === "ok") return "执行成功";
+  if (run.status === "running" || run.status === "pending") return "等待完成";
+  if (run.logs) return run.logs.split("\n").find((line) => line.trim()) || "-";
+  return "-";
+}
+
 function runnerSummary(run: Run): string {
   const name = (run.runner_name || "local").trim();
   const region = (run.runner_region || "").trim();
@@ -752,7 +948,7 @@ function runnerSummary(run: Run): string {
 function failureKindTag(value?: string | null) {
   if (value === "target") return <Tag color="red">目标页面/API</Tag>;
   if (value === "runner") return <Tag color="orange">执行环境</Tag>;
-  return <Tag>未记录</Tag>;
+  return <Tag>无</Tag>;
 }
 
 function defaultRunTab(run: Run | null, mode: RunResultMode, responseSnapshot: unknown, assertionCount: number): string {

@@ -14,7 +14,7 @@ import {
   batchRunNotificationType,
   summarizeBatchRuns
 } from "../components/BatchRunAlert";
-import type { Check, CheckBatchAction, CheckType, Run, TaskSurfaceStatus } from "../types";
+import type { Check, CheckBatchAction, CheckType, ProbeRunner, Run, TaskSurfaceStatus } from "../types";
 import { compactUrl, formatDate, formatDuration, intervalLabel, taskStatus, taskStatusLabel, taskStatusTagColor } from "../utils";
 
 type EnabledFilter = "" | "enabled" | "disabled";
@@ -57,6 +57,8 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const [statusFilter, setStatusFilter] = useState<TaskSurfaceStatus | "">("");
   const [enabledFilter, setEnabledFilter] = useState<EnabledFilter>("");
   const [tagFilter, setTagFilter] = useState("");
+  const [runnerFilter, setRunnerFilter] = useState("");
+  const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [batchIntervalSeconds, setBatchIntervalSeconds] = useState(300);
   const [isCompactList, setIsCompactList] = useState(() => window.matchMedia("(max-width: 720px)").matches);
   const navigate = useNavigate();
@@ -80,6 +82,10 @@ export function ChecksPage({ type }: { type: CheckType }) {
   }, [type]);
 
   useEffect(() => {
+    api.runners().then(setRunners).catch(() => setRunners([]));
+  }, []);
+
+  useEffect(() => {
     const media = window.matchMedia("(max-width: 720px)");
     const sync = () => setIsCompactList(media.matches);
     sync();
@@ -89,6 +95,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLowerCase();
+    const runnerFilterNode = runnerFilter ? runners.find((runner) => runner.runner_id === runnerFilter) : undefined;
     return checks.filter((check) => {
       const matchesKeyword =
         !keyword || [check.name, check.entry_url, check.tags].some((value) => (value || "").toLowerCase().includes(keyword));
@@ -97,10 +104,14 @@ export function ChecksPage({ type }: { type: CheckType }) {
       const matchesEnabled =
         !enabledFilter || (enabledFilter === "enabled" ? check.enabled : !check.enabled);
       const matchesTag = !tagFilter || checkTagTokens(check.tags).includes(tagFilter);
+      const matchesRunner =
+        !runnerFilter ||
+        (check.runner_selection_mode === "round_robin_all" && Boolean(runnerFilterNode?.enabled)) ||
+        (check.runner_ids?.length ? check.runner_ids : ["local"]).includes(runnerFilter);
       const matchesFocused = !focusedCheckId || String(check.id) === focusedCheckId;
-      return matchesKeyword && matchesStatus && matchesEnabled && matchesTag && matchesFocused;
+      return matchesKeyword && matchesStatus && matchesEnabled && matchesTag && matchesRunner && matchesFocused;
     });
-  }, [checks, enabledFilter, focusedCheckId, query, statusFilter, tagFilter]);
+  }, [checks, enabledFilter, focusedCheckId, query, runnerFilter, runners, statusFilter, tagFilter]);
 
   const tagOptions = useMemo(() => {
     const tags = new Set<string>();
@@ -137,7 +148,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
     };
   }, [checks, filtered.length]);
 
-  const hasFilters = Boolean(query || statusFilter || enabledFilter || tagFilter || focusedCheckId);
+  const hasFilters = Boolean(query || statusFilter || enabledFilter || tagFilter || runnerFilter || focusedCheckId);
   const batchTargetCount = batchTargetChecks.length;
   const batchTargetText = tagFilter ? `标签「${tagFilter}」` : `全部${type === "ui" ? " UI" : "接口"}任务`;
   const batchActionItems: MenuProps["items"] = [
@@ -325,6 +336,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
     setStatusFilter("");
     setEnabledFilter("");
     setTagFilter("");
+    setRunnerFilter("");
     clearTaskFocus();
   }
 
@@ -356,6 +368,11 @@ export function ChecksPage({ type }: { type: CheckType }) {
       dataIndex: "entry_url",
       ellipsis: true,
       render: (value: string) => <span title={value}>{compactUrl(value)}</span>
+    },
+    {
+      title: "执行节点",
+      width: 150,
+      render: (_, check) => <Tag>{runnerStrategyLabel(check, runners)}</Tag>
     },
     { title: "状态", className: "check-status-cell", render: (_, check) => <TaskStatusTag check={check} />, width: 105 },
     {
@@ -506,6 +523,16 @@ export function ChecksPage({ type }: { type: CheckType }) {
             options={[{ label: "全部标签", value: "" }, ...tagOptions]}
             aria-label="按标签筛选任务"
           />
+          <Select
+            value={runnerFilter}
+            className="checks-filter-control"
+            onChange={(value) => setRunnerFilter(value)}
+            options={[
+              { label: "全部节点", value: "" },
+              ...runners.map((runner) => ({ label: runner.name || runner.runner_id, value: runner.runner_id }))
+            ]}
+            aria-label="按执行节点筛选任务"
+          />
         </div>
         <Space wrap>
           <Button icon={<FilterX size={16} />} onClick={resetFilters} disabled={!hasFilters}>
@@ -554,6 +581,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
         {statusFilter && <Tag>{taskStatusLabel(statusFilter)}</Tag>}
         {enabledFilter && <Tag>{enabledFilter === "enabled" ? "已启用" : "已禁用"}</Tag>}
         {tagFilter && <Tag>标签：{tagFilter}</Tag>}
+        {runnerFilter && <Tag>执行节点：{runnerName(runnerFilter, runners)}</Tag>}
         {focusedCheckId && (
           <Tag
             closable
@@ -574,6 +602,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
           checks={filtered}
           hasFilters={hasFilters}
           loading={loading}
+          runners={runners}
           type={type}
           onCreate={openCreateDrawer}
           onDelete={confirmRemove}
@@ -604,7 +633,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
             )
           }}
           className="checks-table"
-          scroll={{ x: type === "api" ? 1220 : 1120 }}
+          scroll={{ x: type === "api" ? 1370 : 1270 }}
         />
       )}
 
@@ -637,6 +666,7 @@ interface CompactCheckListProps {
   duplicatingId: number | null;
   hasFilters: boolean;
   loading: boolean;
+  runners: ProbeRunner[];
   type: CheckType;
   onCreate: () => void;
   onDelete: (check: Check) => void;
@@ -655,6 +685,7 @@ function CompactCheckList({
   duplicatingId,
   hasFilters,
   loading,
+  runners,
   type,
   onCreate,
   onDelete,
@@ -732,6 +763,7 @@ function CompactCheckList({
 
             <div className="check-card-meta">
               <CheckMeta label="定时" value={intervalLabel(check.interval_seconds)} />
+              <CheckMeta label="执行节点" value={runnerStrategyLabel(check, runners)} />
               <CheckMeta label="最近执行" value={formatDate(check.last_run_at)} />
               <CheckMeta label="耗时" value={formatDuration(check.last_duration_ms)} />
               <CheckMeta label="连续失败" value={check.consecutive_failures || "-"} />
@@ -796,6 +828,18 @@ function TagLine({ tags }: { tags: string }) {
       ))}
     </div>
   );
+}
+
+function runnerStrategyLabel(check: Check, runners: ProbeRunner[]): string {
+  if (check.runner_selection_mode === "round_robin_all") return "轮询所有启用节点";
+  const ids = check.runner_ids?.length ? check.runner_ids : ["local"];
+  const labels = ids.map((id) => runnerName(id, runners));
+  if (labels.length <= 2) return labels.join("、");
+  return `${labels.slice(0, 2).join("、")} 等 ${labels.length} 个`;
+}
+
+function runnerName(runnerId: string, runners: ProbeRunner[]): string {
+  return runners.find((runner) => runner.runner_id === runnerId)?.name || runnerId;
 }
 
 function checkTagTokens(tags: string | null | undefined, normalize = true): string[] {

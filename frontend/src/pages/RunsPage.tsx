@@ -8,7 +8,7 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } fro
 import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import type { CheckType, NotificationStatus, ObservationKind, Run, RunStatus } from "../types";
+import type { CheckType, NotificationStatus, ObservationKind, ProbeRunner, Run, RunStatus } from "../types";
 import { formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, notificationStatusTagColor, runStatusLabel, runStatusTagColor } from "../utils";
 
 const { RangePicker } = DatePicker;
@@ -89,6 +89,8 @@ export function RunsPage() {
   const [observationKind, setObservationKind] = useState<ObservationKind | "">(
     () => (searchParams.get("observation_kind") as ObservationKind | null) || ""
   );
+  const [runnerId, setRunnerId] = useState(() => searchParams.get("runner_id") || "");
+  const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [q, setQ] = useState(() => searchParams.get("q") || "");
   const [dateRange, setDateRange] = useState<[Dayjs | null, Dayjs | null] | null>(() => parseDateRangeParams(searchParams));
   const [error, setError] = useState<string | null>(null);
@@ -101,7 +103,7 @@ export function RunsPage() {
   const [total, setTotal] = useState(0);
   const checkId = searchParams.get("check_id");
   const normalizedQ = q.trim();
-  const hasFilters = Boolean(type || status || notificationStatus || observationKind || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
+  const hasFilters = Boolean(type || status || notificationStatus || observationKind || runnerId || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
   const scopedCheckName = checkId ? runs.find((run) => String(run.check_id) === checkId)?.check_name : null;
 
   async function load() {
@@ -114,6 +116,7 @@ export function RunsPage() {
           observation_kind: observationKind,
           q: normalizedQ,
           check_id: checkId,
+          runner_id: runnerId,
           start: dateRange?.[0]?.startOf("day").toISOString(),
           end: dateRange?.[1]?.endOf("day").toISOString(),
           page,
@@ -134,6 +137,7 @@ export function RunsPage() {
     const nextStatus = parseRunStatusParam(searchParams.get("status"));
     const nextNotificationStatus = parseNotificationStatusParam(searchParams.get("notification_status"));
     const nextObservationKind = (searchParams.get("observation_kind") as ObservationKind | null) || "";
+    const nextRunnerId = searchParams.get("runner_id") || "";
     const nextQ = searchParams.get("q") || "";
     const nextDateRange = parseDateRangeParams(searchParams);
 
@@ -141,6 +145,7 @@ export function RunsPage() {
     if (status !== nextStatus) setStatus(nextStatus);
     if (notificationStatus !== nextNotificationStatus) setNotificationStatus(nextNotificationStatus);
     if (observationKind !== nextObservationKind) setObservationKind(nextObservationKind);
+    if (runnerId !== nextRunnerId) setRunnerId(nextRunnerId);
     if (q !== nextQ) setQ(nextQ);
     if (!sameDateRange(dateRange, nextDateRange)) setDateRange(nextDateRange);
   }, [searchParams]);
@@ -151,6 +156,7 @@ export function RunsPage() {
     if (status) next.set("status", status);
     if (notificationStatus) next.set("notification_status", notificationStatus);
     if (observationKind) next.set("observation_kind", observationKind);
+    if (runnerId) next.set("runner_id", runnerId);
     if (normalizedQ) next.set("q", normalizedQ);
     if (dateRange?.[0]) next.set("start", dateRange[0].format("YYYY-MM-DD"));
     if (dateRange?.[1]) next.set("end", dateRange[1].format("YYYY-MM-DD"));
@@ -159,15 +165,19 @@ export function RunsPage() {
     if (next.toString() !== searchParams.toString()) {
       setSearchParams(next, { replace: true });
     }
-  }, [checkId, dateRange, normalizedQ, notificationStatus, observationKind, searchParams, setSearchParams, status, type]);
+  }, [checkId, dateRange, normalizedQ, notificationStatus, observationKind, runnerId, searchParams, setSearchParams, status, type]);
 
   useEffect(() => {
     load();
-  }, [type, status, notificationStatus, observationKind, normalizedQ, dateRange, checkId, page]);
+  }, [type, status, notificationStatus, observationKind, runnerId, normalizedQ, dateRange, checkId, page]);
 
   useEffect(() => {
     setPage(1);
-  }, [type, status, notificationStatus, observationKind, normalizedQ, dateRange, checkId]);
+  }, [type, status, notificationStatus, observationKind, runnerId, normalizedQ, dateRange, checkId]);
+
+  useEffect(() => {
+    api.runners().then(setRunners).catch(() => setRunners([]));
+  }, []);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 820px)");
@@ -207,6 +217,7 @@ export function RunsPage() {
     setStatus("");
     setNotificationStatus("");
     setObservationKind("");
+    setRunnerId("");
     setQ("");
     setDateRange(null);
     setSearchParams(new URLSearchParams(), { replace: true });
@@ -244,6 +255,16 @@ export function RunsPage() {
             <span className="history-runner-meta">{runnerSummary(run)}</span>
           </Tooltip>
         </Space>
+      )
+    },
+    {
+      title: "执行节点",
+      dataIndex: "runner_id",
+      width: 150,
+      render: (_, run) => (
+        <Tooltip title={runnerTooltip(run)}>
+          <Tag>{run.runner_name || run.runner_id || "local"}</Tag>
+        </Tooltip>
       )
     },
     { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 92, align: "center" },
@@ -341,6 +362,15 @@ export function RunsPage() {
             onChange={(value) => setObservationKind(value)}
             options={OBSERVATION_KIND_OPTIONS}
           />
+          <Select
+            value={runnerId}
+            className="history-filter-control"
+            onChange={(value) => setRunnerId(value)}
+            options={[
+              { label: "全部节点", value: "" },
+              ...runners.map((runner) => ({ label: runner.name || runner.runner_id, value: runner.runner_id }))
+            ]}
+          />
           <RangePicker
             value={dateRange}
             onChange={(value) => setDateRange(value)}
@@ -375,6 +405,7 @@ export function RunsPage() {
         {status && <Tag>{runStatusFilterLabel(status)}</Tag>}
         {notificationStatus && <Tag>告警：{notificationStatusMeta(notificationStatus).label}</Tag>}
         {observationKind && <Tag>来源：{observationKindLabel(observationKind)}</Tag>}
+        {runnerId && <Tag>执行节点：{runnerLabel(runnerId, runners)}</Tag>}
         {checkId && (
           <Tag
             closable
@@ -544,6 +575,10 @@ function runnerSummary(run: Run): string {
   const name = (run.runner_name || "local").trim();
   const region = (run.runner_region || "").trim();
   return region && region !== name ? `${name} · ${region}` : name;
+}
+
+function runnerLabel(runnerId: string, runners: ProbeRunner[]): string {
+  return runners.find((runner) => runner.runner_id === runnerId)?.name || runnerId;
 }
 
 function runnerTooltip(run: Run): string {

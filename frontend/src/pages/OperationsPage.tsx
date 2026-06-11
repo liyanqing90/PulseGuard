@@ -244,6 +244,23 @@ export function OperationsPage() {
       render: (value: string) => <Tag>{value || "local"}</Tag>
     },
     {
+      title: "启用",
+      dataIndex: "enabled",
+      width: 92,
+      render: (value: boolean) => <Tag color={value ? "success" : "default"}>{value ? "已启用" : "已停用"}</Tag>
+    },
+    {
+      title: "可用",
+      dataIndex: "available",
+      width: 92,
+      render: (value: boolean) => <Tag color={value ? "success" : "error"}>{value ? "可用" : "不可用"}</Tag>
+    },
+    {
+      title: "关联任务",
+      width: 100,
+      render: (_, runner) => assignedRunnerCount(runner, checks)
+    },
+    {
       title: "状态",
       dataIndex: "status",
       width: 110,
@@ -472,12 +489,23 @@ function checkVersionDetail(version: CheckVersion): Record<string, unknown> {
   };
 }
 
+function assignedRunnerCount(runner: ProbeRunner, checks: Check[]): number {
+  return checks.filter((check) => {
+    if (check.runner_selection_mode === "round_robin_all") return runner.enabled;
+    const ids = check.runner_ids?.length ? check.runner_ids : ["local"];
+    return ids.includes(runner.runner_id);
+  }).length;
+}
+
 function runnerDetail(runner: ProbeRunner): Record<string, unknown> {
   return {
     Runner: runner.name || runner.runner_id,
     RunnerID: runner.runner_id,
     地址: runner.address || "-",
     网络区域: runner.network_region || "local",
+    角色: runner.role === "local" ? "本机" : "子节点",
+    启用状态: runner.enabled ? "已启用" : "已停用",
+    可用状态: runner.available ? "可用" : "不可用",
     状态: runnerStatusLabel(runner.status),
     浏览器: runner.browser_version || "-",
     最后心跳: formatDate(runner.last_seen_at),

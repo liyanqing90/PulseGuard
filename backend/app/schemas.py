@@ -14,6 +14,7 @@ from .variables import VARIABLE_NAME_PATTERN
 
 
 CheckType = Literal["ui", "api"]
+RunnerSelectionMode = Literal["selected_parallel", "round_robin_all"]
 RunStatus = Literal["pending", "running", "ok", "failed", "timeout", "skipped"]
 NotificationStatus = Literal["disabled", "not_required", "suppressed", "sent", "failed"]
 NOTIFICATION_STATUSES = {"disabled", "not_required", "suppressed", "sent", "failed"}
@@ -35,6 +36,8 @@ class CheckBase(BaseModel):
     script: str | None = ""
     tags: str | None = ""
     alert_policy_json: str | None = "{}"
+    runner_selection_mode: RunnerSelectionMode = "selected_parallel"
+    runner_ids: list[str] = Field(default_factory=lambda: ["local"])
 
     @field_validator("script")
     @classmethod
@@ -90,6 +93,23 @@ class CheckBase(BaseModel):
         if not isinstance(parsed, dict):
             raise ValueError("告警策略必须是 JSON Object")
         return json.dumps(_alert_policy(parsed), ensure_ascii=False)
+
+    @field_validator("runner_ids")
+    @classmethod
+    def runner_ids_must_be_unique(cls, value: list[str] | None) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in value or []:
+            runner_id = str(raw or "").strip()
+            if not runner_id:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}", runner_id):
+                raise ValueError("Runner ID 格式无效")
+            if runner_id in seen:
+                continue
+            seen.add(runner_id)
+            result.append(runner_id)
+        return result or ["local"]
 
     @model_validator(mode="after")
     def normalize_method(self) -> "CheckBase":
@@ -336,6 +356,23 @@ class RunnerHeartbeatRequest(BaseModel):
     browser_version: str = Field(default="", max_length=120)
     status: Literal["ok", "warning", "offline"] = "ok"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProbeRunnerCreate(BaseModel):
+    runner_id: str | None = Field(default=None, max_length=120)
+    name: str = Field(min_length=1, max_length=120)
+    address: str = Field(min_length=1, max_length=2048)
+    network_region: str = Field(default="local", max_length=120)
+    enabled: bool = True
+    token: str = Field(min_length=1, max_length=4096)
+
+
+class ProbeRunnerUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    address: str | None = Field(default=None, max_length=2048)
+    network_region: str | None = Field(default=None, max_length=120)
+    enabled: bool | None = None
+    token: str | None = Field(default=None, max_length=4096)
 
 
 class ReadOnlyTokenCreate(BaseModel):

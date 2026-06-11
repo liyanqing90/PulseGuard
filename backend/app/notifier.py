@@ -95,6 +95,29 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
     storage.update_last_notified(int(check["id"]), sent_at)
 
 
+async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[str, Any]]) -> None:
+    settings = storage.get_settings()
+    if not settings.get("alerts_enabled"):
+        storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
+        return
+    channels = _notification_channels(settings, enabled_only=True, require_webhook=True)
+    if not channels:
+        storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
+        return
+    title = "PulseGuard 执行节点不可用"
+    text = _format_runner_unavailable_message(runner, checks)
+    failures: list[tuple[str, Exception]] = []
+    sent_channels: list[dict[str, Any]] = []
+    for channel in channels:
+        try:
+            await _send_with_retry(channel, title, text, int(settings.get("alert_delivery_attempts", 1)))
+        except Exception as exc:
+            failures.append((_channel_display_name(channel), exc))
+        else:
+            sent_channels.append(channel)
+    storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
+
+
 def _record_notification(
     run: dict[str, Any],
     status: str,
@@ -543,6 +566,22 @@ def _format_message(
             ]
         )
     return title, "\n".join(lines)
+
+
+def _format_runner_unavailable_message(runner: dict[str, Any], checks: list[dict[str, Any]]) -> str:
+    affected = [str(check.get("name") or f"#{check.get('id')}") for check in checks[:5]]
+    lines = [
+        "#### PulseGuard 执行节点不可用",
+        "",
+        f"- Runner：{runner.get('name') or runner.get('runner_id')}",
+        f"- Runner ID：{runner.get('runner_id')}",
+        f"- 网络区域：{runner.get('network_region') or 'local'}",
+        f"- 地址：{runner.get('address') or '-'}",
+        f"- 最后心跳：{runner.get('last_seen_at') or '-'}",
+    ]
+    if affected:
+        lines.append(f"- 影响任务：{'、'.join(affected)}")
+    return "\n".join(lines)
 
 
 def _webhook_payload(

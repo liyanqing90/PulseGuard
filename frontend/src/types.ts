@@ -3,6 +3,8 @@ export type ViewportMode = "web" | "h5";
 export type RunStatus = "pending" | "running" | "ok" | "failed" | "timeout" | "skipped";
 export type NotificationStatus = "disabled" | "not_required" | "suppressed" | "sent" | "failed";
 export type FailureKind = "none" | "target" | "runner" | string;
+export type RunnerSelectionMode = "selected_parallel" | "round_robin_all";
+export type ProbeRunnerRole = "local" | "child" | string;
 export type TaskSurfaceStatus =
   | "healthy"
   | "suspected_failing"
@@ -187,6 +189,8 @@ export interface Check {
   script: string;
   tags: string;
   alert_policy_json: string;
+  runner_selection_mode: RunnerSelectionMode;
+  runner_ids: string[];
   created_at: string;
   updated_at: string;
   current_status?: TaskSurfaceStatus | null;
@@ -257,9 +261,27 @@ export interface ProbeRunner {
   network_region: string;
   browser_version: string;
   status: "ok" | "warning" | "offline" | string;
+  enabled: boolean;
+  role: ProbeRunnerRole;
+  available: boolean;
+  token_set?: boolean;
+  token_hint?: string;
+  unavailable_since?: string | null;
+  unavailable_notified_at?: string | null;
+  created_at?: string | null;
   metadata: Record<string, unknown>;
-  last_seen_at: string;
+  last_seen_at?: string | null;
   updated_at: string;
+  token?: string;
+}
+
+export interface ProbeRunnerPayload {
+  runner_id?: string;
+  name: string;
+  address: string;
+  network_region: string;
+  enabled?: boolean;
+  token?: string;
 }
 
 export interface StatusPageSnapshot {
@@ -323,6 +345,7 @@ export interface Run {
   response_path?: string | null;
   request_snapshot?: string | null;
   response_snapshot?: string | null;
+  runner_id?: string | null;
   runner_name?: string | null;
   runner_address?: string | null;
   runner_region?: string | null;
@@ -335,6 +358,7 @@ export interface Run {
   trigger: string;
   observation_kind: ObservationKind;
   affects_health: boolean;
+  run_group_id?: string | null;
   created_at: string;
   consecutive_failures?: number;
 }
@@ -499,6 +523,7 @@ export interface RuntimeStatus {
     next_due_at?: string | null;
     overdue_jobs: number;
   };
+  node_role?: "main" | "worker" | string;
 }
 
 export interface RunPage {
@@ -608,6 +633,7 @@ export interface ConfigImportSummary {
   ui_checks?: number;
   api_checks?: number;
   settings?: number;
+  runners?: number;
   conflicts?: number;
   notification_channels?: number;
   environment_variables?: number;

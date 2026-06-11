@@ -4,7 +4,7 @@ import asyncio
 import json
 import unittest
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -285,6 +285,77 @@ class HeartbeatRouteTests(unittest.TestCase):
 
 
 class RunnerRouteTests(unittest.TestCase):
+    def test_create_runner_stores_supplied_token_without_returning_secret(self) -> None:
+        runner = {
+            "runner_id": "office-1",
+            "name": "Office Runner",
+            "address": "http://10.0.0.8:8787",
+            "network_region": "office-lan",
+            "browser_version": "",
+            "status": "offline",
+            "enabled": True,
+            "role": "child",
+            "available": False,
+            "token_set": True,
+            "token_hint": "secret",
+            "token_value": "runner-token-secret",
+        }
+
+        with patch("backend.app.main.storage.create_probe_runner", return_value=runner) as create_probe_runner, patch(
+            "backend.app.main.storage.record_audit_event"
+        ) as record_audit_event, patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).post(
+                "/api/runners",
+                json={
+                    "name": "Office Runner",
+                    "address": "http://10.0.0.8:8787",
+                    "network_region": "office-lan",
+                    "token": "runner-token-secret",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertNotIn("token", payload)
+        self.assertNotIn("token_value", payload)
+        create_probe_runner.assert_called_once()
+        self.assertEqual(create_probe_runner.call_args.args[0]["role"], "child")
+        self.assertEqual(create_probe_runner.call_args.args[0]["token"], "runner-token-secret")
+        record_audit_event.assert_called_once()
+
+    def test_rotate_runner_token_returns_new_one_time_token_response(self) -> None:
+        runner = {
+            "runner_id": "office-1",
+            "name": "Office Runner",
+            "address": "http://10.0.0.8:8787",
+            "network_region": "office-lan",
+            "browser_version": "",
+            "status": "ok",
+            "enabled": True,
+            "role": "child",
+            "available": True,
+            "token_set": True,
+            "token_hint": "secret",
+            "token": "runner-token-secret-2",
+            "token_value": "runner-token-secret-2",
+        }
+
+        with patch("backend.app.main.storage.rotate_probe_runner_token", return_value=runner) as rotate_probe_runner_token, patch(
+            "backend.app.main.storage.record_audit_event"
+        ) as record_audit_event, patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).post("/api/runners/office-1/rotate-token")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["token"], "runner-token-secret-2")
+        self.assertNotIn("token_value", payload)
+        rotate_probe_runner_token.assert_called_once_with("office-1")
+        record_audit_event.assert_called_once()
+
     def test_runner_heartbeat_route_upserts_runner(self) -> None:
         runner = {
             "runner_id": "office-1",
@@ -299,10 +370,13 @@ class RunnerRouteTests(unittest.TestCase):
         }
 
         with patch("backend.app.main.storage.upsert_probe_runner", return_value=runner) as upsert_probe_runner, patch(
+            "backend.app.main.storage.verify_probe_runner_token", return_value=runner
+        ) as verify_probe_runner_token, patch(
             "backend.app.main.storage.get_settings", return_value={}
         ):
             response = TestClient(app).post(
                 "/api/runners/heartbeat",
+                headers={"Authorization": "Bearer token-1"},
                 json={
                     "runner_id": "office-1",
                     "name": "Office Runner",
@@ -317,8 +391,40 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
         self.assertEqual(response.json()["runner"]["runner_id"], "office-1")
+        verify_probe_runner_token.assert_called_once_with("office-1", "token-1")
         upsert_probe_runner.assert_called_once()
         self.assertEqual(upsert_probe_runner.call_args.args[0]["network_region"], "office-lan")
+
+    def test_runner_test_connection_fetches_worker_health_and_marks_available(self) -> None:
+        runner = {
+            "runner_id": "office-1",
+            "name": "Office Runner",
+            "address": "http://10.0.0.8:8788",
+            "network_region": "office-lan",
+            "role": "child",
+            "enabled": True,
+            "available": False,
+        }
+        health = {
+            "ok": True,
+            "name": "worker",
+            "address": "http://10.0.0.8:8788",
+            "status": "ok",
+            "browser_version": "chromium 120",
+            "metadata": {"node_role": "worker"},
+        }
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=runner), patch(
+            "backend.app.main._fetch_runner_health", new=AsyncMock(return_value=health)
+        ) as fetch_runner_health, patch(
+            "backend.app.main.storage.mark_probe_runner_available"
+        ) as mark_probe_runner_available:
+            response = TestClient(app).post("/api/runners/office-1/test")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["worker"], health)
+        fetch_runner_health.assert_awaited_once_with(runner)
+        mark_probe_runner_available.assert_called_once_with("office-1", health)
 
     def test_runners_route_lists_probe_runners(self) -> None:
         runners = [
@@ -343,6 +449,28 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()[0]["runner_id"], "office-1")
         list_probe_runners.assert_called_once_with(limit=10)
+
+
+class RunRouteTests(unittest.TestCase):
+    def test_runs_route_accepts_run_group_filter(self) -> None:
+        with patch("backend.app.main.storage.list_runs", return_value=[]) as list_runs:
+            response = TestClient(app).get("/api/runs?run_group_id=rg-test&limit=25")
+
+        self.assertEqual(response.status_code, 200)
+        filters = list_runs.call_args.args[0]
+        self.assertEqual(filters["run_group_id"], "rg-test")
+        self.assertEqual(list_runs.call_args.kwargs["limit"], 25)
+
+    def test_runs_page_route_accepts_run_group_filter(self) -> None:
+        with patch(
+            "backend.app.main.storage.list_runs_page",
+            return_value={"items": [], "total": 0, "page": 1, "page_size": 20},
+        ) as list_runs_page:
+            response = TestClient(app).get("/api/runs-page?run_group_id=rg-test&page=1&page_size=20")
+
+        self.assertEqual(response.status_code, 200)
+        filters = list_runs_page.call_args.args[0]
+        self.assertEqual(filters["run_group_id"], "rg-test")
 
 
 class OperationsRouteTests(unittest.TestCase):

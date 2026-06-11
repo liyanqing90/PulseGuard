@@ -8,7 +8,7 @@ RUN npm run build
 
 FROM ghcr.io/astral-sh/uv:0.9.30 AS uv-bin
 
-FROM mcr.microsoft.com/playwright/python:v1.49.1-noble
+FROM mcr.microsoft.com/playwright/python:v1.49.1-noble AS runtime-base
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
@@ -28,9 +28,12 @@ COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY backend /app/backend
-COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
 
 RUN mkdir -p /app/data /app/reports/screenshots /app/reports/traces /app/reports/responses
+
+FROM runtime-base AS app
+
+COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
 
 EXPOSE 8787
 CMD ["sh", "-c", "uvicorn app.main:app --host ${PULSEGUARD_HOST:-0.0.0.0} --port ${PULSEGUARD_PORT:-8787}"]

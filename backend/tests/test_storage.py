@@ -510,6 +510,47 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(finished["runner_browser_version"], "chromium 120.0")
         self.assertEqual(finished["failure_kind"], "target")
 
+    def test_runs_can_be_filtered_by_run_group_id_for_multi_runner_results(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            check = storage.create_check(api_check_data("Grouped Runner API"))
+            first = storage.create_run(
+                {
+                    **check,
+                    "_runner": storage.runner_metadata({"runner_id": "edge-1", "name": "Edge 1"}),
+                    "_run": {**storage.run_metadata("manual"), "run_group_id": "rg-test-1"},
+                },
+                "pending",
+            )
+            second = storage.create_run(
+                {
+                    **check,
+                    "_runner": storage.runner_metadata({"runner_id": "edge-2", "name": "Edge 2"}),
+                    "_run": {**storage.run_metadata("manual"), "run_group_id": "rg-test-1"},
+                },
+                "pending",
+            )
+            other = storage.create_run(
+                {
+                    **check,
+                    "_runner": storage.runner_metadata({"runner_id": "edge-3", "name": "Edge 3"}),
+                    "_run": {**storage.run_metadata("manual"), "run_group_id": "rg-test-2"},
+                },
+                "pending",
+            )
+            storage.finish_run(int(first["id"]), {**run_payload("ok"), **storage.runner_metadata({"runner_id": "edge-1", "name": "Edge 1"})})
+            storage.finish_run(int(second["id"]), {**run_payload("failed", "target failed"), **storage.runner_metadata({"runner_id": "edge-2", "name": "Edge 2"}, failure_kind="target")})
+            storage.finish_run(int(other["id"]), {**run_payload("ok"), **storage.runner_metadata({"runner_id": "edge-3", "name": "Edge 3"})})
+
+            grouped = storage.list_runs({"run_group_id": "rg-test-1"}, limit=10)
+            grouped_page = storage.list_runs_page({"run_group_id": "rg-test-1"}, page=1, page_size=10)
+
+        self.assertEqual({run["runner_id"] for run in grouped}, {"edge-1", "edge-2"})
+        self.assertEqual(grouped_page["total"], 2)
+        self.assertEqual({run["runner_id"] for run in grouped_page["items"]}, {"edge-1", "edge-2"})
+
     def test_failed_run_without_failure_kind_defaults_to_target(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -564,7 +605,81 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(updated["browser_version"], "chromium 121.0")
         self.assertEqual(updated["status"], "warning")
         self.assertEqual(updated["metadata"], {"capability": "api"})
-        self.assertEqual([runner["runner_id"] for runner in runners], ["office-1"])
+        self.assertEqual({runner["runner_id"] for runner in runners}, {"local", "office-1"})
+
+    def test_managed_runner_supplied_token_is_hidden_and_rotation_invalidates_old_token(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            created = storage.create_probe_runner(
+                {
+                    "runner_id": "edge-1",
+                    "name": "Edge Runner",
+                    "address": "http://10.0.0.8:8787",
+                    "token": "runner-secret-1",
+                }
+            )
+            public = storage.get_probe_runner("edge-1")
+            listed = next(runner for runner in storage.list_probe_runners() if runner["runner_id"] == "edge-1")
+            verified = storage.verify_probe_runner_token("edge-1", "runner-secret-1")
+            rotated = storage.rotate_probe_runner_token("edge-1")
+            old_verified = storage.verify_probe_runner_token("edge-1", "runner-secret-1")
+            new_verified = storage.verify_probe_runner_token("edge-1", str(rotated["token"]))
+
+        self.assertNotIn("token", created)
+        self.assertIsNotNone(public)
+        self.assertNotIn("token", public)
+        self.assertNotIn("token_value", public)
+        self.assertTrue(public["token_set"])
+        self.assertEqual(public["token_hint"], "cret-1")
+        self.assertNotIn("token", listed)
+        self.assertIsNotNone(verified)
+        self.assertIsNone(old_verified)
+        self.assertIsNotNone(new_verified)
+        self.assertNotEqual(rotated["token"], "runner-secret-1")
+
+    def test_runner_unavailable_notification_is_deduped_until_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            storage.create_probe_runner(
+                {
+                    "runner_id": "edge-2",
+                    "name": "Edge Runner",
+                    "address": "http://10.0.0.9:8787",
+                    "token": "runner-secret-2",
+                }
+            )
+            unavailable = storage.mark_probe_runner_unavailable("edge-2")
+            should_notify_first = storage.should_notify_probe_runner_unavailable(unavailable or {})
+            notified = storage.mark_probe_runner_unavailable_notified("edge-2")
+            should_notify_second = storage.should_notify_probe_runner_unavailable(notified or {})
+            recovered = storage.mark_probe_runner_available(
+                "edge-2",
+                {"browser_version": "chromium 120", "status": "ok", "metadata": {"source": "poll"}},
+            )
+            unavailable_again = storage.mark_probe_runner_unavailable("edge-2")
+            should_notify_after_recovery = storage.should_notify_probe_runner_unavailable(unavailable_again or {})
+
+        self.assertTrue(should_notify_first)
+        self.assertFalse(should_notify_second)
+        self.assertTrue(recovered["available"])
+        self.assertEqual(recovered["metadata"], {"source": "poll"})
+        self.assertIsNone(recovered["unavailable_notified_at"])
+        self.assertTrue(should_notify_after_recovery)
+
+    def test_runner_cursor_round_robins_per_scope(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            first_scope = [storage.next_runner_cursor("check:1", 3) for _ in range(5)]
+            second_scope = [storage.next_runner_cursor("check:2", 2) for _ in range(3)]
+
+        self.assertEqual(first_scope, [0, 1, 2, 0, 1])
+        self.assertEqual(second_scope, [0, 1, 0])
 
 
 class SettingsVariableStorageTests(unittest.TestCase):

@@ -1,0 +1,5 @@
+services:
+  pulseguard-worker:
+    build:
+      context: "${PULSEGUARD_WORKER_BUILD_CONTEXT:-https://github.com/liyanqing90/PulseGuard.git#main}"
+      dockerfile: Dockerfile.worker

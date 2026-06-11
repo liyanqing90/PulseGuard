@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import secrets
 import sqlite3
@@ -19,10 +20,10 @@ from pydantic import ValidationError
 from .api_assertions import inspect_api_response
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
-from .config import REPORTS_DIR, RESPONSES_DIR, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, ensure_runtime_dirs
+from .config import NODE_ROLE, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, ensure_runtime_dirs
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
-from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest
+from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest
 from .variables import mask_data, mask_text
 
 
@@ -88,13 +89,24 @@ VALIDATION_FIELD_LABELS = {
 async def lifespan(app: FastAPI):
     storage.init_db()
     runner = CheckRunner()
-    scheduler = PulseScheduler(runner)
     app.state.runner = runner
-    app.state.scheduler = scheduler
     await runner.start()
-    scheduler.start()
+    scheduler = None
+    health_poll_task = None
+    if NODE_ROLE != "worker":
+        scheduler = PulseScheduler(runner)
+        app.state.scheduler = scheduler
+        scheduler.start()
+        health_poll_task = asyncio.create_task(_runner_health_poll_loop())
+    else:
+        app.state.scheduler = None
+        _log_worker_startup_info()
     yield
-    scheduler.shutdown()
+    if health_poll_task is not None:
+        health_poll_task.cancel()
+        await asyncio.gather(health_poll_task, return_exceptions=True)
+    if scheduler is not None:
+        scheduler.shutdown()
     await runner.shutdown()
 
 
@@ -119,6 +131,38 @@ app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets", check_dir=Fals
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/worker/health")
+def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
+    _verify_worker_token(_bearer_token(authorization))
+    return {
+        "ok": True,
+        "role": NODE_ROLE,
+        "runner_id": WORKER_RUNNER_ID,
+        "name": WORKER_NAME,
+        "address": WORKER_ADDRESS,
+        "network_region": WORKER_REGION,
+        "browser_version": "",
+        "status": "ok",
+        "metadata": {"node_role": NODE_ROLE},
+    }
+
+
+@app.post("/api/worker/run")
+async def worker_run(request: Request, authorization: str = Header(default="")) -> dict[str, Any]:
+    _verify_worker_token(_bearer_token(authorization))
+    raw = await request.json()
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="worker run payload must be an object")
+    check = raw.get("check")
+    settings = raw.get("settings")
+    if not isinstance(check, dict) or not isinstance(settings, dict):
+        raise HTTPException(status_code=400, detail="worker run payload invalid")
+    trigger = str(raw.get("trigger") or "remote")
+    run_id = int(raw.get("run_id") or 0)
+    result = await request.app.state.runner.execute_worker_run(check, trigger, run_id, settings)
+    return {"ok": True, "run": result, "artifacts": _worker_artifacts(result)}
 
 
 @app.post("/api/heartbeats/{key}")
@@ -160,7 +204,8 @@ def overview() -> dict[str, Any]:
 def runtime_status(request: Request) -> dict[str, Any]:
     payload = request.app.state.runner.runtime_status()
     scheduler = request.app.state.scheduler
-    payload["scheduler"] = scheduler.runtime_status() if hasattr(scheduler, "runtime_status") else {}
+    payload["scheduler"] = scheduler.runtime_status() if hasattr(scheduler, "runtime_status") else {"running": False, "scheduled_checks": 0, "next_due_at": None, "overdue_jobs": 0}
+    payload["node_role"] = NODE_ROLE
     return payload
 
 
@@ -169,10 +214,72 @@ def runners(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any
     return mask_data(storage.list_probe_runners(limit=limit), storage.get_settings())
 
 
+@app.post("/api/runners")
+def create_runner(payload: ProbeRunnerCreate) -> dict[str, Any]:
+    try:
+        runner = storage.create_probe_runner({**payload.model_dump(), "role": "child"})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    storage.record_audit_event("created", "runner", runner.get("runner_id"), runner.get("name", ""), "创建执行节点")
+    return _runner_response(runner)
+
+
 @app.post("/api/runners/heartbeat")
-def runner_heartbeat(payload: RunnerHeartbeatRequest) -> dict[str, Any]:
+def runner_heartbeat(payload: RunnerHeartbeatRequest, authorization: str = Header(default="")) -> dict[str, Any]:
+    token = _bearer_token(authorization)
+    if not storage.verify_probe_runner_token(payload.runner_id, token):
+        raise HTTPException(status_code=403, detail="Runner token 无效")
     runner = storage.upsert_probe_runner(payload.model_dump())
     return {"ok": True, "runner": mask_data(runner, storage.get_settings())}
+
+
+@app.put("/api/runners/{runner_id}")
+def update_runner(runner_id: str, payload: ProbeRunnerUpdate) -> dict[str, Any]:
+    try:
+        runner = storage.update_probe_runner(runner_id, payload.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    storage.record_audit_event("updated", "runner", runner.get("runner_id"), runner.get("name", ""), "更新执行节点")
+    return mask_data(runner, storage.get_settings())
+
+
+@app.delete("/api/runners/{runner_id}")
+def delete_runner(runner_id: str) -> dict[str, bool]:
+    try:
+        removed = storage.delete_probe_runner(runner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    storage.record_audit_event("deleted", "runner", runner_id, runner_id, "删除执行节点")
+    return {"ok": True}
+
+
+@app.post("/api/runners/{runner_id}/rotate-token")
+def rotate_runner_token(runner_id: str) -> dict[str, Any]:
+    runner = storage.rotate_probe_runner_token(runner_id)
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    storage.record_audit_event("updated", "runner", runner.get("runner_id"), runner.get("name", ""), "轮换执行节点令牌")
+    return _runner_response(runner)
+
+
+@app.post("/api/runners/{runner_id}/test")
+async def test_runner_connection(runner_id: str) -> dict[str, Any]:
+    runner = storage.get_probe_runner(runner_id)
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    if str(runner.get("role")) == "local":
+        return {"ok": True, "message": "local Runner 可用", "runner": runner}
+    try:
+        health = await _fetch_runner_health(runner)
+        storage.mark_probe_runner_available(runner_id, health)
+    except Exception as exc:
+        storage.mark_probe_runner_unavailable(runner_id)
+        raise HTTPException(status_code=400, detail=f"Runner 连接失败：{exc}") from exc
+    return {"ok": True, "message": "Runner 连接正常", "worker": health}
 
 
 @app.get("/api/status-page")
@@ -462,6 +569,8 @@ def runs(
     notification_status: str | None = Query(default=None),
     q: str | None = Query(default=None),
     check_id: int | None = Query(default=None),
+    runner_id: str | None = Query(default=None),
+    run_group_id: str | None = Query(default=None),
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -479,6 +588,8 @@ def runs(
             "notification_status": notification_status,
             "q": q,
             "check_id": check_id,
+            "runner_id": runner_id,
+            "run_group_id": run_group_id,
             "start": start,
             "end": end,
         },
@@ -495,6 +606,8 @@ def runs_page(
     trigger: str | None = Query(default=None),
     q: str | None = Query(default=None),
     check_id: int | None = Query(default=None),
+    runner_id: str | None = Query(default=None),
+    run_group_id: str | None = Query(default=None),
     start: str | None = Query(default=None),
     end: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
@@ -515,6 +628,8 @@ def runs_page(
             "trigger": trigger,
             "q": q,
             "check_id": check_id,
+            "runner_id": runner_id,
+            "run_group_id": run_group_id,
             "start": start,
             "end": end,
         },
@@ -680,6 +795,112 @@ def _read_only_token_value(query_token: str, header_token: str, authorization: s
     if auth_value.lower().startswith("bearer "):
         return auth_value[7:].strip()
     return (header_token or query_token).strip()
+
+
+def _bearer_token(authorization: str) -> str:
+    value = str(authorization or "").strip()
+    if value.lower().startswith("bearer "):
+        return value[7:].strip()
+    return value
+
+
+def _verify_worker_token(token: str) -> None:
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=403, detail="Worker token 未配置")
+    if not secrets.compare_digest(token, WORKER_TOKEN):
+        raise HTTPException(status_code=403, detail="Worker token 无效")
+
+
+def _worker_artifacts(run: dict[str, Any]) -> dict[str, Any]:
+    artifacts: dict[str, Any] = {}
+    roots = {
+        "screenshot_path": SCREENSHOTS_DIR,
+        "trace_path": TRACES_DIR,
+        "response_path": RESPONSES_DIR,
+    }
+    max_bytes = 10 * 1024 * 1024
+    for field, root in roots.items():
+        relative = str(run.get(field) or "")
+        if not relative:
+            continue
+        name = Path(relative.replace("\\", "/")).name
+        path = (root / name).resolve()
+        root_resolved = root.resolve()
+        if path.parent != root_resolved or not path.exists() or not path.is_file():
+            continue
+        if path.stat().st_size > max_bytes:
+            continue
+        import base64
+
+        artifacts[field] = {
+            "filename": path.name,
+            "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        }
+    return artifacts
+
+
+def _runner_response(runner: dict[str, Any]) -> dict[str, Any]:
+    token = runner.get("token")
+    hidden_fields = {"token", "token_value", "token_hash", "_token"}
+    visible = mask_data({key: value for key, value in runner.items() if key not in hidden_fields}, storage.get_settings())
+    if token:
+        visible["token"] = token
+    return visible
+
+
+async def _fetch_runner_health(runner: dict[str, Any]) -> dict[str, Any]:
+    runner_id = str(runner.get("runner_id") or "")
+    token = storage.get_probe_runner_token(runner_id)
+    address = str(runner.get("address") or "").strip().rstrip("/")
+    if not address or not token:
+        raise RuntimeError("Runner address or token is not configured")
+    async with httpx.AsyncClient(timeout=5) as client:
+        response = await client.get(f"{address}/api/worker/health", headers={"Authorization": f"Bearer {token}"})
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError("Runner health response is invalid")
+    return payload
+
+
+async def _runner_health_poll_loop() -> None:
+    while True:
+        try:
+            runners = [
+                runner
+                for runner in storage.list_enabled_probe_runners()
+                if str(runner.get("role") or "") == "child"
+            ]
+            for runner in runners:
+                runner_id = str(runner.get("runner_id") or "")
+                if not runner_id:
+                    continue
+                try:
+                    health = await _fetch_runner_health(runner)
+                    storage.mark_probe_runner_available(runner_id, health)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    storage.mark_probe_runner_unavailable(runner_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(RUNNER_HEALTH_POLL_SECONDS)
+
+
+def _log_worker_startup_info() -> None:
+    if os.getenv("PULSEGUARD_WORKER_INFO_PRINTED") == "1":
+        return
+    print("", flush=True)
+    print("PulseGuard worker node is ready.", flush=True)
+    print(f"  name: {WORKER_NAME}", flush=True)
+    print(f"  address: {WORKER_ADDRESS}", flush=True)
+    print(f"  region: {WORKER_REGION}", flush=True)
+    print(f"  token: {WORKER_TOKEN}", flush=True)
+    print(f"  token_source: {WORKER_TOKEN_SOURCE}", flush=True)
+    print("Add this child node manually in the main console with the address and token above.", flush=True)
+    print("", flush=True)
 
 
 def _read_only_overview_payload(overview: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:

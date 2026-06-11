@@ -14,7 +14,7 @@ from .schemas import CheckCreate
 from .variables import is_sensitive_variable_name, mask_data
 
 
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 2
 CHECK_EXPORT_FIELDS = (
     "name",
     "type",
@@ -31,6 +31,8 @@ CHECK_EXPORT_FIELDS = (
     "script",
     "tags",
     "alert_policy_json",
+    "runner_selection_mode",
+    "runner_ids",
 )
 
 
@@ -38,12 +40,14 @@ def export_config(redact: bool = True) -> dict[str, Any]:
     settings = storage.get_settings()
     export_settings = _export_settings(settings, redact=redact)
     export_checks = [_export_check(check, settings, redact=redact) for check in storage.list_checks()]
+    export_runners = [_export_runner(runner, redact=redact) for runner in storage.list_probe_runners()]
     return {
         "schema": "pulseguard.config",
         "version": EXPORT_SCHEMA_VERSION,
         "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "redacted": redact,
         "settings": export_settings,
+        "runners": export_runners,
         "checks": export_checks,
     }
 
@@ -63,6 +67,7 @@ def preview_import(bundle: dict[str, Any]) -> dict[str, Any]:
         "warnings": warnings,
         "counts": {
             "checks": len(parsed["checks"]),
+            "runners": len(parsed.get("runners", [])),
             "settings": len(parsed["settings"]),
             "conflicts": len(conflicts),
         },
@@ -83,6 +88,19 @@ def apply_import(bundle: dict[str, Any], *, replace_existing: bool = False) -> d
     if parsed["settings"]:
         storage.update_settings(parsed["settings"])
         updated_settings = len(parsed["settings"])
+
+    imported_runners = 0
+    for runner in parsed.get("runners", []):
+        if runner.get("runner_id") == storage.LOCAL_RUNNER_ID:
+            storage.update_probe_runner(storage.LOCAL_RUNNER_ID, runner)
+            continue
+        existing_runner = storage.get_probe_runner(str(runner.get("runner_id") or ""))
+        runner_payload = _runner_import_payload(runner, existing_runner)
+        if existing_runner:
+            storage.update_probe_runner(str(runner["runner_id"]), runner_payload)
+        else:
+            storage.create_probe_runner(runner_payload, generate_token=not bool(runner.get("_missing_token")))
+        imported_runners += 1
 
     existing = {str(check.get("name") or ""): check for check in storage.list_checks()}
     created = 0
@@ -110,6 +128,7 @@ def apply_import(bundle: dict[str, Any], *, replace_existing: bool = False) -> d
     return {
         "ok": True,
         "settings_updated": updated_settings,
+        "runners_imported": imported_runners,
         "checks_created": created,
         "checks_updated": updated,
         "checks_renamed": renamed,
@@ -138,6 +157,20 @@ def _export_check(check: dict[str, Any], settings: dict[str, Any], *, redact: bo
         return exported
     exported["alert_policy_json"] = _redact_member_references(exported.get("alert_policy_json"))
     return mask_data(exported, settings)
+
+
+def _export_runner(runner: dict[str, Any], *, redact: bool) -> dict[str, Any]:
+    exported = {
+        "runner_id": runner.get("runner_id"),
+        "name": runner.get("name"),
+        "address": runner.get("address"),
+        "network_region": runner.get("network_region"),
+        "enabled": bool(runner.get("enabled", True)),
+        "role": runner.get("role") or "child",
+    }
+    if not redact:
+        exported["token_set"] = bool(runner.get("token_set"))
+    return exported
 
 
 def _redact_member_references(value: Any) -> str:
@@ -178,7 +211,7 @@ def _parse_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     issues: list[str] = []
     warnings: list[str] = []
     if not isinstance(bundle, dict):
-        return {"schema": "", "version": None, "settings": {}, "checks": [], "issues": ["导入内容必须是 JSON Object"], "warnings": warnings}
+        return {"schema": "", "version": None, "settings": {}, "runners": [], "checks": [], "issues": ["导入内容必须是 JSON Object"], "warnings": warnings}
 
     schema = str(bundle.get("schema") or "")
     if schema and schema != "pulseguard.config":
@@ -229,10 +262,60 @@ def _parse_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         "schema": schema or "pulseguard.config",
         "version": version or EXPORT_SCHEMA_VERSION,
         "settings": settings,
+        "runners": _parse_runners(bundle.get("runners") or [], issues, warnings),
         "checks": checks,
         "issues": issues,
         "warnings": warnings,
     }
+
+
+def _parse_runners(raw_runners: Any, issues: list[str], warnings: list[str]) -> list[dict[str, Any]]:
+    if not raw_runners:
+        return []
+    if not isinstance(raw_runners, list):
+        issues.append("runners 必须是 JSON Array")
+        return []
+    runners: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_runners, start=1):
+        if not isinstance(raw, dict):
+            issues.append(f"第 {index} 个 Runner 格式不正确")
+            continue
+        runner_id = str(raw.get("runner_id") or "").strip()
+        if not runner_id:
+            issues.append(f"第 {index} 个 Runner ID 不能为空")
+            continue
+        if runner_id in seen:
+            issues.append(f"Runner ID 重复：{runner_id}")
+            continue
+        seen.add(runner_id)
+        is_child = runner_id != storage.LOCAL_RUNNER_ID
+        token = str(raw.get("token") or raw.get("token_value") or "").strip()
+        enabled = bool(raw.get("enabled", True))
+        if is_child and not token and enabled:
+            warnings.append(f"Runner {runner_id} 未包含认证信息，导入后将停用；请更新认证后再启用")
+            enabled = False
+        runner = {
+            "runner_id": runner_id,
+            "name": str(raw.get("name") or runner_id).strip(),
+            "address": str(raw.get("address") or "").strip(),
+            "network_region": str(raw.get("network_region") or "local").strip(),
+            "enabled": enabled,
+            "role": "local" if runner_id == storage.LOCAL_RUNNER_ID else "child",
+        }
+        if token:
+            runner["token"] = token
+        elif is_child:
+            runner["_missing_token"] = True
+        runners.append(runner)
+    return runners
+
+
+def _runner_import_payload(runner: dict[str, Any], existing_runner: dict[str, Any] | None) -> dict[str, Any]:
+    payload = {key: value for key, value in runner.items() if not key.startswith("_")}
+    if runner.get("_missing_token") and not (existing_runner or {}).get("token_set"):
+        payload["enabled"] = False
+    return payload
 
 
 def _check_payload(raw_check: dict[str, Any]) -> dict[str, Any]:
@@ -254,6 +337,8 @@ def _check_payload(raw_check: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("script", "")
     payload.setdefault("tags", "")
     payload.setdefault("alert_policy_json", "{}")
+    payload.setdefault("runner_selection_mode", "selected_parallel")
+    payload.setdefault("runner_ids", ["local"])
     return payload
 
 

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import time
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import RESPONSES_DIR, SCREENSHOTS_DIR, TRACES_DIR
+
+MAX_UPLOADED_ARTIFACT_BYTES = 10 * 1024 * 1024
 
 
 class ArtifactStore:
@@ -30,6 +33,21 @@ class ArtifactStore:
     def save_response(self, run_id: int, payload: dict[str, Any]) -> str:
         path, relative = self.response_target(run_id)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return relative
+
+    def save_uploaded_artifact(self, run_id: int, artifact_type: str, content_base64: str) -> str | None:
+        if artifact_type == "screenshot_path":
+            path, relative = self.screenshot_target(run_id, "remote")
+        elif artifact_type == "trace_path":
+            path, relative = self.trace_target(run_id)
+        elif artifact_type == "response_path":
+            path, relative = self.response_target(run_id)
+        else:
+            return None
+        content = base64.b64decode(content_base64.encode("ascii"), validate=True)
+        if len(content) > MAX_UPLOADED_ARTIFACT_BYTES:
+            raise ValueError("uploaded artifact exceeds size limit")
+        path.write_bytes(content)
         return relative
 
     @staticmethod

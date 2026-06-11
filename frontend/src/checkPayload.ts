@@ -20,7 +20,9 @@ export function checkToPayload(check: Check): CheckPayload {
     setup_script: check.setup_script || "",
     script: check.script,
     tags: check.tags || "",
-    alert_policy_json: check.alert_policy_json || "{}"
+    alert_policy_json: check.alert_policy_json || "{}",
+    runner_selection_mode: check.runner_selection_mode || "selected_parallel",
+    runner_ids: normalizeRunnerIds(check.runner_ids)
   };
 }
 
@@ -127,7 +129,9 @@ export function normalizeCheckPayload(value: CheckPayload): CheckPayload {
     timeout_ms: Math.max(500, Number(value.timeout_ms || 500)),
     setup_script: value.type === "ui" ? value.setup_script || "" : "",
     script: value.script || "",
-    alert_policy_json: normalizeAlertPolicyJson(value.alert_policy_json)
+    alert_policy_json: normalizeAlertPolicyJson(value.alert_policy_json),
+    runner_selection_mode: value.runner_selection_mode === "round_robin_all" ? "round_robin_all" : "selected_parallel",
+    runner_ids: normalizeRunnerIds(value.runner_ids)
   };
 }
 
@@ -176,4 +180,16 @@ function normalizeAlertPolicyJson(value?: string | null): string {
   } catch {
     return "{}";
   }
+}
+
+function normalizeRunnerIds(value?: string[] | null): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of value || []) {
+    const runnerId = String(item || "").trim();
+    if (!runnerId || seen.has(runnerId)) continue;
+    seen.add(runnerId);
+    result.push(runnerId);
+  }
+  return result.length ? result : ["local"];
 }

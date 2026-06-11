@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import hashlib
 import sqlite3
 import threading
 import uuid
@@ -21,6 +22,10 @@ from .variables import is_sensitive_variable_name
 
 _LOCK = threading.RLock()
 _TAG_SPLIT_PATTERN = re.compile(r"[,\s]+")
+LOCAL_RUNNER_ID = "local"
+RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 120
+RUNNER_ROLES = {"local", "child"}
+RUNNER_SELECTION_MODES = {"selected_parallel", "round_robin_all"}
 
 
 def now_iso() -> str:
@@ -54,6 +59,8 @@ def init_db() -> None:
                 script TEXT NOT NULL,
                 tags TEXT,
                 alert_policy_json TEXT NOT NULL DEFAULT '{}',
+                runner_selection_mode TEXT NOT NULL DEFAULT 'selected_parallel',
+                runner_ids_json TEXT NOT NULL DEFAULT '["local"]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -75,6 +82,7 @@ def init_db() -> None:
                 response_path TEXT,
                 request_snapshot TEXT,
                 response_snapshot TEXT,
+                runner_id TEXT,
                 runner_name TEXT,
                 runner_address TEXT,
                 runner_region TEXT,
@@ -87,6 +95,7 @@ def init_db() -> None:
                 trigger TEXT NOT NULL DEFAULT 'legacy',
                 observation_kind TEXT NOT NULL DEFAULT 'observation',
                 affects_health INTEGER NOT NULL DEFAULT 1,
+                run_group_id TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -163,7 +172,21 @@ def init_db() -> None:
                 browser_version TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'ok',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                role TEXT NOT NULL DEFAULT 'child',
+                token_value TEXT NOT NULL DEFAULT '',
+                token_hash TEXT NOT NULL DEFAULT '',
+                token_hint TEXT NOT NULL DEFAULT '',
+                unavailable_since TEXT,
+                unavailable_notified_at TEXT,
+                created_at TEXT NOT NULL DEFAULT '',
                 last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS runner_cursors (
+                scope TEXT PRIMARY KEY,
+                cursor INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
 
@@ -199,12 +222,16 @@ def init_db() -> None:
         _ensure_check_columns(conn)
         _ensure_run_columns(conn)
         _ensure_check_status_columns(conn)
+        _ensure_probe_runner_columns(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation ON runs(affects_health, started_at DESC)")
         conn.execute("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", (now_iso(),))
         _ensure_default_settings(conn)
         _migrate_read_only_tokens(conn)
+        _ensure_local_probe_runner(conn)
         _mark_interrupted_runs(conn)
         _seed_demo_checks(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_runner_id ON runs(runner_id, started_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(run_group_id, started_at DESC)")
 
 
 def list_checks(check_type: str | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -272,8 +299,9 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO checks (
                 name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
-                headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json,
+                runner_selection_mode, runner_ids_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["name"].strip(),
@@ -291,6 +319,8 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
                 data.get("script") or "",
                 data.get("tags") or "",
                 data.get("alert_policy_json") or "{}",
+                _normalize_runner_selection_mode(data.get("runner_selection_mode")),
+                json.dumps(_normalize_runner_ids(data.get("runner_ids") or data.get("runner_ids_json")), ensure_ascii=False),
                 timestamp,
                 timestamp,
             ),
@@ -307,7 +337,7 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
             UPDATE checks
             SET name = ?, type = ?, enabled = ?, interval_seconds = ?, timeout_ms = ?,
                 entry_url = ?, viewport_mode = ?, method = ?, headers_json = ?, body = ?, assertions_json = ?, setup_script = ?,
-                script = ?, tags = ?, alert_policy_json = ?, updated_at = ?
+                script = ?, tags = ?, alert_policy_json = ?, runner_selection_mode = ?, runner_ids_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -326,6 +356,8 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("script") or "",
                 data.get("tags") or "",
                 data.get("alert_policy_json") or "{}",
+                _normalize_runner_selection_mode(data.get("runner_selection_mode")),
+                json.dumps(_normalize_runner_ids(data.get("runner_ids") or data.get("runner_ids_json")), ensure_ascii=False),
                 timestamp,
                 check_id,
             ),
@@ -531,10 +563,10 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 check_id, check_name, check_type, status, started_at, finished_at,
                 duration_ms, error_message, error_stack, logs, screenshot_path,
                 trace_path, response_path, request_snapshot, response_snapshot,
-                runner_name, runner_address, runner_region, runner_browser_version, failure_kind,
+                runner_id, runner_name, runner_address, runner_region, runner_browser_version, failure_kind,
                 notification_status, notification_channel, notification_error,
-                notification_sent_at, trigger, observation_kind, affects_health, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notification_sent_at, trigger, observation_kind, affects_health, run_group_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(check["id"]),
@@ -552,6 +584,7 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 None,
                 None,
                 None,
+                runner.get("runner_id"),
                 runner.get("runner_name"),
                 runner.get("runner_address"),
                 runner.get("runner_region"),
@@ -564,6 +597,7 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 metadata["trigger"],
                 metadata["observation_kind"],
                 1 if metadata["affects_health"] else 0,
+                metadata.get("run_group_id"),
                 timestamp,
             ),
         )
@@ -599,7 +633,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
             SET status = ?, finished_at = ?, duration_ms = ?, error_message = ?,
                 error_stack = ?, logs = ?, screenshot_path = ?, trace_path = ?,
                 response_path = ?, request_snapshot = ?, response_snapshot = ?,
-                runner_name = ?, runner_address = ?, runner_region = ?,
+                runner_id = ?, runner_name = ?, runner_address = ?, runner_region = ?,
                 runner_browser_version = ?, failure_kind = ?
             WHERE id = ?
             """,
@@ -615,6 +649,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("response_path"),
                 data.get("request_snapshot"),
                 data.get("response_snapshot"),
+                data.get("runner_id"),
                 data.get("runner_name"),
                 data.get("runner_address"),
                 data.get("runner_region"),
@@ -663,7 +698,148 @@ def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
                 timestamp,
             ),
         )
+        if str(data.get("status") or "ok").strip() in {"ok", "warning"}:
+            conn.execute(
+                """
+                UPDATE probe_runners
+                SET unavailable_since = NULL,
+                    unavailable_notified_at = NULL
+                WHERE runner_id = ?
+                """,
+                (runner_id,),
+            )
     return get_probe_runner(runner_id)  # type: ignore[return-value]
+
+
+def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) -> dict[str, Any]:
+    raw_token = str(data.get("token") or "").strip()
+    generated_token = bool(generate_token and not raw_token)
+    token = raw_token or (create_runner_token() if generate_token else "")
+    runner_id = _normalize_runner_id(data.get("runner_id") or f"runner-{uuid.uuid4().hex[:8]}")
+    timestamp = now_iso()
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    with _LOCK, _connect() as conn:
+        if conn.execute("SELECT 1 FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone():
+            raise ValueError("Runner ID already exists")
+        conn.execute(
+            """
+            INSERT INTO probe_runners (
+                runner_id, name, address, network_region, browser_version, status,
+                metadata_json, enabled, role, token_value, token_hash, token_hint, created_at,
+                last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                runner_id,
+                str(data.get("name") or runner_id).strip(),
+                str(data.get("address") or "").strip(),
+                str(data.get("network_region") or "local").strip(),
+                str(data.get("browser_version") or "").strip(),
+                "offline",
+                json.dumps(metadata, ensure_ascii=False),
+                1 if data.get("enabled", True) else 0,
+                _normalize_runner_role(data.get("role") or "child"),
+                token,
+                runner_token_hash(token) if token else "",
+                _token_hint(token),
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+    runner = get_probe_runner(runner_id) or {}
+    if generated_token:
+        runner["token"] = token
+    return runner
+
+
+def update_probe_runner(runner_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        current = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        if not current:
+            return None
+        name = str(data["name"] if data.get("name") is not None else current["name"] or runner_id).strip() or runner_id
+        address = str(data["address"] if data.get("address") is not None else current["address"] or "").strip()
+        network_region = str(data["network_region"] if data.get("network_region") is not None else current["network_region"] or "local").strip() or "local"
+        enabled = bool(data["enabled"] if data.get("enabled") is not None else current["enabled"])
+        assignments = ["name = ?", "address = ?", "network_region = ?", "enabled = ?", "updated_at = ?"]
+        params: list[Any] = [name, address, network_region, 1 if enabled else 0, timestamp]
+        token = str(data.get("token") or "").strip()
+        if token:
+            assignments.extend(["token_value = ?", "token_hash = ?", "token_hint = ?"])
+            params.extend([token, runner_token_hash(token), _token_hint(token)])
+        params.append(runner_id)
+        cursor = conn.execute(
+            f"""
+            UPDATE probe_runners
+            SET {", ".join(assignments)}
+            WHERE runner_id = ?
+            """,
+            params,
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    health = health if isinstance(health, dict) else {}
+    status = str(health.get("status") or "ok").strip().lower()
+    if status not in {"ok", "warning"}:
+        status = "ok"
+    browser_version = str(health.get("browser_version") or "").strip()
+    metadata = health.get("metadata") if isinstance(health.get("metadata"), dict) else {}
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = ?,
+                browser_version = ?,
+                metadata_json = ?,
+                unavailable_since = NULL,
+                unavailable_notified_at = NULL,
+                last_seen_at = ?,
+                updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (status, browser_version, json.dumps(metadata, ensure_ascii=False), timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def delete_probe_runner(runner_id: str) -> bool:
+    runner_id = _normalize_runner_id(runner_id)
+    if runner_id == LOCAL_RUNNER_ID:
+        raise ValueError("local Runner cannot be deleted")
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute("DELETE FROM probe_runners WHERE runner_id = ?", (runner_id,))
+        return cursor.rowcount > 0
+
+
+def rotate_probe_runner_token(runner_id: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    token = create_runner_token()
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET token_value = ?, token_hash = ?, token_hint = ?, updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (token, runner_token_hash(token), _token_hint(token), timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    runner = get_probe_runner(runner_id) or {}
+    runner["token"] = token
+    return runner
 
 
 def get_probe_runner(runner_id: str) -> dict[str, Any] | None:
@@ -684,6 +860,131 @@ def list_probe_runners(limit: int = 100) -> list[dict[str, Any]]:
             (max(1, min(500, int(limit))),),
         ).fetchall()
     return [_normalize_probe_runner(row) for row in rows]
+
+
+def list_enabled_probe_runners() -> list[dict[str, Any]]:
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM probe_runners
+            WHERE enabled = 1
+            ORDER BY role = 'local' DESC, runner_id ASC
+            """
+        ).fetchall()
+    return [_normalize_probe_runner(row) for row in rows]
+
+
+def list_probe_runners_by_ids(runner_ids: list[str]) -> list[dict[str, Any]]:
+    ids = _normalize_runner_ids(runner_ids)
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(f"SELECT * FROM probe_runners WHERE runner_id IN ({placeholders})", ids).fetchall()
+    by_id = {_normalize_probe_runner(row)["runner_id"]: _normalize_probe_runner(row) for row in rows}
+    return [by_id[runner_id] for runner_id in ids if runner_id in by_id]
+
+
+def runner_metadata(runner: dict[str, Any], failure_kind: str = "none", browser_version: str | None = None) -> dict[str, str]:
+    return {
+        "runner_id": str(runner.get("runner_id") or LOCAL_RUNNER_ID),
+        "runner_name": str(runner.get("name") or runner.get("runner_id") or LOCAL_RUNNER_ID),
+        "runner_address": str(runner.get("address") or ""),
+        "runner_region": str(runner.get("network_region") or "local"),
+        "runner_browser_version": str(browser_version if browser_version is not None else runner.get("browser_version") or ""),
+        "failure_kind": failure_kind if failure_kind in {"none", "target", "runner"} else "runner",
+    }
+
+
+def create_runner_token() -> str:
+    return f"pgrn_{secrets.token_urlsafe(32)}"
+
+
+def runner_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def verify_probe_runner_token(runner_id: str, token: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    token = str(token or "").strip()
+    if not runner_id or not token:
+        return None
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+    if not row:
+        return None
+    expected_hash = str(row["token_hash"] or "")
+    expected_value = str(row["token_value"] or "") if "token_value" in row.keys() else ""
+    valid = bool(expected_value and secrets.compare_digest(expected_value, token))
+    valid = valid or bool(expected_hash and secrets.compare_digest(expected_hash, runner_token_hash(token)))
+    if not valid:
+        return None
+    return _normalize_probe_runner(row)
+
+
+def get_probe_runner_token(runner_id: str) -> str:
+    runner_id = _normalize_runner_id(runner_id)
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT token_value FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+    return str(row["token_value"] or "") if row else ""
+
+
+def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = ?,
+                unavailable_since = COALESCE(unavailable_since, ?),
+                updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (status, timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def mark_probe_runner_unavailable_notified(runner_id: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET unavailable_notified_at = ?, updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def should_notify_probe_runner_unavailable(runner: dict[str, Any]) -> bool:
+    return bool(runner.get("enabled")) and str(runner.get("role") or "") != "local" and not runner.get("available") and not runner.get("unavailable_notified_at")
+
+
+def next_runner_cursor(scope: str, count: int) -> int:
+    count = max(1, int(count))
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT cursor FROM runner_cursors WHERE scope = ?", (scope,)).fetchone()
+        current = int(row["cursor"] or 0) if row else 0
+        next_cursor = (current + 1) % count
+        conn.execute(
+            """
+            INSERT INTO runner_cursors(scope, cursor, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(scope) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at
+            """,
+            (scope, next_cursor, timestamp),
+        )
+    return current % count
 
 
 def update_run_notification(
@@ -943,6 +1244,12 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[d
     if filters.get("notification_status"):
         clauses.append("notification_status = ?")
         params.append(filters["notification_status"])
+    if filters.get("runner_id"):
+        clauses.append("runner_id = ?")
+        params.append(filters["runner_id"])
+    if filters.get("run_group_id"):
+        clauses.append("run_group_id = ?")
+        params.append(filters["run_group_id"])
     if filters.get("trigger"):
         clauses.append("trigger = ?")
         params.append(filters["trigger"])
@@ -1002,6 +1309,8 @@ def _run_filter_clauses(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
     mappings = (
         ("check_type", "check_type"),
         ("notification_status", "notification_status"),
+        ("runner_id", "runner_id"),
+        ("run_group_id", "run_group_id"),
         ("trigger", "trigger"),
         ("observation_kind", "observation_kind"),
     )
@@ -1573,6 +1882,8 @@ def _ensure_check_columns(conn: sqlite3.Connection) -> None:
         "viewport_mode": "TEXT NOT NULL DEFAULT 'web'",
         "setup_script": "TEXT NOT NULL DEFAULT ''",
         "alert_policy_json": "TEXT NOT NULL DEFAULT '{}'",
+        "runner_selection_mode": "TEXT NOT NULL DEFAULT 'selected_parallel'",
+        "runner_ids_json": "TEXT NOT NULL DEFAULT '[\"local\"]'",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -1584,6 +1895,7 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
     columns = {
         "request_snapshot": "TEXT",
         "response_snapshot": "TEXT",
+        "runner_id": "TEXT",
         "runner_name": "TEXT",
         "runner_address": "TEXT",
         "runner_region": "TEXT",
@@ -1596,6 +1908,7 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
         "trigger": "TEXT NOT NULL DEFAULT 'legacy'",
         "observation_kind": "TEXT NOT NULL DEFAULT 'observation'",
         "affects_health": "INTEGER NOT NULL DEFAULT 1",
+        "run_group_id": "TEXT",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -1634,6 +1947,68 @@ def _ensure_check_status_columns(conn: sqlite3.Connection) -> None:
             consecutive_successes = 0
         WHERE current_status = 'suspected' OR monitor_status = 'suspected'
         """
+    )
+
+
+def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(probe_runners)").fetchall()}
+    columns = {
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "role": "TEXT NOT NULL DEFAULT 'child'",
+        "token_value": "TEXT NOT NULL DEFAULT ''",
+        "token_hash": "TEXT NOT NULL DEFAULT ''",
+        "token_hint": "TEXT NOT NULL DEFAULT ''",
+        "unavailable_since": "TEXT",
+        "unavailable_notified_at": "TEXT",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, column_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE probe_runners ADD COLUMN {name} {column_type}")
+    timestamp = now_iso()
+    conn.execute(
+        "UPDATE probe_runners SET created_at = COALESCE(NULLIF(created_at, ''), updated_at, last_seen_at, ?) WHERE created_at = ''",
+        (timestamp,),
+    )
+
+
+def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
+    timestamp = now_iso()
+    name = str(_read_setting_value(conn, "local_runner_name") or "local").strip() or "local"
+    address = str(_read_setting_value(conn, "local_runner_address") or "127.0.0.1").strip()
+    region = str(_read_setting_value(conn, "local_runner_region") or "local").strip() or "local"
+    conn.execute(
+        """
+        INSERT INTO probe_runners (
+            runner_id, name, address, network_region, browser_version, status,
+            metadata_json, enabled, role, token_hash, token_hint, created_at,
+            last_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(runner_id) DO UPDATE SET
+            name = excluded.name,
+            address = excluded.address,
+            network_region = excluded.network_region,
+            status = 'ok',
+            role = 'local',
+            last_seen_at = excluded.last_seen_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            LOCAL_RUNNER_ID,
+            name,
+            address,
+            region,
+            "",
+            "ok",
+            "{}",
+            1,
+            "local",
+            "",
+            "",
+            timestamp,
+            timestamp,
+            timestamp,
+        ),
     )
 
 
@@ -1755,6 +2130,8 @@ def _normalize_check(row: sqlite3.Row) -> dict[str, Any]:
     data["script"] = data.get("script") or ""
     data["tags"] = data.get("tags") or ""
     data["alert_policy_json"] = data.get("alert_policy_json") or "{}"
+    data["runner_selection_mode"] = _normalize_runner_selection_mode(data.get("runner_selection_mode"))
+    data["runner_ids"] = _normalize_runner_ids(data.get("runner_ids_json"))
     if not data["enabled"]:
         data["monitor_status"] = "disabled"
     else:
@@ -1773,9 +2150,11 @@ def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:
     data["duration_ms"] = data.get("duration_ms")
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
     data["failure_kind"] = _normalize_failure_kind(data.get("failure_kind"), str(data.get("status") or ""))
+    data["runner_id"] = data.get("runner_id") or (LOCAL_RUNNER_ID if data.get("runner_name") else "")
     data["trigger"] = data.get("trigger") or "legacy"
     data["observation_kind"] = data.get("observation_kind") or "observation"
     data["affects_health"] = bool(data.get("affects_health"))
+    data["run_group_id"] = data.get("run_group_id") or ""
     return data
 
 
@@ -1834,7 +2213,73 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     except json.JSONDecodeError:
         data["metadata"] = {}
     data.pop("metadata_json", None)
+    data["enabled"] = bool(data.get("enabled", True))
+    data["role"] = _normalize_runner_role(data.get("role"))
+    data["token_set"] = bool(data.get("token_hash"))
+    data["available"] = _runner_available(data)
+    data.pop("token_value", None)
+    data.pop("token_hash", None)
     return data
+
+
+def _normalize_runner_id(value: Any) -> str:
+    runner_id = str(value or "").strip()
+    if not runner_id:
+        raise ValueError("Runner ID cannot be empty")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}", runner_id):
+        raise ValueError("Runner ID format is invalid")
+    return runner_id
+
+
+def _normalize_runner_role(value: Any) -> str:
+    role = str(value or "child").strip().lower()
+    return role if role in RUNNER_ROLES else "child"
+
+
+def _normalize_runner_selection_mode(value: Any) -> str:
+    mode = str(value or "selected_parallel").strip()
+    return mode if mode in RUNNER_SELECTION_MODES else "selected_parallel"
+
+
+def _normalize_runner_ids(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = [value]
+    else:
+        parsed = value
+    if not isinstance(parsed, list):
+        parsed = []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in parsed:
+        runner_id = str(item or "").strip()
+        if not runner_id or runner_id in seen:
+            continue
+        seen.add(runner_id)
+        result.append(runner_id)
+    return result or [LOCAL_RUNNER_ID]
+
+
+def _token_hint(token: str) -> str:
+    token = str(token or "")
+    return token[-6:] if len(token) >= 6 else token
+
+
+def _runner_available(data: dict[str, Any]) -> bool:
+    if not data.get("enabled"):
+        return False
+    if str(data.get("role") or "") == "local":
+        return str(data.get("status") or "ok") != "offline"
+    if str(data.get("status") or "ok") == "offline":
+        return False
+    try:
+        last_seen = datetime.fromisoformat(str(data.get("last_seen_at") or ""))
+    except ValueError:
+        return False
+    age = datetime.now(last_seen.tzinfo) - last_seen
+    return age.total_seconds() <= RUNNER_HEARTBEAT_TIMEOUT_SECONDS
 
 
 def _check_snapshot(check: dict[str, Any]) -> dict[str, Any]:
@@ -1854,5 +2299,7 @@ def _check_snapshot(check: dict[str, Any]) -> dict[str, Any]:
         "script",
         "tags",
         "alert_policy_json",
+        "runner_selection_mode",
+        "runner_ids",
     )
     return {field: check.get(field) for field in fields}

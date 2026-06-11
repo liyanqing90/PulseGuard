@@ -1,0 +1,25 @@
+services:
+  pulseguard-worker:
+    image: ${PULSEGUARD_WORKER_IMAGE:-pulseguard-worker:latest}
+    container_name: pulseguard-worker
+    restart: unless-stopped
+    ports:
+      - "${PULSEGUARD_WORKER_PUBLISH_HOST:-0.0.0.0}:${PULSEGUARD_WORKER_PUBLISH_PORT:-8788}:${PULSEGUARD_PORT:-8788}"
+    volumes:
+      - pulseguard-worker-data:/app/data
+      - pulseguard-worker-reports:/app/reports
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PULSEGUARD_HOST=0.0.0.0
+      - PULSEGUARD_PORT=${PULSEGUARD_PORT:-8788}
+      - PULSEGUARD_WORKER_NAME=${PULSEGUARD_WORKER_NAME:-worker}
+      - PULSEGUARD_WORKER_REGION=${PULSEGUARD_WORKER_REGION:-local}
+      - PULSEGUARD_DATA_DIR=/app/data
+      - PULSEGUARD_REPORTS_DIR=/app/reports
+      - PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
+    mem_limit: 1g
+    cpus: 1.0
+
+volumes:
+  pulseguard-worker-data:
+  pulseguard-worker-reports:

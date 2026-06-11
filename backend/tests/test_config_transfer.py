@@ -117,6 +117,15 @@ class ConfigTransferApiTests(unittest.TestCase):
                 alert_policy_json=json.dumps(task_policy, ensure_ascii=False),
             )
         )
+        storage.create_probe_runner(
+            {
+                "runner_id": "edge-secret",
+                "name": "Edge Runner",
+                "address": "http://10.0.0.8:8787",
+                "network_region": "edge",
+                "token": "runner-secret-export",
+            }
+        )
 
         with patch.dict("os.environ", {"PROCESS_PASSWORD": "process-secret-789"}, clear=False):
             response = self.client.get("/api/config/export")
@@ -141,8 +150,14 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertNotIn("ou_alice_private", exported_text)
         self.assertNotIn("alice.private", exported_text)
         self.assertNotIn("13800000001", exported_text)
+        self.assertNotIn("runner-secret-export", exported_text)
         self.assertEqual(exported["settings"]["read_only_token"], "")
         self.assertEqual(exported["settings"]["members"], [])
+        self.assertIn("runners", exported)
+        exported_runner = next(runner for runner in exported["runners"] if runner["runner_id"] == "edge-secret")
+        self.assertEqual(exported_runner["role"], "child")
+        self.assertNotIn("token", exported_runner)
+        self.assertNotIn("token_value", exported_runner)
 
         exported_check = next(check for check in exported["checks"] if check["name"] == "Secret-bearing API")
         self.assertEqual(
@@ -170,6 +185,10 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertEqual(full_export["settings"]["members"][0]["id"], "alice")
         full_check = next(check for check in full_export["checks"] if check["name"] == "Secret-bearing API")
         self.assertEqual(json.loads(full_check["alert_policy_json"])["member_ids"], ["alice"])
+        full_runner = next(runner for runner in full_export["runners"] if runner["runner_id"] == "edge-secret")
+        self.assertTrue(full_runner["token_set"])
+        self.assertNotIn("token", full_runner)
+        self.assertNotIn("runner-secret-export", json.dumps(full_export, ensure_ascii=False))
 
     def test_import_preview_reports_counts_and_does_not_persist_changes(self) -> None:
         before_check_count = len(storage.list_checks())
@@ -259,6 +278,46 @@ class ConfigTransferApiTests(unittest.TestCase):
         self.assertNotIn("webhook", tag_policy_text.lower())
         self.assertNotIn("secret", tag_policy_text.lower())
 
+    def test_import_apply_creates_runners_and_preserves_check_runner_strategy(self) -> None:
+        check_payload = api_check_payload("Imported Runner API", entry_url="https://import.example.com/runner")
+        check_payload.update({"runner_selection_mode": "selected_parallel", "runner_ids": ["edge-import"]})
+        payload = {
+            "bundle": transfer_config(
+                settings={},
+                runners=[
+                    {
+                        "runner_id": "edge-import",
+                        "name": "Imported Edge Runner",
+                        "address": "http://10.0.0.12:8787",
+                        "network_region": "edge",
+                        "enabled": True,
+                    }
+                ],
+                checks=[check_payload],
+            ),
+            "replace_existing": True,
+        }
+
+        preview = self.client.post("/api/config/import-preview", json=payload)
+        response = self.client.post("/api/config/import", json=payload)
+
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["counts"].get("runners"), 1)
+        self.assertIn("未包含认证信息", "；".join(preview.json()["warnings"]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["runners_imported"], 1)
+
+        runner = storage.get_probe_runner("edge-import")
+        imported_check = find_check_by_name("Imported Runner API")
+        self.assertIsNotNone(runner)
+        self.assertEqual(runner["address"], "http://10.0.0.12:8787")
+        self.assertFalse(runner["enabled"])
+        self.assertFalse(runner["token_set"])
+        self.assertNotIn("token", runner)
+        self.assertIsNotNone(imported_check)
+        self.assertEqual(imported_check["runner_selection_mode"], "selected_parallel")
+        self.assertEqual(imported_check["runner_ids"], ["edge-import"])
+
     def test_import_apply_without_replace_preserves_existing_duplicate_name_policy(self) -> None:
         existing = storage.create_check(api_check_payload("Duplicate API", entry_url="https://old.example.com/health"))
         payload = {
@@ -286,11 +345,16 @@ class ConfigTransferApiTests(unittest.TestCase):
             self.assertIn("skipped", result_text)
 
 
-def transfer_config(settings: dict[str, Any], checks: list[dict[str, Any]]) -> dict[str, Any]:
+def transfer_config(
+    settings: dict[str, Any],
+    checks: list[dict[str, Any]],
+    runners: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "version": 1,
         "exported_at": "2026-06-08T00:00:00+00:00",
         "settings": settings,
+        "runners": runners or [],
         "checks": checks,
     }
 

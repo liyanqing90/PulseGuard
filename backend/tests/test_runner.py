@@ -397,7 +397,14 @@ class RunnerQueueTests(unittest.TestCase):
             first_started = asyncio.Event()
             release_first = asyncio.Event()
 
-            async def execute(check: dict[str, object], trigger: str, run_id: int, record_status: bool = True, notify: bool = True) -> dict[str, object]:
+            async def execute(
+                check: dict[str, object],
+                trigger: str,
+                run_id: int,
+                record_status: bool = True,
+                notify: bool = True,
+                runner_metadata: dict[str, object] | None = None,
+            ) -> dict[str, object]:
                 if check["id"] == 1:
                     first_started.set()
                     await release_first.wait()
@@ -434,7 +441,14 @@ class RunnerQueueTests(unittest.TestCase):
         async def scenario() -> list[dict[str, object]]:
             nonlocal active_ui, max_active_ui
 
-            async def execute(check: dict[str, object], trigger: str, run_id: int, record_status: bool = True, notify: bool = True) -> dict[str, object]:
+            async def execute(
+                check: dict[str, object],
+                trigger: str,
+                run_id: int,
+                record_status: bool = True,
+                notify: bool = True,
+                runner_metadata: dict[str, object] | None = None,
+            ) -> dict[str, object]:
                 nonlocal active_ui, max_active_ui
                 active_ui += 1
                 max_active_ui = max(max_active_ui, active_ui)
@@ -455,6 +469,113 @@ class RunnerQueueTests(unittest.TestCase):
 
         self.assertEqual([result["status"] for result in results], ["ok", "ok"])
         self.assertEqual(max_active_ui, 1)
+
+
+class DistributedRunnerTests(unittest.TestCase):
+    def test_disabled_local_runner_is_skipped_without_executing_probe(self) -> None:
+        check = {
+            "id": 31,
+            "name": "Disabled local runner",
+            "type": "api",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/health",
+            "method": "GET",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"status_code","expected_status":200}]',
+            "script": "",
+            "tags": "",
+            "runner_selection_mode": "selected_parallel",
+            "runner_ids": ["local"],
+        }
+        local_runner = {
+            "runner_id": "local",
+            "name": "local",
+            "address": "127.0.0.1",
+            "network_region": "local",
+            "browser_version": "",
+            "status": "offline",
+            "enabled": False,
+            "available": False,
+            "role": "local",
+        }
+
+        def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+            return {"id": run_id, "check_id": 31, "affects_health": True, **data}
+
+        with patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.list_probe_runners_by_ids", return_value=[local_runner]
+        ), patch("backend.app.runner.storage.get_settings", return_value={}), patch(
+            "backend.app.runner.storage.create_run", return_value={"id": 310, "check_id": 31, "status": "pending"}
+        ), patch("backend.app.runner.storage.finish_run", side_effect=finish_run), patch(
+            "backend.app.runner.storage.get_run", return_value=None
+        ), patch("backend.app.runner.storage.update_run_notification") as update_run_notification, patch(
+            "backend.app.runner.storage.update_check_status"
+        ) as update_check_status, patch(
+            "backend.app.runner.storage.get_probe_runner", return_value=local_runner
+        ), patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ) as maybe_notify, patch.object(
+            CheckRunner, "_execute", new_callable=AsyncMock, side_effect=AssertionError("disabled local runner should not execute")
+        ) as execute:
+            result = asyncio.run(CheckRunner().run_check(31, trigger="manual"))
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failure_kind"], "runner")
+        execute.assert_not_awaited()
+        update_run_notification.assert_called_once()
+        update_check_status.assert_not_called()
+        maybe_notify.assert_not_called()
+
+    def test_runner_only_distributed_group_does_not_update_target_health(self) -> None:
+        check = {"id": 32, "name": "Runner only", "type": "api"}
+        runner_failure = {
+            "id": 320,
+            "check_id": 32,
+            "status": "skipped",
+            "failure_kind": "runner",
+            "affects_health": True,
+        }
+
+        with patch("backend.app.runner.storage.update_check_status") as update_check_status, patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ) as maybe_notify:
+            result = asyncio.run(CheckRunner()._finish_distributed_group(check, [runner_failure], "manual"))
+
+        self.assertEqual(result, runner_failure)
+        update_check_status.assert_not_called()
+        maybe_notify.assert_not_called()
+
+    def test_distributed_group_target_failure_wins_over_success_and_updates_once(self) -> None:
+        check = {"id": 33, "name": "Aggregate target failure", "type": "api"}
+        success = {
+            "id": 331,
+            "check_id": 33,
+            "status": "ok",
+            "failure_kind": "none",
+            "affects_health": True,
+        }
+        target_failure = {
+            "id": 332,
+            "check_id": 33,
+            "status": "failed",
+            "failure_kind": "target",
+            "affects_health": True,
+        }
+
+        with patch(
+            "backend.app.runner.storage.update_check_status",
+            return_value={"current_status": "failing", "previous_status": "healthy"},
+        ) as update_check_status, patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ) as maybe_notify:
+            result = asyncio.run(CheckRunner()._finish_distributed_group(check, [success, target_failure], "manual"))
+
+        self.assertEqual(result, target_failure)
+        update_check_status.assert_called_once_with(33, target_failure)
+        maybe_notify.assert_awaited_once()
 
 
 def runner_patches(max_concurrency: int = 2, max_ui_concurrency: int = 1, max_queue_size: int = 50, check_type: str = "api"):

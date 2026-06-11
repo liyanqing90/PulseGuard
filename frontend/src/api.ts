@@ -17,6 +17,7 @@ import type {
   NotificationStatus,
   Overview,
   ProbeRunner,
+  ProbeRunnerPayload,
   CreatedReadOnlyToken,
   Run,
   RunArchive,
@@ -204,6 +205,19 @@ export const api = {
   auditEvents: () => request<AuditEvent[]>("/api/audit-events"),
   runArchives: () => request<RunArchive[]>("/api/run-archives"),
   runners: () => request<ProbeRunner[]>("/api/runners"),
+  createRunner: (payload: ProbeRunnerPayload) =>
+    request<ProbeRunner>("/api/runners", { method: "POST", body: JSON.stringify(payload) }),
+  updateRunner: (runnerId: string, payload: Partial<ProbeRunnerPayload>) =>
+    request<ProbeRunner>(`/api/runners/${encodeURIComponent(runnerId)}`, { method: "PUT", body: JSON.stringify(payload) }),
+  deleteRunner: (runnerId: string) =>
+    request<{ ok: boolean }>(`/api/runners/${encodeURIComponent(runnerId)}`, { method: "DELETE" }),
+  rotateRunnerToken: (runnerId: string) =>
+    request<ProbeRunner>(`/api/runners/${encodeURIComponent(runnerId)}/rotate-token`, { method: "POST" }),
+  testRunner: (runnerId: string) =>
+    request<{ ok: boolean; message: string; runner?: ProbeRunner; worker?: unknown }>(
+      `/api/runners/${encodeURIComponent(runnerId)}/test`,
+      { method: "POST" }
+    ),
   checkVersions: (id: number) => request<CheckVersion[]>(`/api/checks/${id}/versions`),
   restoreCheckVersion: (versionId: number) =>
     request<Check>(`/api/check-versions/${versionId}/restore`, { method: "POST" }),
@@ -213,12 +227,15 @@ export const api = {
     notification_status?: NotificationStatus | "";
     q?: string;
     check_id?: string | null;
+    runner_id?: string | null;
+    run_group_id?: string | null;
     start?: string;
     end?: string;
+    limit?: number;
   }) => {
     const query = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
-      if (value) query.set(key, value);
+      if (value) query.set(key, String(value));
     });
     return request<Run[]>(`/api/runs?${query.toString()}`);
   },
@@ -229,6 +246,8 @@ export const api = {
     observation_kind?: "observation" | "verification" | "draft" | "";
     q?: string;
     check_id?: string | null;
+    runner_id?: string | null;
+    run_group_id?: string | null;
     start?: string;
     end?: string;
     page: number;

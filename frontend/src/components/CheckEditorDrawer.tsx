@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { checkToPayload, detectBodyMode, normalizeCheckPayload, prepareCheckPayload, sameCheckPayload, type BodyEditorMode } from "../checkPayload";
 import { apiScriptTemplate, blankCheck, checkFromTemplate, checkTemplatesForType } from "../defaults";
-import type { AlertPolicy, Check, CheckPayload, CheckType, Member, NotificationChannel, Run } from "../types";
+import type { AlertPolicy, Check, CheckPayload, CheckType, Member, NotificationChannel, ProbeRunner, Run, RunnerSelectionMode } from "../types";
 import { dirtyTagColor } from "../utils";
 import { ApiAssertionsBuilder } from "./ApiAssertionsBuilder";
 import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
@@ -33,6 +33,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const [bodyMode, setBodyMode] = useState<BodyEditorMode>("json");
   const [notificationChannels, setNotificationChannels] = useState<NotificationChannel[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
+  const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState(() => checkTemplatesForType(type)[0]?.id || "");
 
   const templates = useMemo(() => checkTemplatesForType(type), [type]);
@@ -40,6 +41,30 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const debugStale = useMemo(() => Boolean(debugRun && debugSnapshot && !sameCheckPayload(form, debugSnapshot)), [debugRun, debugSnapshot, form]);
   const alertPolicy = useMemo(() => parseCheckAlertPolicy(form.alert_policy_json), [form.alert_policy_json]);
   const alertPolicyMode = useMemo(() => (hasAlertPolicyOverrides(alertPolicy) ? "custom" : "inherit"), [alertPolicy]);
+  const runnerOptions = useMemo(() => {
+    const list = runners.length
+      ? runners
+      : [
+          {
+            runner_id: "local",
+            name: "local",
+            address: "127.0.0.1",
+            network_region: "local",
+            browser_version: "",
+            status: "ok",
+            enabled: true,
+            role: "local",
+            available: true,
+            metadata: {},
+            updated_at: ""
+          } as ProbeRunner
+        ];
+    return list.map((runner) => ({
+      label: `${runner.name || runner.runner_id} · ${runner.network_region || "local"}${runner.enabled ? "" : " · 已停用"}`,
+      value: runner.runner_id,
+      disabled: !runner.enabled
+    }));
+  }, [runners]);
   const running = Boolean(runningMode);
 
   useEffect(() => {
@@ -57,15 +82,16 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
 
   useEffect(() => {
     if (!open) return;
-    api
-      .settings()
-      .then((values) => {
+    Promise.all([api.settings(), api.runners()])
+      .then(([values, nextRunners]) => {
         setNotificationChannels(values.notification_channels || []);
         setMembers(values.members || []);
+        setRunners(nextRunners);
       })
       .catch(() => {
         setNotificationChannels([]);
         setMembers([]);
+        setRunners([]);
       });
   }, [open]);
 
@@ -147,6 +173,13 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
 
   function patchAlertPolicy(patch: Partial<AlertPolicy>) {
     patchForm({ alert_policy_json: serializeCheckAlertPolicy({ ...alertPolicy, ...patch }) });
+  }
+
+  function setRunnerSelectionMode(mode: RunnerSelectionMode) {
+    patchForm({
+      runner_selection_mode: mode,
+      runner_ids: form.runner_ids?.length ? form.runner_ids : ["local"]
+    });
   }
 
   function setAlertPolicyMode(mode: "inherit" | "custom") {
@@ -303,6 +336,34 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
                 <Switch aria-label="任务启用状态" checked={form.enabled} onChange={(checked) => patchForm({ enabled: checked })} />
               </Space>
             </Form.Item>
+          </div>
+
+          <div className="field-grid two">
+            <Form.Item label="执行节点策略" required>
+              <Segmented
+                value={form.runner_selection_mode || "selected_parallel"}
+                onChange={(value) => setRunnerSelectionMode(value as RunnerSelectionMode)}
+                options={[
+                  { label: "多选并行", value: "selected_parallel" },
+                  { label: "轮询所有启用节点", value: "round_robin_all" }
+                ]}
+              />
+            </Form.Item>
+            {form.runner_selection_mode === "round_robin_all" ? (
+              <Form.Item label="执行节点">
+                <Input value="所有已启用节点，按任务轮询游标挨个请求" disabled />
+              </Form.Item>
+            ) : (
+              <Form.Item label="执行节点" required>
+                <Select
+                  mode="multiple"
+                  value={form.runner_ids?.length ? form.runner_ids : ["local"]}
+                  onChange={(runner_ids) => patchForm({ runner_ids })}
+                  options={runnerOptions}
+                  placeholder="选择执行节点"
+                />
+              </Form.Item>
+            )}
           </div>
         </Form>
 

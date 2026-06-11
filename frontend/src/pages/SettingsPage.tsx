@@ -11,6 +11,7 @@ import {
   KeyRound,
   Monitor,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Send,
@@ -36,6 +37,8 @@ import type {
   DatabaseBackup,
   EnvironmentVariable,
   NotificationChannel,
+  ProbeRunner,
+  ProbeRunnerPayload,
   SettingsValues,
   WebhookType
 } from "../types";
@@ -77,6 +80,7 @@ const CONFIG_SUMMARY_ITEMS: Array<{ key: keyof ConfigImportSummary; label: strin
   { key: "checks", label: "任务" },
   { key: "ui_checks", label: "UI 任务" },
   { key: "api_checks", label: "API 任务" },
+  { key: "runners", label: "执行节点" },
   { key: "settings", label: "设置项" },
   { key: "conflicts", label: "冲突" },
   { key: "notification_channels", label: "通知渠道" },
@@ -725,6 +729,7 @@ export function SettingsPage() {
         )}
 
         {activeTab === "runtime" && (
+        <>
         <SettingsPanel title="执行设置" icon={<Zap size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <NumberItem label="默认执行频率" value={settings.default_interval_seconds} min={5} max={86400} suffix="秒" onChange={(value) => update("default_interval_seconds", value)} />
@@ -769,6 +774,8 @@ export function SettingsPage() {
             </Form.Item>
           </Form>
         </SettingsPanel>
+        <RunnerNodePanel />
+        </>
         )}
 
         {activeTab === "browser" && (
@@ -1094,6 +1101,270 @@ export function SettingsPage() {
         </Space>
       </Modal>
     </div>
+  );
+}
+
+const emptyRunnerDraft: ProbeRunnerPayload = {
+  name: "",
+  address: "",
+  network_region: "local",
+  enabled: true,
+  token: ""
+};
+
+function RunnerNodePanel() {
+  const { message } = App.useApp();
+  const [runners, setRunners] = useState<ProbeRunner[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [draft, setDraft] = useState<ProbeRunnerPayload>(emptyRunnerDraft);
+  const [saving, setSaving] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [authRunner, setAuthRunner] = useState<{ runner: ProbeRunner; token: string } | null>(null);
+
+  useEffect(() => {
+    void loadRunners();
+  }, []);
+
+  async function loadRunners() {
+    setLoading(true);
+    try {
+      setRunners(await api.runners());
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openCreateDrawer() {
+    setDraft(emptyRunnerDraft);
+    setDrawerOpen(true);
+  }
+
+  async function createRunner() {
+    const payload: ProbeRunnerPayload = {
+      name: draft.name.trim(),
+      address: draft.address.trim(),
+      network_region: draft.network_region.trim() || "local",
+      enabled: draft.enabled !== false,
+      token: draft.token?.trim() || ""
+    };
+    if (!payload.name || !payload.address || !payload.token) {
+      message.error("请填写节点名称、地址和认证信息");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.createRunner(payload);
+      setDrawerOpen(false);
+      await loadRunners();
+      message.success("执行节点已创建");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateRunnerEnabled(runner: ProbeRunner, enabled: boolean) {
+    setBusyId(runner.runner_id);
+    try {
+      await api.updateRunner(runner.runner_id, { enabled });
+      await loadRunners();
+      message.success(enabled ? "节点已启用" : "节点已停用");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function testRunner(runner: ProbeRunner) {
+    setBusyId(runner.runner_id);
+    try {
+      const result = await api.testRunner(runner.runner_id);
+      await loadRunners();
+      message.success(result.message || "节点连接正常");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function updateRunnerToken() {
+    if (!authRunner) return;
+    const token = authRunner.token.trim();
+    if (!token) {
+      message.error("请填写认证信息");
+      return;
+    }
+    setBusyId(authRunner.runner.runner_id);
+    try {
+      await api.updateRunner(authRunner.runner.runner_id, { token });
+      setAuthRunner(null);
+      await loadRunners();
+      message.success("节点认证已更新");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function deleteRunner(runner: ProbeRunner) {
+    setBusyId(runner.runner_id);
+    try {
+      await api.deleteRunner(runner.runner_id);
+      await loadRunners();
+      message.success("执行节点已删除");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <SettingsPanel title="执行节点" icon={<Monitor size={18} />} className="settings-panel-wide">
+      <Space orientation="vertical" size={14} className="drawer-stack">
+        <div className="read-only-token-toolbar">
+          <Space size={8} wrap>
+            <strong>节点列表</strong>
+            <Tag color="processing">{runners.length} 个节点</Tag>
+          </Space>
+          <Space size={8} wrap>
+            <Button icon={<RefreshCw size={16} />} loading={loading} onClick={loadRunners}>
+              刷新
+            </Button>
+            <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>
+              新增子节点
+            </Button>
+          </Space>
+        </div>
+
+        {loading ? (
+          <Skeleton active paragraph={{ rows: 4 }} />
+        ) : runners.length === 0 ? (
+          <Empty description="暂无执行节点" />
+        ) : (
+          <Space orientation="vertical" size={10} className="drawer-stack">
+            {runners.map((runner) => (
+              <Card size="small" key={runner.runner_id}>
+                <div className="read-only-token-card">
+                  <div>
+                    <Space size={8} wrap>
+                      <strong>{runner.name || runner.runner_id}</strong>
+                      <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
+                      <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
+                      <Tag color={runner.available ? "success" : "error"}>{runner.available ? "可用" : "不可用"}</Tag>
+                      <Tag>{runner.network_region || "local"}</Tag>
+                    </Space>
+                    <span>
+                      {runner.address || "-"} · 最近心跳 {runner.last_seen_at ? formatDate(runner.last_seen_at) : "无"}
+                    </span>
+                    <span>token {runner.token_set ? runner.token_hint || "已配置" : "未配置"}</span>
+                  </div>
+                  <Space size={8} wrap>
+                    <Switch
+                      checked={runner.enabled}
+                      loading={busyId === runner.runner_id}
+                      onChange={(enabled) => updateRunnerEnabled(runner, enabled)}
+                      aria-label={`切换执行节点 ${runner.runner_id}`}
+                    />
+                    <Button loading={busyId === runner.runner_id} onClick={() => testRunner(runner)}>
+                      测试连接
+                    </Button>
+                    {runner.role !== "local" && (
+                      <Button icon={<KeyRound size={15} />} loading={busyId === runner.runner_id} onClick={() => setAuthRunner({ runner, token: "" })}>
+                        更新认证
+                      </Button>
+                    )}
+                    {runner.role !== "local" && (
+                      <Popconfirm
+                        title="删除执行节点"
+                        description="删除后，仍引用该节点的任务会在执行时回退到可用节点。"
+                        okText="删除"
+                        cancelText="取消"
+                        onConfirm={() => deleteRunner(runner)}
+                      >
+                        <Button danger icon={<Trash2 size={15} />} loading={busyId === runner.runner_id}>
+                          删除
+                        </Button>
+                      </Popconfirm>
+                    )}
+                  </Space>
+                </div>
+              </Card>
+            ))}
+          </Space>
+        )}
+      </Space>
+
+      <Drawer
+        title="新增子节点"
+        width={520}
+        open={drawerOpen}
+        destroyOnHidden
+        onClose={() => setDrawerOpen(false)}
+        extra={
+          <Button type="primary" icon={<Save size={16} />} loading={saving} onClick={createRunner}>
+            创建
+          </Button>
+        }
+      >
+        <Form layout="vertical" autoComplete="off">
+          <Form.Item label="节点名称" required>
+            <Input value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
+          </Form.Item>
+          <Form.Item label="节点地址" required>
+            <Input
+              value={draft.address}
+              placeholder="http://10.0.0.12:8788"
+              onChange={(event) => setDraft((current) => ({ ...current, address: event.target.value }))}
+            />
+          </Form.Item>
+          <Form.Item label="认证信息" required>
+            <Input.Password
+              value={draft.token}
+              placeholder="粘贴子节点启动日志输出的 token"
+              onChange={(event) => setDraft((current) => ({ ...current, token: event.target.value }))}
+            />
+          </Form.Item>
+          <Form.Item label="网络区域">
+            <Input
+              value={draft.network_region}
+              placeholder="local"
+              onChange={(event) => setDraft((current) => ({ ...current, network_region: event.target.value }))}
+            />
+          </Form.Item>
+          <Form.Item label="启用状态">
+            <Switch checked={draft.enabled !== false} onChange={(enabled) => setDraft((current) => ({ ...current, enabled }))} />
+          </Form.Item>
+        </Form>
+      </Drawer>
+
+      <Modal
+        title="更新节点认证"
+        open={Boolean(authRunner)}
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={Boolean(authRunner && busyId === authRunner.runner.runner_id)}
+        onOk={updateRunnerToken}
+        onCancel={() => setAuthRunner(null)}
+      >
+        <Form layout="vertical" autoComplete="off">
+          <Form.Item label="认证信息" required>
+            <Input.Password
+              value={authRunner?.token || ""}
+              placeholder="粘贴子节点启动日志输出的 token"
+              onChange={(event) => setAuthRunner((current) => (current ? { ...current, token: event.target.value } : current))}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+    </SettingsPanel>
   );
 }
 

@@ -303,6 +303,8 @@ export function blankCheck(type: CheckType): CheckPayload {
     setup_script: "",
     script: "",
     tags: "",
-    alert_policy_json: "{}"
+    alert_policy_json: "{}",
+    runner_selection_mode: "selected_parallel",
+    runner_ids: ["local"]
   };
 }
