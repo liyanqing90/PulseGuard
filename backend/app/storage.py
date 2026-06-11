@@ -781,6 +781,19 @@ def update_probe_runner(runner_id: str, data: dict[str, Any]) -> dict[str, Any] 
         )
         if cursor.rowcount == 0:
             return None
+        if runner_id == LOCAL_RUNNER_ID:
+            for key, value in {
+                "local_runner_name": name,
+                "local_runner_address": address,
+                "local_runner_region": network_region,
+            }.items():
+                conn.execute(
+                    """
+                    INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(value, ensure_ascii=False), timestamp),
+                )
     return get_probe_runner(runner_id)
 
 

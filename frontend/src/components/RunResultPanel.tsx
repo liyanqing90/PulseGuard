@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api";
 import type { Run, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
-import { artifactHref, formatDate, formatDuration, parseSnapshot, runStatusLabel, runStatusTagColor } from "../utils";
+import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerExecutionMeta, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
 type RunResultMode = "detail" | "debug";
@@ -165,6 +165,9 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
           <Descriptions.Item label="状态">
             <RunStatusTag status={run.status} />
           </Descriptions.Item>
+          <Descriptions.Item label="节点执行状态">
+            <RunnerExecutionTag run={run} />
+          </Descriptions.Item>
           <Descriptions.Item label="任务 ID">{isDraftRun ? "草稿调试" : run.check_id}</Descriptions.Item>
           <Descriptions.Item label="任务名称">{run.check_name}</Descriptions.Item>
           <Descriptions.Item label="运行记录">#{run.id}</Descriptions.Item>
@@ -179,9 +182,9 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
           ))}
           <Descriptions.Item label="连续失败">{run.consecutive_failures || "-"}</Descriptions.Item>
           <Descriptions.Item label="失败来源">{failureKindTag(run.failure_kind)}</Descriptions.Item>
-          <Descriptions.Item label="Runner">{runnerSummary(run)}</Descriptions.Item>
-          <Descriptions.Item label="Runner ID">{run.runner_id || "local"}</Descriptions.Item>
-          <Descriptions.Item label="Runner 地址">{run.runner_address || "-"}</Descriptions.Item>
+          <Descriptions.Item label="执行节点">{runnerSummary(run)}</Descriptions.Item>
+          <Descriptions.Item label="节点 ID">{run.runner_id || "local"}</Descriptions.Item>
+          <Descriptions.Item label="节点地址">{run.runner_address || "-"}</Descriptions.Item>
           <Descriptions.Item label="网络区域">{run.runner_region || "-"}</Descriptions.Item>
           <Descriptions.Item label="浏览器版本">{run.runner_browser_version || "-"}</Descriptions.Item>
         </Descriptions>
@@ -254,6 +257,7 @@ export function RunResultPanel({ run, mode = "detail" }: Props) {
       <section className={`run-detail-summary run-detail-${run.status}`}>
         <div className="run-detail-title">
           <RunStatusTag status={run.status} />
+          <RunnerExecutionTag run={run} />
           {isDraftRun && <Tag color="blue">草稿调试</Tag>}
           <div>
             <strong>{run.check_name}</strong>
@@ -546,7 +550,14 @@ function RunGroupPanel({
       )
     },
     {
-      title: "状态",
+      title: "节点结果",
+      dataIndex: "failure_kind",
+      width: 108,
+      align: "center",
+      render: (_, item) => <RunnerExecutionTag run={item} />
+    },
+    {
+      title: "运行状态",
       dataIndex: "status",
       width: 88,
       align: "center",
@@ -872,6 +883,11 @@ function compactAssertionMessage(message?: string | null, path?: string | null, 
 
 function RunStatusTag({ status }: { status: Run["status"] }) {
   return <Tag color={runStatusTagColor(status)}>{runStatusLabel(status)}</Tag>;
+}
+
+function RunnerExecutionTag({ run }: { run: Run }) {
+  const meta = runnerExecutionMeta(run.status, run.failure_kind);
+  return <Tag color={meta.color}>{meta.label}</Tag>;
 }
 
 function formatOperatorValue(value?: string | null): string {

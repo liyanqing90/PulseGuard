@@ -9,7 +9,16 @@ import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { CheckType, NotificationStatus, ObservationKind, ProbeRunner, Run, RunStatus } from "../types";
-import { formatDate, formatDuration, notificationChannelLabel, notificationStatusMeta, notificationStatusTagColor, runStatusLabel, runStatusTagColor } from "../utils";
+import {
+  formatDate,
+  formatDuration,
+  notificationChannelLabel,
+  notificationStatusMeta,
+  notificationStatusTagColor,
+  runnerExecutionMeta,
+  runStatusLabel,
+  runStatusTagColor
+} from "../utils";
 
 const { RangePicker } = DatePicker;
 const HISTORY_PAGE_SIZE = 12;
@@ -23,7 +32,7 @@ const OBSERVATION_KIND_OPTIONS: Array<{ label: string; value: ObservationKind | 
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
 
 const runPaginationItemRender: PaginationProps["itemRender"] = (_, itemType, originalElement) => {
-  const label = itemType === "prev" ? "上一页执行记录" : itemType === "next" ? "下一页执行记录" : "";
+  const label = itemType === "prev" ? "上一页运行记录" : itemType === "next" ? "下一页运行记录" : "";
   if (!label || !isValidElement(originalElement)) return originalElement;
   return cloneElement(originalElement as ReactElement<Record<string, unknown>>, { "aria-label": label, title: label });
 };
@@ -263,11 +272,21 @@ export function RunsPage() {
       width: 150,
       render: (_, run) => (
         <Tooltip title={runnerTooltip(run)}>
-          <Tag>{run.runner_name || run.runner_id || "local"}</Tag>
+          <Space orientation="vertical" size={2}>
+            <Tag>{run.runner_name || run.runner_id || "local"}</Tag>
+            <RunnerExecutionTag run={run} />
+          </Space>
         </Tooltip>
       )
     },
-    { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 92, align: "center" },
+    { title: "运行状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 92, align: "center" },
+    {
+      title: "节点结果",
+      dataIndex: "failure_kind",
+      render: (_, run) => <RunnerExecutionTag run={run} />,
+      width: 104,
+      align: "center"
+    },
     {
       title: "来源",
       dataIndex: "observation_kind",
@@ -441,7 +460,7 @@ export function RunsPage() {
           dataSource={runs}
           loading={loading}
           className="history-table"
-          locale={{ emptyText: <Empty description={hasFilters ? "没有符合筛选条件的执行记录" : "暂无执行记录"} /> }}
+          locale={{ emptyText: <Empty description={hasFilters ? "没有符合筛选条件的运行记录" : "暂无运行记录"} /> }}
           pagination={{
             current: page,
             pageSize: HISTORY_PAGE_SIZE,
@@ -450,7 +469,7 @@ export function RunsPage() {
             itemRender: runPaginationItemRender,
             onChange: setPage
           }}
-          scroll={{ x: 950 }}
+          scroll={{ x: 1060 }}
         />
       )}
       {detailRunId && (
@@ -490,7 +509,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
   if (!runs.length) {
     return (
       <section className="history-card-empty">
-        <Empty description={hasFilters ? "没有符合筛选条件的执行记录" : "暂无执行记录"} />
+        <Empty description={hasFilters ? "没有符合筛选条件的运行记录" : "暂无运行记录"} />
       </section>
     );
   }
@@ -515,6 +534,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               </div>
               <div className="history-card-state">
                 <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>
+                <RunnerExecutionTag run={run} />
                 {failureKindTag(run)}
                 <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>
               </div>
@@ -524,7 +544,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
               <HistoryMeta label="记录来源" value={observationKindLabel(run.observation_kind)} />
               <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
-              <HistoryMeta label="Runner" value={runnerSummary(run)} />
+              <HistoryMeta label="执行节点" value={runnerSummary(run)} />
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
               <HistoryMeta label="连续失败" value={run.consecutive_failures || "-"} />
             </div>
@@ -571,6 +591,11 @@ function HistoryMeta({ label, value }: { label: string; value: string | number }
   );
 }
 
+function RunnerExecutionTag({ run }: { run: Run }) {
+  const meta = runnerExecutionMeta(run.status, run.failure_kind);
+  return <Tag color={meta.color}>{meta.label}</Tag>;
+}
+
 function runnerSummary(run: Run): string {
   const name = (run.runner_name || "local").trim();
   const region = (run.runner_region || "").trim();
@@ -583,7 +608,7 @@ function runnerLabel(runnerId: string, runners: ProbeRunner[]): string {
 
 function runnerTooltip(run: Run): string {
   const details = [
-    `Runner: ${runnerSummary(run)}`,
+    `执行节点: ${runnerSummary(run)}`,
     run.runner_address ? `地址: ${run.runner_address}` : "",
     run.runner_browser_version ? `浏览器: ${run.runner_browser_version}` : ""
   ].filter(Boolean);

@@ -1,4 +1,4 @@
-import type { Check, CheckType, NotificationStatus, RunStatus, TaskSurfaceStatus } from "./types";
+import type { Check, CheckType, FailureKind, NotificationStatus, RunStatus, TaskSurfaceStatus } from "./types";
 
 export type SemanticTagColor = "default" | "blue" | "success" | "warning" | "error" | "processing";
 
@@ -66,6 +66,21 @@ export function runStatusTagColor(status: RunStatus): SemanticTagColor {
   if (status === "running" || status === "pending") return "processing";
   if (status === "skipped") return "warning";
   return "default";
+}
+
+export function runnerExecutionMeta(status: RunStatus, failureKind?: FailureKind | null): { label: string; color: SemanticTagColor } {
+  if (status === "pending") return { label: "等待中", color: "processing" };
+  if (status === "running") return { label: "执行中", color: "processing" };
+  if (failureKind === "runner" || (status === "skipped" && failureKind !== "target")) {
+    return { label: "节点异常", color: "warning" };
+  }
+  if ((status === "failed" || status === "timeout") && failureKind === "target") {
+    return { label: "目标失败", color: "error" };
+  }
+  if (status === "ok") return { label: "成功", color: "success" };
+  if (status === "skipped") return { label: "已跳过", color: "warning" };
+  if (status === "failed" || status === "timeout") return { label: runStatusLabel(status), color: "error" };
+  return { label: runStatusLabel(status), color: runStatusTagColor(status) };
 }
 
 export function notificationStatusTagColor(status?: NotificationStatus | null): SemanticTagColor {

@@ -607,6 +607,33 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(updated["metadata"], {"capability": "api"})
         self.assertEqual({runner["runner_id"] for runner in runners}, {"local", "office-1"})
 
+    def test_local_runner_update_persists_to_settings(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            updated = storage.update_probe_runner(
+                "local",
+                {
+                    "name": "Main Node",
+                    "address": "http://127.0.0.1:8787",
+                    "network_region": "office",
+                    "enabled": True,
+                },
+            )
+            settings = storage.get_settings()
+            storage.init_db()
+            reloaded = storage.get_probe_runner("local")
+
+        self.assertIsNotNone(updated)
+        self.assertEqual(settings["local_runner_name"], "Main Node")
+        self.assertEqual(settings["local_runner_address"], "http://127.0.0.1:8787")
+        self.assertEqual(settings["local_runner_region"], "office")
+        self.assertIsNotNone(reloaded)
+        self.assertEqual(reloaded["name"], "Main Node")
+        self.assertEqual(reloaded["address"], "http://127.0.0.1:8787")
+        self.assertEqual(reloaded["network_region"], "office")
+
     def test_managed_runner_supplied_token_is_hidden_and_rotation_invalidates_old_token(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"

@@ -1,5 +1,19 @@
 import { Button, Menu, Modal, Typography } from "antd";
-import { History, LayoutDashboard, Megaphone, MonitorCheck, PlugZap, ScrollText, Settings, ShieldCheck, Users } from "lucide-react";
+import type { MenuProps } from "antd";
+import {
+  Activity,
+  BellRing,
+  History,
+  KeyRound,
+  LayoutDashboard,
+  Megaphone,
+  MonitorCheck,
+  PlugZap,
+  ScrollText,
+  Settings,
+  Users
+} from "lucide-react";
+import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
@@ -8,34 +22,80 @@ import { formatDate } from "../utils";
 
 const { Text, Title } = Typography;
 
-const navItems = [
+type NavLeaf = {
+  to: string;
+  label: string;
+  icon: ReactNode;
+};
+
+type NavEntry =
+  | NavLeaf
+  | {
+      key: string;
+      label: string;
+      icon: ReactNode;
+      children: NavLeaf[];
+    };
+
+const navEntries: NavEntry[] = [
   { to: "/", label: "总览", icon: <LayoutDashboard size={16} /> },
-  { to: "/ui-checks", label: "页面监控", icon: <MonitorCheck size={16} /> },
-  { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> },
+  {
+    key: "monitoring",
+    label: "监控任务",
+    icon: <MonitorCheck size={16} />,
+    children: [
+      { to: "/ui-checks", label: "页面监控", icon: <MonitorCheck size={16} /> },
+      { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> }
+    ]
+  },
   { to: "/runs", label: "运行记录", icon: <History size={16} /> },
-  { to: "/status", label: "内网状态", icon: <ShieldCheck size={16} /> },
-  { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> },
   { to: "/members", label: "成员管理", icon: <Users size={16} /> },
-  { to: "/settings", label: "系统设置", icon: <Settings size={16} /> }
+  {
+    key: "system",
+    label: "系统设置",
+    icon: <Settings size={16} />,
+    children: [
+      { to: "/settings/execution", label: "执行配置", icon: <Activity size={16} /> },
+      { to: "/settings/alerts", label: "告警配置", icon: <BellRing size={16} /> },
+      { to: "/settings/variables", label: "变量管理", icon: <KeyRound size={16} /> },
+      { to: "/settings/system", label: "系统配置", icon: <Settings size={16} /> },
+      { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> }
+    ]
+  }
 ];
 
-const titles: Record<string, string> = {
-  "/": "总览",
-  "/ui-checks": "页面监控",
-  "/api-checks": "接口监控",
-  "/runs": "运行记录",
-  "/members": "成员管理",
-  "/status": "内网状态",
-  "/operations": "运维审计",
-  "/settings": "系统设置"
-};
+const navItems = navEntries.flatMap((entry) => ("to" in entry ? [entry] : entry.children));
+
+const menuItems: MenuProps["items"] = navEntries.map((entry) => {
+  if ("to" in entry) {
+    return { key: entry.to, icon: entry.icon, label: entry.label };
+  }
+  return {
+    key: entry.key,
+    icon: entry.icon,
+    label: entry.label,
+    children: entry.children.map((item) => ({ key: item.to, icon: item.icon, label: item.label }))
+  };
+});
+
+const defaultOpenKeys = navEntries.flatMap((entry) => ("to" in entry ? [] : [entry.key]));
+
+const titles: Record<string, string> = Object.fromEntries(navItems.map((item) => [item.to, item.label]));
+
+function pathMatchesNavItem(pathname: string, itemPath: string): boolean {
+  if (itemPath === "/") return pathname === "/";
+  return pathname === itemPath || pathname.startsWith(`${itemPath}/`);
+}
 
 export function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [maintenance, setMaintenance] = useState<StatusPageSnapshot["maintenance"] | null>(null);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
-  const selectedPath = navItems.find((item) => item.to !== "/" && location.pathname.startsWith(item.to))?.to || "/";
+  const selectedPath =
+    [...navItems]
+      .sort((left, right) => right.to.length - left.to.length)
+      .find((item) => pathMatchesNavItem(location.pathname, item.to))?.to || "/";
   const activeTitle = location.pathname.startsWith("/debug")
     ? "全屏调试"
     : titles[selectedPath] || (location.pathname.startsWith("/runs") ? "运行记录" : "PulseGuard");
@@ -84,9 +144,15 @@ export function Layout() {
         <Menu
           className="nav-menu"
           mode="inline"
+          defaultOpenKeys={defaultOpenKeys}
           selectedKeys={[selectedPath]}
-          items={navItems.map((item) => ({ key: item.to, icon: item.icon, label: item.label }))}
-          onClick={({ key }) => navigate(key)}
+          items={menuItems}
+          onClick={({ key }) => {
+            const path = String(key);
+            if (navItems.some((item) => item.to === path)) {
+              navigate(path);
+            }
+          }}
         />
       </aside>
       <main className="main-area" id="main-content">

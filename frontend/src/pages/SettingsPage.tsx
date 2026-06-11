@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Drawer, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Skeleton, Space, Statistic, Switch, Tabs, Tag, Tooltip, Upload } from "antd";
+import { Alert, App, Button, Card, Drawer, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
 import type { UploadProps } from "antd";
 import {
   BellRing,
@@ -10,6 +10,7 @@ import {
   Info,
   KeyRound,
   Monitor,
+  Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -22,10 +23,9 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { StructuredViewer } from "../components/StructuredViewer";
-import { OperationsPage } from "./OperationsPage";
-import { StatusPage } from "./StatusPage";
 import type {
   AlertTagPolicy,
   AlertPreview,
@@ -44,8 +44,32 @@ import type {
 } from "../types";
 import { dirtyTagColor, enabledTagColor, formatDate } from "../utils";
 
-type SettingsTab = "alerts" | "runtime" | "browser" | "variables" | "retention" | "access" | "maintenance" | "config";
-type AccessDrawer = "status" | "operations" | null;
+type SettingsTab = "alerts" | "execution" | "variables" | "system";
+
+const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
+  alerts: "告警配置",
+  execution: "执行配置",
+  variables: "变量管理",
+  system: "系统配置"
+};
+
+const SETTINGS_TAB_KEYS = new Set<SettingsTab>(Object.keys(SETTINGS_TAB_LABELS) as SettingsTab[]);
+
+const SETTINGS_TAB_ALIASES: Record<string, SettingsTab> = {
+  runtime: "execution",
+  nodes: "execution",
+  browser: "execution",
+  retention: "system",
+  access: "system",
+  maintenance: "system",
+  config: "system"
+};
+
+function normalizeSettingsTab(value?: string): SettingsTab {
+  if (!value) return "execution";
+  if (SETTINGS_TAB_KEYS.has(value as SettingsTab)) return value as SettingsTab;
+  return SETTINGS_TAB_ALIASES[value] || "execution";
+}
 
 const CHANNEL_OPTIONS: Array<{ label: string; value: WebhookType }> = [
   { label: "飞书", value: "feishu" },
@@ -90,6 +114,9 @@ const CONFIG_SUMMARY_ITEMS: Array<{ key: keyof ConfigImportSummary; label: strin
 
 export function SettingsPage() {
   const { message } = App.useApp();
+  const navigate = useNavigate();
+  const { tab } = useParams<{ tab?: string }>();
+  const activeTab = normalizeSettingsTab(tab);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
   const [savedSettings, setSavedSettings] = useState<SettingsValues | null>(null);
   const [loading, setLoading] = useState(true);
@@ -98,7 +125,6 @@ export function SettingsPage() {
   const [previewing, setPreviewing] = useState(false);
   const [alertPreview, setAlertPreview] = useState<AlertPreview | null>(null);
   const [newChannelType, setNewChannelType] = useState<WebhookType>("feishu");
-  const [activeTab, setActiveTab] = useState<SettingsTab>("alerts");
   const [exportingConfig, setExportingConfig] = useState(false);
   const [importDrawerOpen, setImportDrawerOpen] = useState(false);
   const [importBundle, setImportBundle] = useState<ConfigBundle | null>(null);
@@ -113,7 +139,12 @@ export function SettingsPage() {
   const [createdReadOnlyToken, setCreatedReadOnlyToken] = useState<{ name: string; token: string } | null>(null);
   const [databaseBackups, setDatabaseBackups] = useState<DatabaseBackup[]>([]);
   const [backupBusy, setBackupBusy] = useState(false);
-  const [accessDrawer, setAccessDrawer] = useState<AccessDrawer>(null);
+
+  useEffect(() => {
+    if (tab !== activeTab) {
+      navigate(`/settings/${activeTab}`, { replace: true });
+    }
+  }, [activeTab, navigate, tab]);
 
   useEffect(() => {
     api
@@ -127,7 +158,7 @@ export function SettingsPage() {
   }, [message]);
 
   useEffect(() => {
-    if (activeTab !== "retention") return;
+    if (activeTab !== "system") return;
     void loadDatabaseBackups();
   }, [activeTab]);
 
@@ -286,7 +317,7 @@ export function SettingsPage() {
         notification_channels: settings.notification_channels.map(toPayloadChannel)
       };
     }
-    if (scope === "runtime") {
+    if (scope === "execution") {
       return {
         default_interval_seconds: settings.default_interval_seconds,
         default_ui_timeout_ms: settings.default_ui_timeout_ms,
@@ -301,13 +332,6 @@ export function SettingsPage() {
         api_retry_attempts: settings.api_retry_attempts,
         ui_retry_attempts: settings.ui_retry_attempts,
         stale_after_intervals: settings.stale_after_intervals,
-        local_runner_name: (settings.local_runner_name || "").trim(),
-        local_runner_address: (settings.local_runner_address || "").trim(),
-        local_runner_region: (settings.local_runner_region || "").trim()
-      };
-    }
-    if (scope === "browser") {
-      return {
         browser_headless: settings.browser_headless,
         browser_type: settings.browser_type,
         browser_proxy: settings.browser_proxy,
@@ -319,18 +343,14 @@ export function SettingsPage() {
         environment_variables: settings.environment_variables.map(toPayloadEnvironmentVariable)
       };
     }
-    if (scope === "retention") {
+    if (scope === "system") {
       return {
-      run_retention_days: settings.run_retention_days,
-      screenshot_retention_days: settings.screenshot_retention_days,
-      trace_retention_days: settings.trace_retention_days,
-      response_retention_days: settings.response_retention_days,
-      success_response_artifacts_enabled: settings.success_response_artifacts_enabled,
-      database_backup_retention: settings.database_backup_retention
-      };
-    }
-    if (scope === "maintenance") {
-      return {
+        run_retention_days: settings.run_retention_days,
+        screenshot_retention_days: settings.screenshot_retention_days,
+        trace_retention_days: settings.trace_retention_days,
+        response_retention_days: settings.response_retention_days,
+        success_response_artifacts_enabled: settings.success_response_artifacts_enabled,
+        database_backup_retention: settings.database_backup_retention,
         maintenance_enabled: Boolean(settings.maintenance_enabled),
         maintenance_title: (settings.maintenance_title || "").trim(),
         maintenance_message: (settings.maintenance_message || "").trim(),
@@ -349,7 +369,7 @@ export function SettingsPage() {
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
       setAlertPreview(null);
-      if (scope === "maintenance") {
+      if (scope === "system") {
         window.dispatchEvent(new Event("pulseguard:maintenance-updated"));
       }
       message.success("当前页设置已保存");
@@ -376,7 +396,7 @@ export function SettingsPage() {
       setReadOnlyTokenCreateOpen(false);
       setReadOnlyTokenNameDraft("");
       setCreatedReadOnlyToken({ name: created.name, token: created.token });
-      message.success("只读访问令牌已新建");
+      message.success("开放接口令牌已新建");
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -391,7 +411,7 @@ export function SettingsPage() {
       setSettings(cloneSettings(values));
       setSavedSettings(cloneSettings(values));
       setCreatedReadOnlyToken(null);
-      message.success("只读访问令牌已删除");
+      message.success("开放接口令牌已删除");
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -538,7 +558,7 @@ export function SettingsPage() {
   const variableBlockingError = firstVariableBlockingError(settings.environment_variables);
   const readyChannels = readyNotificationChannels(settings.notification_channels);
   const hasUnsavedChanges = Boolean(savedSettings && settingsChanged(settings, savedSettings));
-  const settingsTabCanSave = activeTab !== "config" && activeTab !== "access";
+  const settingsTabCanSave = true;
   const activeTabChanged = Boolean(savedSettings && settingsTabCanSave && settingsTabChanged(settings, savedSettings, activeTab));
   const alertSettingsChanged = Boolean(savedSettings && settingsTabChanged(settings, savedSettings, "alerts"));
   const activeTabBlockingError = activeTab === "alerts" ? blockingError || alertTagPolicyError : activeTab === "variables" ? variableBlockingError : "";
@@ -564,7 +584,7 @@ export function SettingsPage() {
       <section className="settings-command-bar">
         <div>
           <div className="settings-title-row">
-            <h2>运行与告警控制台</h2>
+            <h2>{SETTINGS_TAB_LABELS[activeTab]}</h2>
             <Tooltip title={hasUnsavedChanges ? "当前页存在未保存内容" : "当前内容与已保存配置一致"}>
               <Tag color={dirtyTagColor(hasUnsavedChanges)}>{hasUnsavedChanges ? "未保存更改" : "已保存"}</Tag>
             </Tooltip>
@@ -580,42 +600,6 @@ export function SettingsPage() {
           {settingsTabCanSave && <SaveSettingsButton loading={saving} disabledReason={saveDisabledReason} onClick={() => save()} />}
         </Space>
       </section>
-
-      <section className="settings-summary">
-        <Card className={`summary-card ${settings.alerts_enabled ? "metric-success" : ""}`}>
-          <span className="metric-icon"><BellRing size={17} /></span>
-          <Statistic title="告警状态" value={settings.alerts_enabled ? "已启用" : "未启用"} />
-        </Card>
-        <Card className={`summary-card ${readyChannels.length > 0 ? "metric-success" : "metric-warning"}`}>
-          <span className="metric-icon"><ShieldCheck size={17} /></span>
-          <Statistic title="可发送渠道" value={`${readyChannels.length}/${settings.notification_channels.length}`} />
-        </Card>
-        <Card className={`summary-card ${settings.recovery_notification ? "metric-success" : ""}`}>
-          <span className="metric-icon"><CheckCircle2 size={17} /></span>
-          <Statistic title="恢复通知" value={settings.recovery_notification ? "发送" : "关闭"} />
-        </Card>
-        <Card className="summary-card">
-          <span className="metric-icon"><Database size={17} /></span>
-          <Statistic title="历史保留" value={`${settings.run_retention_days} 天`} />
-        </Card>
-      </section>
-
-      <Tabs
-        activeKey={activeTab}
-        className="settings-tabs"
-        moreIcon={<span className="settings-tabs-more">更多</span>}
-        onChange={(key) => setActiveTab(key as SettingsTab)}
-        items={[
-          { key: "alerts", label: "告警通知" },
-          { key: "runtime", label: "执行参数" },
-          { key: "browser", label: "浏览器" },
-          { key: "variables", label: "变量占位符" },
-          { key: "retention", label: "数据保留" },
-          { key: "access", label: "访问出口" },
-          { key: "maintenance", label: "维护公告" },
-          { key: "config", label: "配置迁移" }
-        ]}
-      />
 
       <section className={`settings-layout settings-layout-${activeTab}`}>
         {activeTab === "alerts" && (
@@ -728,7 +712,7 @@ export function SettingsPage() {
           </>
         )}
 
-        {activeTab === "runtime" && (
+        {activeTab === "execution" && (
         <>
         <SettingsPanel title="执行设置" icon={<Zap size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
@@ -745,40 +729,14 @@ export function SettingsPage() {
             <NumberItem label="API 失败重试次数" value={settings.api_retry_attempts} min={0} max={3} suffix="次" onChange={(value) => update("api_retry_attempts", value)} />
             <NumberItem label="UI 失败重试次数" value={settings.ui_retry_attempts} min={0} max={3} suffix="次" onChange={(value) => update("ui_retry_attempts", value)} />
             <NumberItem label="观测过期判定周期数" value={settings.stale_after_intervals} min={1} max={10} suffix="个周期" onChange={(value) => update("stale_after_intervals", value)} />
-            <Form.Item label="Runner 名称">
-              <Input
-                name="local-runner-name"
-                value={settings.local_runner_name || ""}
-                onChange={(event) => update("local_runner_name", event.target.value)}
-                placeholder="local"
-                autoComplete="off"
-              />
-            </Form.Item>
-            <Form.Item label="Runner 地址">
-              <Input
-                name="local-runner-address"
-                value={settings.local_runner_address || ""}
-                onChange={(event) => update("local_runner_address", event.target.value)}
-                placeholder="127.0.0.1"
-                autoComplete="off"
-              />
-            </Form.Item>
-            <Form.Item label="Runner 网络区域">
-              <Input
-                name="local-runner-region"
-                value={settings.local_runner_region || ""}
-                onChange={(event) => update("local_runner_region", event.target.value)}
-                placeholder="local"
-                autoComplete="off"
-              />
-            </Form.Item>
           </Form>
         </SettingsPanel>
-        <RunnerNodePanel />
         </>
         )}
 
-        {activeTab === "browser" && (
+        {activeTab === "execution" && <RunnerNodePanel />}
+
+        {activeTab === "execution" && (
         <SettingsPanel title="浏览器设置" icon={<Monitor size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <Form.Item label="Headless">
@@ -843,7 +801,7 @@ export function SettingsPage() {
         </SettingsPanel>
         )}
 
-        {activeTab === "retention" && (
+        {activeTab === "system" && (
         <>
         <SettingsPanel title="数据保留" icon={<Database size={18} />}>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
@@ -895,9 +853,9 @@ export function SettingsPage() {
         </>
         )}
 
-        {activeTab === "access" && (
+        {activeTab === "system" && (
           <>
-            <SettingsPanel title="只读访问令牌" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
+            <SettingsPanel title="开放接口令牌" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
               <Space orientation="vertical" size={14} className="drawer-stack">
                 <div className="read-only-token-toolbar">
                   <Space size={8} wrap>
@@ -914,7 +872,7 @@ export function SettingsPage() {
                   </Button>
                 </div>
                 {readOnlyTokens.length === 0 ? (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无只读访问令牌" />
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无开放接口令牌" />
                 ) : (
                   <Space orientation="vertical" size={10} className="drawer-stack">
                     {readOnlyTokens.map((token) => (
@@ -925,7 +883,7 @@ export function SettingsPage() {
                             <span>创建时间 {formatDate(token.created_at)}</span>
                           </div>
                           <Popconfirm
-                            title="删除只读访问令牌"
+                            title="删除开放接口令牌"
                             description="删除后，使用该令牌的外部调用会立即失效。"
                             okText="删除"
                             cancelText="取消"
@@ -941,17 +899,13 @@ export function SettingsPage() {
                   </Space>
                 )}
               </Space>
-              <Space wrap className="settings-secondary-actions">
-                <Button onClick={() => setAccessDrawer("status")}>打开内网状态</Button>
-                <Button onClick={() => setAccessDrawer("operations")}>打开运维审计</Button>
-              </Space>
             </SettingsPanel>
 
             <ReadOnlyApiDocs onCopyPath={(path) => copyValue(path, "已复制 Path")} />
           </>
         )}
 
-        {activeTab === "maintenance" && (
+        {activeTab === "system" && (
           <SettingsPanel title="维护公告" icon={<ShieldCheck size={18} />} className="settings-panel-wide">
               <Alert
                 type="info"
@@ -984,7 +938,7 @@ export function SettingsPage() {
             </SettingsPanel>
         )}
 
-        {activeTab === "config" && (
+        {activeTab === "system" && (
         <ConfigTransferPanel
           exporting={exportingConfig}
           uploadProps={importUploadProps}
@@ -1027,19 +981,8 @@ export function SettingsPage() {
         </div>
       </Modal>
 
-      <Drawer
-        title={accessDrawer === "status" ? "内网状态" : "运维审计"}
-        open={Boolean(accessDrawer)}
-        width="min(1120px, 92vw)"
-        destroyOnHidden
-        onClose={() => setAccessDrawer(null)}
-      >
-        {accessDrawer === "status" && <StatusPage />}
-        {accessDrawer === "operations" && <OperationsPage />}
-      </Drawer>
-
       <Modal
-        title="新建只读访问令牌"
+        title="新建开放接口令牌"
         open={readOnlyTokenCreateOpen}
         okText="新建"
         cancelText="取消"
@@ -1121,6 +1064,8 @@ function RunnerNodePanel() {
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [authRunner, setAuthRunner] = useState<{ runner: ProbeRunner; token: string } | null>(null);
+  const [editRunner, setEditRunner] = useState<{ runner: ProbeRunner; draft: ProbeRunnerPayload } | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   useEffect(() => {
     void loadRunners();
@@ -1140,6 +1085,18 @@ function RunnerNodePanel() {
   function openCreateDrawer() {
     setDraft(emptyRunnerDraft);
     setDrawerOpen(true);
+  }
+
+  function openEditDrawer(runner: ProbeRunner) {
+    setEditRunner({
+      runner,
+      draft: {
+        name: runner.name || runner.runner_id,
+        address: runner.address || "",
+        network_region: runner.network_region || "local",
+        enabled: runner.enabled
+      }
+    });
   }
 
   async function createRunner() {
@@ -1176,6 +1133,33 @@ function RunnerNodePanel() {
     } catch (err) {
       message.error((err as Error).message);
     } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function saveRunnerEdit() {
+    if (!editRunner) return;
+    const payload: ProbeRunnerPayload = {
+      name: editRunner.draft.name.trim(),
+      address: editRunner.draft.address.trim(),
+      network_region: editRunner.draft.network_region.trim() || "local",
+      enabled: editRunner.draft.enabled !== false
+    };
+    if (!payload.name || !payload.address) {
+      message.error("请填写节点名称和地址");
+      return;
+    }
+    setSaving(true);
+    setBusyId(editRunner.runner.runner_id);
+    try {
+      await api.updateRunner(editRunner.runner.runner_id, payload);
+      setEditRunner(null);
+      await loadRunners();
+      message.success("执行节点已更新");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setSaving(false);
       setBusyId(null);
     }
   }
@@ -1235,6 +1219,9 @@ function RunnerNodePanel() {
             <Tag color="processing">{runners.length} 个节点</Tag>
           </Space>
           <Space size={8} wrap>
+            <Button icon={<Info size={16} />} onClick={() => setHelpOpen(true)}>
+              部署方法
+            </Button>
             <Button icon={<RefreshCw size={16} />} loading={loading} onClick={loadRunners}>
               刷新
             </Button>
@@ -1273,6 +1260,9 @@ function RunnerNodePanel() {
                       onChange={(enabled) => updateRunnerEnabled(runner, enabled)}
                       aria-label={`切换执行节点 ${runner.runner_id}`}
                     />
+                    <Button icon={<Pencil size={15} />} loading={busyId === runner.runner_id} onClick={() => openEditDrawer(runner)}>
+                      编辑
+                    </Button>
                     <Button loading={busyId === runner.runner_id} onClick={() => testRunner(runner)}>
                       测试连接
                     </Button>
@@ -1345,6 +1335,62 @@ function RunnerNodePanel() {
         </Form>
       </Drawer>
 
+      <Drawer
+        title="编辑执行节点"
+        width={520}
+        open={Boolean(editRunner)}
+        destroyOnHidden
+        onClose={() => setEditRunner(null)}
+        extra={
+          <Button type="primary" icon={<Save size={16} />} loading={saving} onClick={saveRunnerEdit}>
+            保存
+          </Button>
+        }
+      >
+        <Form layout="vertical" autoComplete="off">
+          <Form.Item label="节点名称" required>
+            <Input
+              value={editRunner?.draft.name || ""}
+              onChange={(event) =>
+                setEditRunner((current) =>
+                  current ? { ...current, draft: { ...current.draft, name: event.target.value } } : current
+                )
+              }
+            />
+          </Form.Item>
+          <Form.Item label="节点地址" required>
+            <Input
+              value={editRunner?.draft.address || ""}
+              placeholder={editRunner?.runner.role === "local" ? "127.0.0.1" : "http://10.0.0.12:8788"}
+              onChange={(event) =>
+                setEditRunner((current) =>
+                  current ? { ...current, draft: { ...current.draft, address: event.target.value } } : current
+                )
+              }
+            />
+          </Form.Item>
+          <Form.Item label="网络区域">
+            <Input
+              value={editRunner?.draft.network_region || ""}
+              placeholder="local"
+              onChange={(event) =>
+                setEditRunner((current) =>
+                  current ? { ...current, draft: { ...current.draft, network_region: event.target.value } } : current
+                )
+              }
+            />
+          </Form.Item>
+          <Form.Item label="启用状态">
+            <Switch
+              checked={editRunner?.draft.enabled !== false}
+              onChange={(enabled) =>
+                setEditRunner((current) => (current ? { ...current, draft: { ...current.draft, enabled } } : current))
+              }
+            />
+          </Form.Item>
+        </Form>
+      </Drawer>
+
       <Modal
         title="更新节点认证"
         open={Boolean(authRunner)}
@@ -1363,6 +1409,24 @@ function RunnerNodePanel() {
             />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal title="创建子节点" open={helpOpen} footer={null} onCancel={() => setHelpOpen(false)} width={720}>
+        <Space orientation="vertical" size={12} className="drawer-stack">
+          <span>子节点不会主动注册。先在子节点服务器启动 worker，再回到这里点击“新增子节点”，填写子节点地址和日志输出的 token。</span>
+          <div className="worker-help-block">
+            <strong>Docker 一行启动</strong>
+            <pre>{`curl -fsSL "http://<可访问地址>/docker-compose.worker.yml" -o docker-compose.worker.yml
+docker compose -f docker-compose.worker.yml up -d
+docker logs -f pulseguard-worker`}</pre>
+          </div>
+          <div className="worker-help-block">
+            <strong>刷新子节点 token</strong>
+            <pre>{`docker compose -f docker-compose.worker.yml exec pulseguard-worker python -m app.worker --rotate-token
+docker compose -f docker-compose.worker.yml restart pulseguard-worker`}</pre>
+          </div>
+          <span>添加时地址通常是 <code>http://&lt;子节点 IP&gt;:8788</code>。保存后先测试连接，测试通过后再把任务绑定到该节点。</span>
+        </Space>
       </Modal>
     </SettingsPanel>
   );
@@ -1406,20 +1470,13 @@ function copyTextWithTextarea(value: string): boolean {
 
 function ReadOnlyApiDocs({ onCopyPath }: { onCopyPath: (path: string) => void }) {
   return (
-    <SettingsPanel title="只读 API 文档" icon={<Clipboard size={18} />} className="settings-panel-wide">
+    <SettingsPanel title="开放接口文档" icon={<Clipboard size={18} />} className="settings-panel-wide">
       <Space orientation="vertical" size={12} className="drawer-stack">
         <Card size="small" title={<EndpointTitle path="/api/read-only/snapshot" onCopy={onCopyPath} />}>
           <Space orientation="vertical" size={8}>
             <span>用途：给外部看板、脚本或巡检工具读取当前监控概况、任务状态和最近运行。</span>
-            <span>鉴权：需要只读访问令牌，推荐使用 Authorization: Bearer &lt;token&gt;；也兼容 X-PulseGuard-Read-Only-Token 请求头或 token 查询参数。</span>
+            <span>鉴权：需要开放接口令牌，推荐使用 Authorization: Bearer &lt;token&gt;；也兼容 X-PulseGuard-Read-Only-Token 请求头或 token 查询参数。</span>
             <pre>{`curl -H "Authorization: Bearer <token>" "http://<host>:8787/api/read-only/snapshot"`}</pre>
-          </Space>
-        </Card>
-
-        <Card size="small" title={<EndpointTitle path="/api/status-page" onCopy={onCopyPath} />}>
-          <Space orientation="vertical" size={8}>
-            <span>用途：内网状态页数据源，返回脱敏后的任务健康状态和最近异常。</span>
-            <span>鉴权：不需要只读令牌，适合内网只读展示。</span>
           </Space>
         </Card>
 
@@ -2426,10 +2483,7 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     recovery_confirmation_count: values.recovery_confirmation_count,
     api_retry_attempts: values.api_retry_attempts,
     ui_retry_attempts: values.ui_retry_attempts,
-    stale_after_intervals: values.stale_after_intervals,
-    local_runner_name: values.local_runner_name || "",
-    local_runner_address: values.local_runner_address || "",
-    local_runner_region: values.local_runner_region || ""
+    stale_after_intervals: values.stale_after_intervals
   };
   const browser = {
     browser_headless: values.browser_headless,
@@ -2470,14 +2524,13 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     maintenance_starts_at: values.maintenance_starts_at || "",
     maintenance_ends_at: values.maintenance_ends_at || ""
   };
+  const execution = { runtime, browser };
+  const system = { retention, access, maintenance };
   if (tab === "alerts") return alerts;
-  if (tab === "runtime") return runtime;
-  if (tab === "browser") return browser;
+  if (tab === "execution") return execution;
   if (tab === "variables") return variables;
-  if (tab === "retention") return retention;
-  if (tab === "access") return access;
-  if (tab === "maintenance") return maintenance;
-  return { alerts, runtime, browser, variables, retention, access, maintenance };
+  if (tab === "system") return system;
+  return { alerts, execution, variables, system };
 }
 
 function cloneSettings(values: SettingsValues): SettingsValues {

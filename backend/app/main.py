@@ -1136,7 +1136,22 @@ def frontend_index():
 def frontend_spa(full_path: str):
     if full_path.startswith("api/") or full_path.startswith("artifacts/"):
         raise HTTPException(status_code=404, detail="资源不存在")
+    static_file = _serve_frontend_static_file(full_path)
+    if static_file is not None:
+        return static_file
     return _serve_frontend()
+
+
+def _serve_frontend_static_file(full_path: str):
+    static_root = Path(STATIC_DIR).resolve()
+    candidate = (static_root / full_path).resolve()
+    if candidate == static_root / "index.html":
+        return None
+    if not candidate.is_relative_to(static_root):
+        raise HTTPException(status_code=404, detail="资源不存在")
+    if candidate.is_file():
+        return FileResponse(candidate)
+    return None
 
 
 def _serve_frontend():

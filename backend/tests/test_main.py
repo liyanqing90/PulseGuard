@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -45,6 +47,24 @@ class FakeScheduler:
 
     def sync_check(self, check_id: int) -> None:
         self.synced.append(check_id)
+
+
+class FrontendRouteTests(unittest.TestCase):
+    def test_frontend_root_static_file_is_served_before_spa_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            static_dir = Path(tmpdir)
+            (static_dir / "index.html").write_text('<div id="root"></div>', encoding="utf-8")
+            (static_dir / "favicon.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8")
+
+            with patch("backend.app.main.STATIC_DIR", static_dir):
+                favicon = TestClient(app).get("/favicon.svg")
+                fallback = TestClient(app).get("/unknown-route")
+
+        self.assertEqual(favicon.status_code, 200)
+        self.assertIn("image/svg+xml", favicon.headers["content-type"])
+        self.assertIn("<svg", favicon.text)
+        self.assertEqual(fallback.status_code, 200)
+        self.assertIn('id="root"', fallback.text)
 
 
 class RunAllRouteTests(unittest.TestCase):

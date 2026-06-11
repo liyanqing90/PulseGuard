@@ -228,7 +228,7 @@ export function OperationsPage() {
 
   const runnerColumns: ColumnsType<ProbeRunner> = [
     {
-      title: "Runner",
+      title: "执行节点",
       dataIndex: "name",
       render: (value: string, runner) => (
         <div className="runner-cell">
@@ -283,11 +283,11 @@ export function OperationsPage() {
       width: 96,
       align: "right",
       render: (_, runner) => (
-        <Tooltip title="查看 Runner 元数据">
+        <Tooltip title="查看执行节点元数据">
           <Button
             icon={<Eye size={16} />}
-            onClick={() => setDrawer({ title: `Runner ${runner.runner_id}`, value: runnerDetail(runner) })}
-            aria-label={`查看 Runner ${runner.runner_id}`}
+            onClick={() => setDrawer({ title: `执行节点 ${runner.runner_id}`, value: runnerDetail(runner) })}
+            aria-label={`查看执行节点 ${runner.runner_id}`}
           />
         </Tooltip>
       )
@@ -318,10 +318,10 @@ export function OperationsPage() {
         items={[
           {
             key: "runners",
-            label: "Runner 状态",
+            label: "执行节点状态",
             children:
               runners.length === 0 ? (
-                <Empty description="暂无 Runner 心跳" />
+                <Empty description="暂无执行节点心跳" />
               ) : (
                 <Table rowKey="runner_id" columns={runnerColumns} dataSource={runners} pagination={{ pageSize: 12 }} />
               )
@@ -432,7 +432,7 @@ function entityTypeLabel(value: string): string {
       config: "配置",
       settings: "设置",
       batch: "批量操作",
-      runner: "Runner"
+      runner: "执行节点"
     }[value] || "其他"
   );
 }
@@ -499,8 +499,8 @@ function assignedRunnerCount(runner: ProbeRunner, checks: Check[]): number {
 
 function runnerDetail(runner: ProbeRunner): Record<string, unknown> {
   return {
-    Runner: runner.name || runner.runner_id,
-    RunnerID: runner.runner_id,
+    执行节点: runner.name || runner.runner_id,
+    "节点 ID": runner.runner_id,
     地址: runner.address || "-",
     网络区域: runner.network_region || "local",
     角色: runner.role === "local" ? "本机" : "子节点",
