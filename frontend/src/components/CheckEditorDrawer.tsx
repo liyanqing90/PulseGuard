@@ -41,8 +41,9 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const debugStale = useMemo(() => Boolean(debugRun && debugSnapshot && !sameCheckPayload(form, debugSnapshot)), [debugRun, debugSnapshot, form]);
   const alertPolicy = useMemo(() => parseCheckAlertPolicy(form.alert_policy_json), [form.alert_policy_json]);
   const alertPolicyMode = useMemo(() => (hasAlertPolicyOverrides(alertPolicy) ? "custom" : "inherit"), [alertPolicy]);
-  const runnerOptions = useMemo(() => {
-    const list = runners.length
+  const selectedRunnerIds = useMemo(() => form.runner_ids ?? ["local"], [form.runner_ids]);
+  const runnerList = useMemo(() => {
+    return runners.length
       ? runners
       : [
           {
@@ -59,12 +60,28 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             updated_at: ""
           } as ProbeRunner
         ];
-    return list.map((runner) => ({
-      label: `${runner.name || runner.runner_id} · ${runner.network_region || "local"}${runner.enabled ? "" : " · 已停用"}`,
-      value: runner.runner_id,
-      disabled: !runner.enabled
-    }));
   }, [runners]);
+  const availableRunnerIds = useMemo(() => runnerList.filter(isSelectableRunner).map((runner) => runner.runner_id), [runnerList]);
+  const runnerOptions = useMemo(() => {
+    const selected = new Set(selectedRunnerIds);
+    const visible = runnerList.filter((runner) => isSelectableRunner(runner) || (Boolean(activeCheck) && selected.has(runner.runner_id)));
+    const seen = new Set<string>();
+    return visible
+      .filter((runner) => {
+        if (seen.has(runner.runner_id)) return false;
+        seen.add(runner.runner_id);
+        return true;
+      })
+      .map((runner) => ({
+        label: runnerOptionLabel(runner),
+        value: runner.runner_id,
+        disabled: !isSelectableRunner(runner)
+      }));
+  }, [activeCheck, runnerList, selectedRunnerIds]);
+  const hiddenUnavailableRunnerCount = useMemo(() => {
+    const selected = new Set(selectedRunnerIds);
+    return runnerList.filter((runner) => !selected.has(runner.runner_id) && !isSelectableRunner(runner)).length;
+  }, [runnerList, selectedRunnerIds]);
   const running = Boolean(runningMode);
 
   useEffect(() => {
@@ -87,6 +104,16 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
         setNotificationChannels(values.notification_channels || []);
         setMembers(values.members || []);
         setRunners(nextRunners);
+        const nextAvailableRunnerIds = nextRunners.filter(isSelectableRunner).map((runner) => runner.runner_id);
+        if (!check) {
+          setForm((current) => {
+            const currentIds = current.runner_ids?.filter((runnerId) => nextAvailableRunnerIds.includes(runnerId)) ?? [];
+            return {
+              ...current,
+              runner_ids: currentIds.length ? currentIds : nextAvailableRunnerIds.slice(0, 1)
+            };
+          });
+        }
       })
       .catch(() => {
         setNotificationChannels([]);
@@ -99,6 +126,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     setSaving(true);
     setError(null);
     try {
+      validateRunnerSelection(form, availableRunnerIds);
       const payload = prepareCheckPayload(form, { bodyMode });
       const saved = activeCheck ? await api.updateCheck(activeCheck.id, payload) : await api.createCheck(payload);
       const savedPayload = checkToPayload(saved);
@@ -178,7 +206,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   function setRunnerSelectionMode(mode: RunnerSelectionMode) {
     patchForm({
       runner_selection_mode: mode,
-      runner_ids: form.runner_ids?.length ? form.runner_ids : ["local"]
+      runner_ids: form.runner_ids ?? ["local"]
     });
   }
 
@@ -350,17 +378,18 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
               />
             </Form.Item>
             {form.runner_selection_mode === "round_robin_all" ? (
-              <Form.Item label="执行节点">
-                <Input value="所有已启用节点，按任务轮询游标挨个请求" disabled />
+              <Form.Item label="执行节点" extra={hiddenUnavailableRunnerCount > 0 ? `已隐藏 ${hiddenUnavailableRunnerCount} 个当前不可用或已停用节点` : undefined}>
+                <Input value="所有当前可用节点，按任务轮询游标挨个请求" disabled />
               </Form.Item>
             ) : (
-              <Form.Item label="执行节点" required>
+              <Form.Item label="执行节点" required extra={hiddenUnavailableRunnerCount > 0 ? `已隐藏 ${hiddenUnavailableRunnerCount} 个当前不可用或已停用节点` : undefined}>
                 <Select
                   mode="multiple"
-                  value={form.runner_ids?.length ? form.runner_ids : ["local"]}
+                  value={selectedRunnerIds}
                   onChange={(runner_ids) => patchForm({ runner_ids })}
                   options={runnerOptions}
                   placeholder="选择执行节点"
+                  optionFilterProp="label"
                 />
               </Form.Item>
             )}
@@ -550,6 +579,27 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
       </Space>
     </Drawer>
   );
+}
+
+function isSelectableRunner(runner: ProbeRunner): boolean {
+  return Boolean(runner.enabled && runner.available);
+}
+
+function runnerOptionLabel(runner: ProbeRunner): string {
+  const suffix = !runner.enabled ? " · 已停用" : runner.available ? "" : " · 当前不可用";
+  return `${runner.name || runner.runner_id} · ${runner.network_region || "local"}${suffix}`;
+}
+
+function validateRunnerSelection(form: CheckPayload, availableRunnerIds: string[]) {
+  if (availableRunnerIds.length === 0) {
+    throw new Error("当前没有可用执行节点，请先恢复节点后再保存任务");
+  }
+  if ((form.runner_selection_mode || "selected_parallel") === "round_robin_all") return;
+  const available = new Set(availableRunnerIds);
+  const selected = form.runner_ids ?? [];
+  if (!selected.some((runnerId) => available.has(runnerId))) {
+    throw new Error("请选择当前可用的执行节点");
+  }
 }
 
 function parseCheckAlertPolicy(value?: string | null): AlertPolicy {
