@@ -2191,7 +2191,7 @@ function PreviewChannel({ channel }: { channel: AlertPreviewChannel }) {
 
 function PreviewFact({ label, value, tone = "muted" }: { label: string; value: string; tone?: "ok" | "muted" }) {
   return (
-    <div className={`alert-preview-fact alert-preview-fact-${tone}`}>
+    <div className={`meta-field meta-field-preview meta-field-preview-${tone}`}>
       <small>{label}</small>
       <span>{value}</span>
     </div>

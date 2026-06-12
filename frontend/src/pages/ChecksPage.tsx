@@ -809,7 +809,7 @@ function CompactCheckList({
 
 function CheckMeta({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="check-card-meta-item">
+    <div className="meta-field meta-field-card">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>

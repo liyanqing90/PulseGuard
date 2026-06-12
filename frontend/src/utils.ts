@@ -1,4 +1,4 @@
-import type { Check, CheckType, FailureKind, NotificationStatus, RunStatus, TaskSurfaceStatus } from "./types";
+import type { Check, CheckType, FailureKind, NotificationStatus, Run, RunStatus, TaskSurfaceStatus } from "./types";
 
 export type SemanticTagColor = "default" | "blue" | "success" | "warning" | "error" | "processing";
 
@@ -81,6 +81,12 @@ export function runnerExecutionMeta(status: RunStatus, failureKind?: FailureKind
   if (status === "skipped") return { label: "已跳过", color: "warning" };
   if (status === "failed" || status === "timeout") return { label: runStatusLabel(status), color: "error" };
   return { label: runStatusLabel(status), color: runStatusTagColor(status) };
+}
+
+export function runnerSummary(run: Run): string {
+  const name = (run.runner_name || "local").trim();
+  const region = (run.runner_region || "").trim();
+  return region && region !== name ? `${name} · ${region}` : name;
 }
 
 export function notificationStatusTagColor(status?: NotificationStatus | null): SemanticTagColor {

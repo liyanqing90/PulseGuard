@@ -4,8 +4,9 @@ import { Archive, Download, ExternalLink, FileText, Image as ImageIcon } from "l
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api";
+import { RunnerExecutionTag, failureKindTag } from "./shared/businessTags";
 import type { Run, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
-import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerExecutionMeta, runStatusLabel, runStatusTagColor } from "../utils";
+import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerExecutionMeta, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
 type RunResultMode = "detail" | "debug";
@@ -561,7 +562,7 @@ function RunDetailSummary({
 
 function MetaItem({ label, value }: { label: string; value: string | number }) {
   return (
-    <div>
+    <div className="meta-field">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -997,11 +998,6 @@ function RunStatusTag({ status }: { status: Run["status"] }) {
   return <Tag color={runStatusTagColor(status)}>{runStatusLabel(status)}</Tag>;
 }
 
-function RunnerExecutionTag({ run }: { run: Run }) {
-  const meta = runnerExecutionMeta(run.status, run.failure_kind);
-  return <Tag color={meta.color}>{meta.label}</Tag>;
-}
-
 function formatOperatorValue(value?: string | null): string {
   if (!value) return "-";
   const labels: Record<string, string> = {
@@ -1067,12 +1063,6 @@ function runnerResultMessage(run: Run): string {
   return "-";
 }
 
-function runnerSummary(run: Run): string {
-  const name = (run.runner_name || "local").trim();
-  const region = (run.runner_region || "").trim();
-  return region && region !== name ? `${name} · ${region}` : name;
-}
-
 function hasFailureKind(value?: string | null): boolean {
   return Boolean(value && value !== "none");
 }
@@ -1083,12 +1073,6 @@ function runHasEvidence(run: Run): boolean {
 
 function shouldShowEvidence(run: Run): boolean {
   return runHasEvidence(run) || ["failed", "timeout", "skipped"].includes(run.status);
-}
-
-function failureKindTag(value?: string | null) {
-  if (value === "target") return <Tag color="red">目标页面/API</Tag>;
-  if (value === "runner") return <Tag color="orange">执行环境</Tag>;
-  return <Tag>无</Tag>;
 }
 
 function defaultRunTab(run: Run | null, mode: RunResultMode, responseSnapshot: unknown, assertionCount: number): string {

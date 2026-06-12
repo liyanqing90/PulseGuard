@@ -8,6 +8,7 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } fro
 import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { RunnerExecutionTag, failureKindTag } from "../components/shared/businessTags";
 import type { CheckType, NotificationStatus, ObservationKind, ProbeRunner, Run, RunStatus } from "../types";
 import {
   formatDate,
@@ -16,6 +17,7 @@ import {
   notificationStatusMeta,
   notificationStatusTagColor,
   runnerExecutionMeta,
+  runnerSummary,
   runStatusLabel,
   runStatusTagColor
 } from "../utils";
@@ -297,7 +299,7 @@ export function RunsPage() {
     {
       title: "失败来源",
       dataIndex: "failure_kind",
-      render: (_, run) => failureKindTag(run),
+      render: (_, run) => failureKindTag(run.failure_kind, <span className="history-empty-cell">-</span>),
       width: 92,
       align: "center"
     },
@@ -535,7 +537,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               <div className="history-card-state">
                 <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>
                 <RunnerExecutionTag run={run} />
-                {failureKindTag(run)}
+                {failureKindTag(run.failure_kind, <span className="history-empty-cell">-</span>)}
                 <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>
               </div>
             </header>
@@ -584,22 +586,11 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
 
 function HistoryMeta({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="history-card-meta-item">
+    <div className="meta-field">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
-}
-
-function RunnerExecutionTag({ run }: { run: Run }) {
-  const meta = runnerExecutionMeta(run.status, run.failure_kind);
-  return <Tag color={meta.color}>{meta.label}</Tag>;
-}
-
-function runnerSummary(run: Run): string {
-  const name = (run.runner_name || "local").trim();
-  const region = (run.runner_region || "").trim();
-  return region && region !== name ? `${name} · ${region}` : name;
 }
 
 function runnerLabel(runnerId: string, runners: ProbeRunner[]): string {
@@ -613,13 +604,6 @@ function runnerTooltip(run: Run): string {
     run.runner_browser_version ? `浏览器: ${run.runner_browser_version}` : ""
   ].filter(Boolean);
   return details.join("\n");
-}
-
-function failureKindTag(run: Run) {
-  const kind = run.failure_kind || "none";
-  if (kind === "target") return <Tag color="red">目标页面/API</Tag>;
-  if (kind === "runner") return <Tag color="orange">执行环境</Tag>;
-  return <span className="history-empty-cell">-</span>;
 }
 
 function runStatusFilterLabel(status: RunStatus): string {

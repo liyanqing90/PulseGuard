@@ -21,6 +21,7 @@ import {
   batchRunNotificationType,
   summarizeBatchRuns
 } from "../components/BatchRunAlert";
+import { failureKindTag } from "../components/shared/businessTags";
 import type { CheckType, Overview, OverviewTrend, OverviewTrendSeries, Run, RuntimeStatus, SettingsValues } from "../types";
 import { checkListPath, formatDate, formatDuration, runStatusLabel, runStatusTagColor } from "../utils";
 
@@ -123,7 +124,7 @@ export function OverviewPage() {
       )
     },
     { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 100 },
-    { title: "失败来源", dataIndex: "failure_kind", render: (_, run) => failureKindTag(run), width: 118 },
+    { title: "失败来源", dataIndex: "failure_kind", render: (_, run) => failureKindTag(run.failure_kind, <span>-</span>), width: 118 },
     { title: "耗时", dataIndex: "duration_ms", render: (value: number | null) => formatDuration(value), width: 110 },
     { title: "错误摘要", dataIndex: "error_message", ellipsis: true },
     { title: "连续失败", dataIndex: "consecutive_failures", render: (value?: number) => value || "-", width: 110 },
@@ -273,12 +274,6 @@ export function OverviewPage() {
       )}
     </div>
   );
-}
-
-function failureKindTag(run: Run) {
-  if (run.failure_kind === "target") return <Tag color="red">目标页面/API</Tag>;
-  if (run.failure_kind === "runner") return <Tag color="orange">执行环境</Tag>;
-  return <span>-</span>;
 }
 
 function TrendCard({ trend }: { trend: OverviewTrend }) {

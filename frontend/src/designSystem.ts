@@ -39,6 +39,7 @@ export const fontWeights = {
 } as const;
 
 export const typeScale = {
+  small: "0.6875rem",
   caption: "0.75rem",
   meta: "0.8125rem",
   body: "0.875rem",
@@ -49,15 +50,28 @@ export const typeScale = {
 } as const;
 
 export const radii = {
+  small: 4,
   tight: 6,
   default: 8
 } as const;
 
 export const spacing = {
+  inner: 8,
   xs: 6,
+  field: 12,
   sm: 10,
+  surface: 14,
   md: 16,
-  lg: 24
+  lg: 24,
+  xl: 32,
+  xxl: 48
+} as const;
+
+export const lineHeights = {
+  tight: 1.15,
+  normal: 1.35,
+  body: 1.5,
+  caption: 1.45
 } as const;
 
 export const semanticTones = {
@@ -179,7 +193,10 @@ export const pulseGuardTheme: ThemeConfig = {
       borderColor: palette.border,
       headerBg: palette.surfaceMuted,
       headerColor: palette.textMuted,
-      rowHoverBg: "#f3f7ff"
+      headerSplitColor: "transparent",
+      rowHoverBg: palette.primarySoft,
+      cellPaddingBlock: 12,
+      cellPaddingBlockSM: 8
     },
     Tabs: {
       itemSelectedColor: palette.primaryHover,
@@ -187,6 +204,33 @@ export const pulseGuardTheme: ThemeConfig = {
     },
     Tag: {
       borderRadiusSM: radii.tight
+    },
+    Descriptions: {
+      labelBg: palette.surfaceMuted,
+      titleColor: palette.text
+    },
+    Segmented: {
+      itemSelectedBg: palette.surface,
+      trackBg: palette.surfaceMuted
+    },
+    Pagination: {
+      itemSize: 32,
+      itemBg: "transparent"
+    },
+    Collapse: {
+      headerBg: palette.surfaceMuted,
+      contentBg: palette.surface
+    },
+    Empty: {
+      colorTextDescription: palette.textMuted
+    },
+    Skeleton: {
+      colorFill: palette.surfaceMuted
+    },
+    Form: {
+      labelColor: palette.textMuted,
+      labelFontSize: 13,
+      itemMarginBottom: 18
     }
   }
 };
