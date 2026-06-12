@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -23,7 +24,9 @@ from .defaults import DEFAULT_SETTINGS
 from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
-from .schemas import ApiInspectRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
+from .browser_installation import browser_capabilities, schedule_browser_install
+from .browser_types import enabled_browser_types, normalize_browser_types
+from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
 from .variables import mask_data, mask_text
 
 
@@ -63,7 +66,7 @@ VALIDATION_FIELD_LABELS = {
     "recovery_notification": "恢复通知",
     "max_queue_size": "执行队列容量",
     "api_pool_size": "API 请求池大小",
-    "browser_pool_size": "浏览器池大小",
+    "browser_pool_size": "浏览器 Context 池大小",
     "max_ui_concurrency": "最大 UI 并发数",
     "viewport_width": "Viewport 宽度",
     "viewport_height": "Viewport 高度",
@@ -91,6 +94,7 @@ async def lifespan(app: FastAPI):
     runner = CheckRunner()
     app.state.runner = runner
     await runner.start()
+    asyncio.create_task(_sync_enabled_browser_type_installation(storage.get_settings()))
     scheduler = None
     health_poll_task = None
     if NODE_ROLE != "worker":
@@ -138,6 +142,7 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
     _verify_worker_token(_bearer_token(authorization))
     update_supported = bool(WORKER_UPDATER_URL)
     update_target = WORKER_UPDATE_IMAGE or WORKER_IMAGE
+    capabilities = browser_capabilities(storage.get_settings())
     return {
         "ok": True,
         "role": NODE_ROLE,
@@ -146,6 +151,8 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
         "address": WORKER_ADDRESS,
         "network_region": WORKER_REGION,
         "browser_version": "",
+        "installed_browser_types": capabilities["installed_browser_types"],
+        "available_browser_types": capabilities["available_browser_types"],
         "status": "ok",
         "metadata": {
             "node_role": NODE_ROLE,
@@ -155,6 +162,7 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
             "update_supported": update_supported,
             "update_target_image": update_target,
             "update_available": bool(update_supported and WORKER_IMAGE and update_target and WORKER_IMAGE != update_target),
+            "browser_type_status": capabilities["browser_type_status"],
         },
     }
 
@@ -179,6 +187,12 @@ async def worker_run(request: Request, authorization: str = Header(default="")) 
 async def worker_update(payload: WorkerUpdateRequest, authorization: str = Header(default="")) -> dict[str, Any]:
     _verify_worker_token(_bearer_token(authorization))
     return await _worker_updater_request("POST", "/update", payload.model_dump(exclude_none=True))
+
+
+@app.post("/api/worker/browser-types/install")
+async def worker_install_browser_types(payload: BrowserInstallRequest, authorization: str = Header(default="")) -> dict[str, Any]:
+    _verify_worker_token(_bearer_token(authorization))
+    return {"ok": True, "install": schedule_browser_install(payload.browser_types)}
 
 
 @app.get("/api/worker/update-status")
@@ -491,7 +505,8 @@ def restore_database_backup(filename: str, request: Request) -> dict[str, Any]:
 
 @app.post("/api/checks")
 def create_check(payload: CheckCreate, request: Request) -> dict[str, Any]:
-    check = storage.create_check(payload.model_dump())
+    data = _validated_check_payload(payload)
+    check = storage.create_check(data)
     storage.record_check_version(check, "created")
     storage.record_audit_event("created", "check", check["id"], check["name"], "创建任务", {"type": check["type"]})
     request.app.state.scheduler.sync_check(int(check["id"]))
@@ -550,7 +565,7 @@ async def batch_checks(payload: CheckBatchRequest, request: Request) -> dict[str
 
 @app.post("/api/checks/debug")
 async def debug_check(payload: CheckCreate, request: Request) -> dict[str, Any]:
-    return await request.app.state.runner.run_draft(payload.model_dump(), trigger="draft-debug")
+    return await request.app.state.runner.run_draft(_validated_check_payload(payload), trigger="draft-debug")
 
 
 @app.post("/api/checks/inspect-api")
@@ -612,7 +627,7 @@ def restore_check_version(version_id: int, request: Request) -> dict[str, Any]:
     if not version:
         raise HTTPException(status_code=404, detail="任务版本不存在")
     snapshot = dict(version["snapshot"])
-    payload = CheckCreate.model_validate(snapshot).model_dump()
+    payload = _validated_check_data(CheckCreate.model_validate(snapshot).model_dump())
     check_id = int(version["check_id"])
     current = storage.get_check(check_id)
     if current:
@@ -631,7 +646,8 @@ def restore_check_version(version_id: int, request: Request) -> dict[str, Any]:
 @app.put("/api/checks/{check_id}")
 def update_check(check_id: int, payload: CheckUpdate, request: Request) -> dict[str, Any]:
     previous = storage.get_check(check_id)
-    check = storage.update_check(check_id, payload.model_dump())
+    data = _validated_check_payload(payload)
+    check = storage.update_check(check_id, data)
     if not check:
         raise HTTPException(status_code=404, detail="任务不存在")
     if previous:
@@ -771,7 +787,49 @@ def run_detail(run_id: int) -> dict[str, Any]:
     run = storage.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="运行记录不存在")
-    return run
+    settings = storage.get_settings()
+    check_id = int(run.get("check_id") or 0)
+    check = storage.get_check(check_id, refresh_stale=False) if check_id > 0 else None
+    return _run_detail_payload(run, check, settings)
+
+
+def _run_detail_payload(run: dict[str, Any], check: dict[str, Any] | None, settings: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(run)
+    payload["check"] = _run_check_request_payload(check, settings) if check else None
+    return payload
+
+
+def _run_check_request_payload(check: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    check_type = str(check.get("type") or "")
+    payload: dict[str, Any] = {
+        "id": check.get("id"),
+        "name": check.get("name"),
+        "type": check_type,
+        "entry_url": check.get("entry_url") or "",
+        "timeout_ms": check.get("timeout_ms"),
+    }
+    if check_type == "api":
+        payload.update(
+            {
+                "method": check.get("method") or "GET",
+                "headers": _headers_json_to_object(check.get("headers_json")),
+                "body": check.get("body") or "",
+            }
+        )
+    elif check_type == "ui":
+        payload["viewport_mode"] = check.get("viewport_mode") or "web"
+    return mask_data(payload, settings)
+
+
+def _headers_json_to_object(value: Any) -> dict[str, Any]:
+    text = str(value or "{}").strip() or "{}"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"_raw": text}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"_raw": text}
 
 
 @app.get("/api/runs/{run_id}/failure-summary")
@@ -812,10 +870,12 @@ def get_settings() -> dict[str, Any]:
 @app.put("/api/settings")
 async def update_settings(payload: SettingsUpdate, request: Request) -> dict[str, Any]:
     try:
-        storage.update_settings(payload.values)
+        settings = storage.update_settings(payload.values)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await request.app.state.runner.reload_settings()
+    if "enabled_browser_types" in payload.values:
+        asyncio.create_task(_sync_enabled_browser_type_installation(settings))
     request.app.state.scheduler.refresh_all()
     storage.record_audit_event("updated", "settings", summary="更新系统设置", payload={"fields": sorted(payload.values)})
     return storage.get_public_settings()
@@ -901,6 +961,21 @@ def _settings_with_overrides(payload: SettingsUpdate) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return settings
+
+
+def _validated_check_payload(payload: CheckCreate | CheckUpdate) -> dict[str, Any]:
+    return _validated_check_data(payload.model_dump())
+
+
+def _validated_check_data(data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("type") != "ui":
+        return data
+    enabled_types = set(enabled_browser_types(storage.get_settings()))
+    selected_types = [str(item) for item in data.get("browser_types") or []]
+    disabled = [browser_type for browser_type in selected_types if browser_type not in enabled_types]
+    if disabled:
+        raise HTTPException(status_code=400, detail=f"browser type 未启用：{', '.join(disabled)}")
+    return data
 
 
 def _verify_read_only_token(token: str) -> None:
@@ -1015,6 +1090,37 @@ async def _fetch_runner_health(runner: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+async def _sync_enabled_browser_type_installation(settings: dict[str, Any]) -> None:
+    browser_types = enabled_browser_types(settings)
+    try:
+        schedule_browser_install(browser_types)
+    except Exception:
+        pass
+    runners = [
+        runner
+        for runner in storage.list_enabled_probe_runners()
+        if str(runner.get("role") or "") == "child" and runner.get("available")
+    ]
+    for runner in runners:
+        try:
+            missing = _missing_enabled_browser_types(runner, settings) or browser_types
+            await _worker_request(runner, "POST", "/api/worker/browser-types/install", {"browser_types": missing}, timeout=10)
+        except Exception:
+            continue
+
+
+def _missing_enabled_browser_types(source: dict[str, Any], settings: dict[str, Any]) -> list[str]:
+    installed = set(normalize_browser_types(source.get("installed_browser_types"), default=[], allow_empty=True))
+    return [browser_type for browser_type in enabled_browser_types(settings) if browser_type not in installed]
+
+
+async def _install_missing_enabled_browser_types_on_runner(runner: dict[str, Any], health: dict[str, Any]) -> None:
+    missing = _missing_enabled_browser_types(health, storage.get_settings())
+    if not missing:
+        return
+    await _worker_request(runner, "POST", "/api/worker/browser-types/install", {"browser_types": missing}, timeout=10)
+
+
 async def _worker_request(
     runner: dict[str, Any],
     method: str,
@@ -1102,6 +1208,7 @@ async def _runner_health_poll_loop() -> None:
                 try:
                     health = await _fetch_runner_health(runner)
                     storage.mark_probe_runner_available(runner_id, health)
+                    await _install_missing_enabled_browser_types_on_runner(runner, health)
                 except asyncio.CancelledError:
                     raise
                 except Exception:

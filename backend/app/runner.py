@@ -16,6 +16,15 @@ from typing import Any, AsyncIterator
 import httpx
 
 from .api_assertions import has_enabled_api_assertions, run_structured_api_check
+from .browser_installation import browser_capabilities, ensure_browser_types_installed
+from .browser_types import (
+    DEFAULT_BROWSER_TYPE,
+    browser_pool_sizes,
+    enabled_browser_types,
+    normalize_browser_selection_mode,
+    normalize_browser_types,
+    settings_for_browser_type,
+)
 from .ui_assertions import has_enabled_ui_assertions, run_structured_ui_check
 from . import notifier, storage
 from .artifacts import ArtifactStore
@@ -38,6 +47,13 @@ class RunJob:
     runner_metadata: dict[str, Any] | None = None
     started: bool = False
     manage_active: bool = True
+
+
+@dataclass(frozen=True)
+class BrowserRunTarget:
+    runner: dict[str, Any]
+    browser_type: str
+    skip_reason: str = ""
 
 
 class AsyncCapacityLimiter:
@@ -86,7 +102,7 @@ class CheckRunner:
         self._suppress_shutdown_records = False
         self._global_limiter = AsyncCapacityLimiter(self._max_concurrency())
         self._ui_limiter = AsyncCapacityLimiter(self._max_ui_concurrency())
-        self.resources = ProbeResourcePool(self._api_pool_size(), self._browser_pool_size())
+        self.resources = ProbeResourcePool(self._api_pool_size(), self._browser_pool_sizes())
 
     async def start(self) -> None:
         self._closing = False
@@ -94,8 +110,9 @@ class CheckRunner:
         await self.resources.start(
             settings,
             api_pool_size=self._api_pool_size(settings),
-            browser_pool_size=self._browser_pool_size(settings),
+            browser_pool_sizes_value=self._browser_pool_sizes(settings),
         )
+        self._refresh_local_runner_browser_capabilities(settings)
 
     async def shutdown(self, record_cancelled: bool = True) -> None:
         previous_suppression = self._suppress_shutdown_records
@@ -120,8 +137,9 @@ class CheckRunner:
         await self.resources.reload(
             settings,
             api_pool_size=self._api_pool_size(settings),
-            browser_pool_size=self._browser_pool_size(settings),
+            browser_pool_sizes_value=self._browser_pool_sizes(settings),
         )
+        self._refresh_local_runner_browser_capabilities(settings)
 
     async def run_check(self, check_id: int, trigger: str = "scheduled") -> dict[str, Any]:
         check = storage.get_check(check_id)
@@ -130,6 +148,17 @@ class CheckRunner:
         if storage.is_deployment_window_active() and trigger != "post-deploy":
             return self._deployment_paused_result(check, trigger)
         runners = self._resolve_check_runners(check)
+        targets = self._resolve_browser_targets(check, runners)
+        if self._uses_browser(check):
+            if len(targets) == 1 and targets[0].runner.get("runner_id") == storage.LOCAL_RUNNER_ID and not targets[0].skip_reason:
+                target = targets[0]
+                check_payload = self._with_browser_type(check, target.browser_type)
+                return await self._submit(
+                    check_payload,
+                    trigger,
+                    runner_metadata=storage.runner_metadata(target.runner, browser_type=target.browser_type),
+                )
+            return await self._run_distributed_check(check, targets, trigger)
         if (
             len(runners) == 1
             and runners[0].get("runner_id") == storage.LOCAL_RUNNER_ID
@@ -137,7 +166,8 @@ class CheckRunner:
             and runners[0].get("available")
         ):
             return await self._submit(check, trigger, runner_metadata=storage.runner_metadata(runners[0]))
-        return await self._run_distributed_check(check, runners, trigger)
+        targets = [BrowserRunTarget(runner=runner, browser_type="") for runner in runners]
+        return await self._run_distributed_check(check, targets, trigger)
 
     async def run_draft(self, check: dict[str, Any], trigger: str = "draft") -> dict[str, Any]:
         draft = dict(check)
@@ -145,7 +175,11 @@ class CheckRunner:
         started = datetime.now().astimezone()
         settings = storage.get_settings()
         local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(settings)
-        runner_payload = storage.runner_metadata(local)
+        browser_type = self._first_runnable_browser_type(draft, local, settings) if self._uses_browser(draft) else ""
+        if browser_type:
+            draft = self._with_browser_type(draft, browser_type)
+            settings = settings_for_browser_type(settings, browser_type)
+        runner_payload = storage.runner_metadata(local, browser_type=browser_type)
         try:
             if self._uses_browser(draft):
                 async with self._ui_limiter.slot():
@@ -447,6 +481,7 @@ class CheckRunner:
                     "runner_address": runner_metadata.get("runner_address"),
                     "runner_region": runner_metadata.get("runner_region"),
                     "runner_browser_version": result_data.get("runner_browser_version") or runner_metadata.get("runner_browser_version"),
+                    "browser_type": result_data.get("browser_type") or runner_metadata.get("browser_type"),
                 }
             )
         if self._is_runner_system_result(result_data):
@@ -492,7 +527,7 @@ class CheckRunner:
                 ctx.log(f"任务入口：{check.get('entry_url')}")
                 if max_attempts > 1:
                     ctx.log(f"执行尝试：{attempt}/{max_attempts}")
-                duration_ms += await self._run_check_attempt(ctx, check, settings)
+                duration_ms = await self._run_check_attempt(ctx, check, settings)
                 status = "ok"
                 error_message = None
                 error_stack = None
@@ -500,37 +535,37 @@ class CheckRunner:
             except asyncio.CancelledError as exc:
                 if self._suppress_shutdown_records:
                     raise
-                duration_ms += self._task_duration_from_exception(exc)
+                duration_ms = self._task_duration_from_exception(exc)
                 status = "skipped"
                 error_message = "执行被取消，可能是服务关闭或运行设置刷新"
                 error_stack = None
                 failure_kind = "runner"
             except asyncio.TimeoutError as exc:
-                duration_ms += self._task_duration_from_exception(exc)
+                duration_ms = self._task_duration_from_exception(exc)
                 status = "timeout"
                 error_message = str(exc).strip() or f"执行超过超时限制：{check.get('timeout_ms')}ms"
                 error_stack = traceback.format_exc()
                 failure_kind = "target"
             except RunnerEnvironmentFailure as exc:
-                duration_ms += self._task_duration_from_exception(exc)
+                duration_ms = self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc)
                 error_stack = traceback.format_exc()
                 failure_kind = "runner"
             except RunFailure as exc:
-                duration_ms += self._task_duration_from_exception(exc)
+                duration_ms = self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc)
                 error_stack = traceback.format_exc()
                 failure_kind = "target"
             except AssertionError as exc:
-                duration_ms += self._task_duration_from_exception(exc)
+                duration_ms = self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc) or "断言失败"
                 error_stack = traceback.format_exc()
                 failure_kind = "target"
             except Exception as exc:
-                duration_ms += self._task_duration_from_exception(exc)
+                duration_ms = self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc) or exc.__class__.__name__
                 error_stack = traceback.format_exc()
@@ -576,6 +611,7 @@ class CheckRunner:
             "response_path": ctx.response_path if ctx else None,
             "request_snapshot": json.dumps(safe_request_snapshot, ensure_ascii=False) if safe_request_snapshot else None,
             "response_snapshot": json.dumps(safe_response_snapshot, ensure_ascii=False) if safe_response_snapshot else None,
+            "browser_type": str(check.get("_browser_type") or settings.get("browser_type") or ""),
             **self._runner_metadata(settings, ctx=ctx, failure_kind=failure_kind),
         }
     async def _run_check_attempt(self, ctx: RunContext, check: dict[str, Any], settings: dict[str, Any]) -> int:
@@ -633,7 +669,7 @@ class CheckRunner:
         return 1 + max(0, min(3, int(retries or 0)))
 
     def _create_skipped_run(self, check: dict[str, Any], message: str, trigger: str, record_status: bool = True) -> dict[str, Any]:
-        settings = storage.get_settings()
+        settings = self._settings_for_check(check, storage.get_settings())
         metadata = run_metadata(trigger)
         runner_payload = self._runner_metadata(settings, failure_kind="runner")
         run = storage.create_run(
@@ -754,6 +790,7 @@ class CheckRunner:
             "runner_address": "",
             "runner_region": "",
             "runner_browser_version": "",
+            "browser_type": "",
         }
 
     @staticmethod
@@ -769,6 +806,7 @@ class CheckRunner:
             "runner_address": address,
             "runner_region": region,
             "runner_browser_version": browser_version,
+            "browser_type": str(settings.get("browser_type") or ""),
             "failure_kind": normalized_failure_kind,
         }
 
@@ -806,7 +844,65 @@ class CheckRunner:
         local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())
         return [local]
 
-    async def _run_distributed_check(self, check: dict[str, Any], runners: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
+    def _resolve_browser_targets(self, check: dict[str, Any], runners: list[dict[str, Any]]) -> list[BrowserRunTarget]:
+        if not self._uses_browser(check):
+            return [BrowserRunTarget(runner=runner, browser_type="") for runner in runners]
+        settings = storage.get_settings()
+        targets: list[BrowserRunTarget] = []
+        for runner in runners:
+            targets.extend(self._resolve_browser_targets_for_runner(check, runner, settings))
+        return targets or [BrowserRunTarget(runner=self._local_runner_from_settings(settings), browser_type="", skip_reason="没有可执行的 browser type")]
+
+    def _resolve_browser_targets_for_runner(
+        self,
+        check: dict[str, Any],
+        runner: dict[str, Any],
+        settings: dict[str, Any],
+    ) -> list[BrowserRunTarget]:
+        if not runner.get("available"):
+            browser_type = ""
+            try:
+                browser_type = normalize_browser_types(check.get("browser_types"), default=[DEFAULT_BROWSER_TYPE])[0]
+            except Exception:
+                browser_type = DEFAULT_BROWSER_TYPE
+            return [BrowserRunTarget(runner=runner, browser_type=browser_type, skip_reason="执行节点不可用")]
+        enabled = set(enabled_browser_types(settings))
+        installed = set(self._runner_installed_browser_types(runner))
+        mode = normalize_browser_selection_mode(check.get("browser_selection_mode"))
+        if mode == "round_robin_all":
+            candidates = [browser_type for browser_type in enabled_browser_types(settings) if browser_type in installed]
+            if not candidates:
+                return [
+                    BrowserRunTarget(
+                        runner=runner,
+                        browser_type="",
+                        skip_reason="执行节点没有已启用且已安装的 browser type",
+                    )
+                ]
+            index = storage.next_runner_cursor(
+                f"check-browser:{int(check.get('id') or 0)}:{runner.get('runner_id') or storage.LOCAL_RUNNER_ID}",
+                len(candidates),
+            )
+            return [BrowserRunTarget(runner=runner, browser_type=candidates[index])]
+
+        selected = normalize_browser_types(check.get("browser_types"), default=[DEFAULT_BROWSER_TYPE])
+        targets: list[BrowserRunTarget] = []
+        for browser_type in selected:
+            if browser_type not in enabled:
+                targets.append(BrowserRunTarget(runner=runner, browser_type=browser_type, skip_reason=f"browser type 未启用：{browser_type}"))
+            elif browser_type not in installed:
+                targets.append(BrowserRunTarget(runner=runner, browser_type=browser_type, skip_reason=f"执行节点未安装 browser type：{browser_type}"))
+            else:
+                targets.append(BrowserRunTarget(runner=runner, browser_type=browser_type))
+        return targets
+
+    def _first_runnable_browser_type(self, check: dict[str, Any], runner: dict[str, Any], settings: dict[str, Any]) -> str:
+        for target in self._resolve_browser_targets_for_runner(check, runner, settings):
+            if not target.skip_reason and target.browser_type:
+                return target.browser_type
+        return DEFAULT_BROWSER_TYPE
+
+    async def _run_distributed_check(self, check: dict[str, Any], targets: list[BrowserRunTarget], trigger: str) -> dict[str, Any]:
         check_id = int(check.get("id") or 0)
         run_group_id = f"rg_{uuid.uuid4().hex}"
         async with self._lock:
@@ -818,7 +914,7 @@ class CheckRunner:
             if check_id > 0:
                 self._active_checks.add(check_id)
         try:
-            jobs = [self._dispatch_runner(check, runner, trigger, run_group_id) for runner in runners]
+            jobs = [self._dispatch_runner(check, target, trigger, run_group_id) for target in targets]
             runs = await asyncio.gather(*jobs)
             return await self._finish_distributed_group(check, runs, trigger)
         finally:
@@ -826,11 +922,18 @@ class CheckRunner:
                 if check_id > 0:
                     self._active_checks.discard(check_id)
 
-    async def _dispatch_runner(self, check: dict[str, Any], runner: dict[str, Any], trigger: str, run_group_id: str) -> dict[str, Any]:
+    async def _dispatch_runner(self, check: dict[str, Any], target: BrowserRunTarget, trigger: str, run_group_id: str) -> dict[str, Any]:
+        runner = target.runner
         runner_id = str(runner.get("runner_id") or storage.LOCAL_RUNNER_ID)
-        check_payload = {**check, "_run_group_id": run_group_id}
-        runner_payload = storage.runner_metadata(runner)
+        check_payload = self._with_browser_type({**check, "_run_group_id": run_group_id}, target.browser_type)
+        runner_payload = storage.runner_metadata(runner, browser_type=target.browser_type)
         metadata = {**run_metadata(trigger), "run_group_id": run_group_id}
+        if target.skip_reason:
+            run = storage.create_run(
+                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=metadata),
+                "pending",
+            )
+            return self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
         if not runner.get("available"):
             run = storage.create_run(
                 self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=metadata),
@@ -855,7 +958,7 @@ class CheckRunner:
         run_id = int(run["id"])
         storage.start_run(run_id)
         try:
-            result = await self._call_remote_runner(runner, check, trigger, run_id)
+            result = await self._call_remote_runner(runner, check_payload, trigger, run_id)
         except Exception as exc:
             storage.mark_probe_runner_unavailable(runner_id)
             unavailable = self._finish_runner_unavailable(run_id, check, trigger, runner, f"执行节点调用失败：{exc}")
@@ -936,7 +1039,12 @@ class CheckRunner:
                 data["logs"] = f"{logs}\n远程证据保存失败：{field} {exc}".strip()
                 continue
             data[field] = saved
-        metadata = storage.runner_metadata(runner, failure_kind=str(data.get("failure_kind") or "none"), browser_version=str(data.get("runner_browser_version") or runner.get("browser_version") or ""))
+        metadata = storage.runner_metadata(
+            runner,
+            failure_kind=str(data.get("failure_kind") or "none"),
+            browser_version=str(data.get("runner_browser_version") or runner.get("browser_version") or ""),
+            browser_type=str(data.get("browser_type") or ""),
+        )
         return {
             "status": str(data.get("status") or "failed"),
             "finished_at": str(data.get("finished_at") or storage.now_iso()),
@@ -973,7 +1081,7 @@ class CheckRunner:
             "response_path": None,
             "request_snapshot": None,
             "response_snapshot": None,
-            **storage.runner_metadata(runner, failure_kind="runner"),
+            **storage.runner_metadata(runner, failure_kind="runner", browser_type=str(check.get("_browser_type") or "")),
         }
         storage.discard_incomplete_run(run_id)
         return self._ephemeral_runner_result(check, trigger, run_id, payload)
@@ -1023,11 +1131,12 @@ class CheckRunner:
             "script",
             "tags",
             "alert_policy_json",
+            "browser_selection_mode",
+            "browser_types",
         }
         return {key: check.get(key) for key in allowed}
 
-    @staticmethod
-    def _worker_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    def _worker_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
         allowed = {
             "max_task_runtime_seconds",
             "browser_headless",
@@ -1042,6 +1151,34 @@ class CheckRunner:
         return {key: settings.get(key) for key in allowed}
 
     @staticmethod
+    def _with_browser_type(check: dict[str, Any], browser_type: str) -> dict[str, Any]:
+        if not browser_type:
+            return dict(check)
+        return {**check, "_browser_type": browser_type, "browser_type": browser_type}
+
+    @staticmethod
+    def _settings_for_check(check: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+        browser_type = str(check.get("_browser_type") or check.get("browser_type") or settings.get("browser_type") or DEFAULT_BROWSER_TYPE)
+        return settings_for_browser_type(settings, browser_type)
+
+    @staticmethod
+    def _runner_installed_browser_types(runner: dict[str, Any]) -> list[str]:
+        if str(runner.get("runner_id") or "") == storage.LOCAL_RUNNER_ID:
+            installed = browser_capabilities(storage.get_settings()).get("installed_browser_types") or []
+            if installed:
+                return normalize_browser_types(installed, default=[], allow_empty=True)
+        installed = runner.get("installed_browser_types")
+        if isinstance(installed, list) and installed:
+            return normalize_browser_types(installed, default=[], allow_empty=True)
+        browser_version = str(runner.get("browser_version") or "")
+        inferred = [browser_type for browser_type in ("chromium", "firefox", "webkit") if browser_type in browser_version]
+        if inferred:
+            return inferred
+        if str(runner.get("runner_id") or "") == storage.LOCAL_RUNNER_ID:
+            return [DEFAULT_BROWSER_TYPE]
+        return []
+
+    @staticmethod
     def _runner_token_from_row(runner: dict[str, Any]) -> str:
         runner_id = str(runner.get("runner_id") or "")
         if not runner_id:
@@ -1053,12 +1190,16 @@ class CheckRunner:
 
     @staticmethod
     def _local_runner_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
+        capabilities = browser_capabilities(settings)
         return {
             "runner_id": storage.LOCAL_RUNNER_ID,
             "name": str(settings.get("local_runner_name") or "local"),
             "address": str(settings.get("local_runner_address") or "127.0.0.1"),
             "network_region": str(settings.get("local_runner_region") or "local"),
             "browser_version": "",
+            "installed_browser_types": capabilities["installed_browser_types"] or [DEFAULT_BROWSER_TYPE],
+            "available_browser_types": capabilities["available_browser_types"] or [DEFAULT_BROWSER_TYPE],
+            "browser_type_status": capabilities["browser_type_status"],
             "status": "ok",
             "enabled": True,
             "role": "local",
@@ -1162,9 +1303,27 @@ class CheckRunner:
             return 5
 
     @staticmethod
-    def _browser_pool_size(settings: dict[str, Any] | None = None) -> int:
+    def _browser_pool_sizes(settings: dict[str, Any] | None = None) -> dict[str, int]:
         try:
             resolved_settings = settings or storage.get_settings()
-            return max(1, int(resolved_settings.get("browser_pool_size", 5)))
+            return browser_pool_sizes(resolved_settings)
         except Exception:
-            return 5
+            return {"chromium": 5, "firefox": 5, "webkit": 5}
+
+    @staticmethod
+    def _refresh_local_runner_browser_capabilities(settings: dict[str, Any]) -> None:
+        capabilities = browser_capabilities(settings)
+        storage.mark_probe_runner_available(
+            storage.LOCAL_RUNNER_ID,
+            {
+                "status": "ok",
+                "browser_version": "",
+                "installed_browser_types": capabilities["installed_browser_types"],
+                "available_browser_types": capabilities["available_browser_types"],
+                "metadata": {"browser_type_status": capabilities["browser_type_status"]},
+            },
+        )
+
+    async def ensure_enabled_browser_types_installed(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        resolved_settings = settings or storage.get_settings()
+        return await ensure_browser_types_installed(enabled_browser_types(resolved_settings))

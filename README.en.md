@@ -92,6 +92,18 @@ $env:VITE_DEV_API_TARGET="http://127.0.0.1:8787"
 npm run dev -- --host 127.0.0.1 --port 5175
 ```
 
+## UI Browser Lifecycle
+
+UI tasks support the Playwright browser types `chromium`, `firefox`, and `webkit`. System settings can configure:
+
+- `enabled_browser_types`: browser types that tasks are allowed to select and run.
+- `prewarmed_browser_types`: browser types that are warmed automatically on backend startup or settings reload. They must also be enabled and may be empty.
+- `browser_pool_sizes`: the empty `BrowserContext` reserve size for each browser type. Each type defaults to 5.
+
+Each prewarmed browser type keeps one Playwright browser process alive and pre-creates empty `BrowserContext` instances according to that type's pool size. Each UI task leases one exclusive context/page. When the task ends, only that context is closed; the browser process stays alive and the pool refills an empty context. Web and H5 sizing are separated by context options, so different viewport tasks can run concurrently under the same browser process.
+
+`browser_type` only applies to UI tasks. Execution resolves target nodes first, then browser types inside each node. Node multi-select plus browser type multi-select creates a node x browser-type execution matrix. A browser type runs only when it is enabled in settings and installed on the selected node; missing or disabled combinations are recorded as runner-side failures. When new browser types are enabled, the main node asks the local process and available child nodes to install the matching Playwright browsers. Child nodes report installed and available browser types in their health response.
+
 ## Verification
 
 Backend:
@@ -151,7 +163,10 @@ Structured UI/API assertions do not require an advanced script. Complex login, m
 - `GET /api/metrics.json`: JSON metrics
 - `GET /api/metrics`: Prometheus metrics
 - `GET /api/read-only/snapshot`: read-only snapshot, requires a configured read-only token
+- `GET /api/runs/{id}`: run detail with only basic request info attached (UI URL / API method, URL, headers, body, timeout); alert policies, runner selection, assertions, and scripts are not returned, and sensitive values are redacted
 - `POST /api/runners/heartbeat`: Runner heartbeat
+- `GET /api/worker/health` / `POST /api/worker/run`: child worker health and execution entry points
+- `POST /api/worker/browser-types/install`: request a worker to install enabled Playwright browser types
 - `POST /api/heartbeats/{key}`: passive heartbeat report
 
 ## Repository Structure

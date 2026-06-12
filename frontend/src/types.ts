@@ -4,6 +4,8 @@ export type RunStatus = "pending" | "running" | "ok" | "failed" | "timeout" | "s
 export type NotificationStatus = "disabled" | "not_required" | "suppressed" | "sent" | "failed";
 export type FailureKind = "none" | "target" | "runner" | string;
 export type RunnerSelectionMode = "selected_parallel" | "round_robin_all";
+export type BrowserType = "chromium" | "firefox" | "webkit";
+export type BrowserSelectionMode = "selected_parallel" | "round_robin_all";
 export type ProbeRunnerRole = "local" | "child" | string;
 export type TaskSurfaceStatus =
   | "healthy"
@@ -191,6 +193,8 @@ export interface Check {
   alert_policy_json: string;
   runner_selection_mode: RunnerSelectionMode;
   runner_ids: string[];
+  browser_selection_mode: BrowserSelectionMode;
+  browser_types: BrowserType[];
   created_at: string;
   updated_at: string;
   current_status?: TaskSurfaceStatus | null;
@@ -206,6 +210,18 @@ export interface Check {
   last_scheduled_at?: string | null;
   last_scheduled_run_id?: number | null;
   last_state_changed_at?: string | null;
+}
+
+export interface RunCheckRequestInfo {
+  id: number;
+  name: string;
+  type: CheckType;
+  entry_url: string;
+  timeout_ms: number;
+  viewport_mode?: ViewportMode;
+  method?: string;
+  headers?: Record<string, unknown>;
+  body?: string;
 }
 
 export interface CheckBatchPayload {
@@ -259,6 +275,9 @@ export interface ProbeRunner {
   address: string;
   network_region: string;
   browser_version: string;
+  installed_browser_types: BrowserType[];
+  available_browser_types: BrowserType[];
+  browser_type_status?: Record<string, BrowserTypeStatus>;
   status: "ok" | "warning" | "offline" | string;
   enabled: boolean;
   role: ProbeRunnerRole;
@@ -272,6 +291,16 @@ export interface ProbeRunner {
   last_seen_at?: string | null;
   updated_at: string;
   token?: string;
+}
+
+export interface BrowserTypeStatus {
+  enabled?: boolean;
+  installed?: boolean;
+  available?: boolean;
+  prewarmed?: boolean;
+  pool_size?: number;
+  status?: string;
+  message?: string;
 }
 
 export interface ProbeRunnerPayload {
@@ -366,6 +395,7 @@ export interface Run {
   runner_address?: string | null;
   runner_region?: string | null;
   runner_browser_version?: string | null;
+  browser_type?: BrowserType | string | null;
   failure_kind?: FailureKind | null;
   notification_status?: NotificationStatus | null;
   notification_channel?: "feishu" | "wecom" | "dingtalk" | string | null;
@@ -377,6 +407,7 @@ export interface Run {
   run_group_id?: string | null;
   created_at: string;
   consecutive_failures?: number;
+  check?: RunCheckRequestInfo | null;
 }
 
 export interface RunComparison {
@@ -493,7 +524,10 @@ export interface SettingsValues {
   ui_retry_attempts: number;
   stale_after_intervals: number;
   browser_headless: boolean;
-  browser_type: "chromium" | "firefox" | "webkit";
+  browser_type: BrowserType;
+  enabled_browser_types: BrowserType[];
+  prewarmed_browser_types: BrowserType[];
+  browser_pool_sizes: Record<BrowserType, number>;
   browser_proxy: string;
   browser_viewport: string;
   run_retention_days: number;

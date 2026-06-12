@@ -305,6 +305,8 @@ export function blankCheck(type: CheckType): CheckPayload {
     tags: "",
     alert_policy_json: "{}",
     runner_selection_mode: "selected_parallel",
-    runner_ids: ["local"]
+    runner_ids: ["local"],
+    browser_selection_mode: "selected_parallel",
+    browser_types: type === "ui" ? ["chromium"] : []
   };
 }

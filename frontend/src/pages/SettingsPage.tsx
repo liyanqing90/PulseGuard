@@ -31,6 +31,7 @@ import type {
   AlertTagPolicy,
   AlertPreview,
   AlertPreviewChannel,
+  BrowserType,
   ConfigBundle,
   ConfigExportFile,
   ConfigImportPreview,
@@ -56,6 +57,8 @@ const SETTINGS_TAB_LABELS: Record<SettingsTab, string> = {
 };
 
 const SETTINGS_TAB_KEYS = new Set<SettingsTab>(Object.keys(SETTINGS_TAB_LABELS) as SettingsTab[]);
+
+const BROWSER_TYPES: BrowserType[] = ["chromium", "firefox", "webkit"];
 
 const SETTINGS_TAB_ALIASES: Record<string, SettingsTab> = {
   runtime: "execution",
@@ -335,7 +338,12 @@ export function SettingsPage() {
         ui_retry_attempts: settings.ui_retry_attempts,
         stale_after_intervals: settings.stale_after_intervals,
         browser_headless: settings.browser_headless,
-        browser_type: settings.browser_type,
+        browser_type: settings.enabled_browser_types[0] || "chromium",
+        enabled_browser_types: normalizeBrowserTypes(settings.enabled_browser_types),
+        prewarmed_browser_types: normalizeBrowserTypes(settings.prewarmed_browser_types, true).filter((browserType) =>
+          normalizeBrowserTypes(settings.enabled_browser_types).includes(browserType)
+        ),
+        browser_pool_sizes: normalizeBrowserPoolSizes(settings.browser_pool_sizes),
         browser_proxy: settings.browser_proxy,
         browser_viewport: settings.browser_viewport
       };
@@ -746,15 +754,50 @@ export function SettingsPage() {
             </Form.Item>
             <Form.Item label="浏览器类型">
               <Select
-                value={settings.browser_type}
-                onChange={(value) => update("browser_type", value)}
-                options={[
-                  { label: "chromium", value: "chromium" },
-                  { label: "firefox", value: "firefox" },
-                  { label: "webkit", value: "webkit" }
-                ]}
+                mode="multiple"
+                value={normalizeBrowserTypes(settings.enabled_browser_types)}
+                onChange={(value) => {
+                  const enabled = normalizeBrowserTypes(value);
+                  update("enabled_browser_types", enabled);
+                  update(
+                    "prewarmed_browser_types",
+                    normalizeBrowserTypes(settings.prewarmed_browser_types, true).filter((browserType) => enabled.includes(browserType))
+                  );
+                  update("browser_type", enabled[0] || "chromium");
+                }}
+                options={BROWSER_TYPES.map((browserType) => ({ label: browserType, value: browserType }))}
               />
             </Form.Item>
+            <Form.Item label="自动预热 browser type">
+              <Select
+                mode="multiple"
+                value={normalizeBrowserTypes(settings.prewarmed_browser_types, true).filter((browserType) =>
+                  normalizeBrowserTypes(settings.enabled_browser_types).includes(browserType)
+                )}
+                onChange={(value) => update("prewarmed_browser_types", normalizeBrowserTypes(value, true))}
+                options={BROWSER_TYPES.map((browserType) => ({
+                  label: browserType,
+                  value: browserType,
+                  disabled: !normalizeBrowserTypes(settings.enabled_browser_types).includes(browserType)
+                }))}
+              />
+            </Form.Item>
+            {BROWSER_TYPES.map((browserType) => (
+              <NumberItem
+                key={browserType}
+                label={`${browserType} Context 池`}
+                value={normalizeBrowserPoolSizes(settings.browser_pool_sizes)[browserType]}
+                min={1}
+                max={5}
+                suffix="个"
+                onChange={(value) =>
+                  update("browser_pool_sizes", {
+                    ...normalizeBrowserPoolSizes(settings.browser_pool_sizes),
+                    [browserType]: value
+                  })
+                }
+              />
+            ))}
             <Form.Item label="代理" className="span-2">
               <Input
                 name="browser-proxy"
@@ -2594,6 +2637,28 @@ function formatBytes(value: number): string {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function normalizeBrowserTypes(value?: string[] | null, allowEmpty = false): BrowserType[] {
+  const seen = new Set<string>();
+  const result: BrowserType[] = [];
+  for (const item of value || []) {
+    const browserType = String(item || "").trim() as BrowserType;
+    if (!BROWSER_TYPES.includes(browserType) || seen.has(browserType)) continue;
+    seen.add(browserType);
+    result.push(browserType);
+  }
+  if (result.length) return result;
+  return allowEmpty ? [] : ["chromium"];
+}
+
+function normalizeBrowserPoolSizes(value?: Partial<Record<BrowserType, number>> | null): Record<BrowserType, number> {
+  const source = value || {};
+  return BROWSER_TYPES.reduce<Record<BrowserType, number>>((result, browserType) => {
+    const raw = Number(source[browserType] || 5);
+    result[browserType] = Math.max(1, Math.min(5, Number.isFinite(raw) ? Math.round(raw) : 5));
+    return result;
+  }, { chromium: 5, firefox: 5, webkit: 5 });
+}
+
 function settingsChanged(current: SettingsValues, saved: SettingsValues): boolean {
   return JSON.stringify(comparableSettings(current)) !== JSON.stringify(comparableSettings(saved));
 }
@@ -2647,6 +2712,9 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
   const browser = {
     browser_headless: values.browser_headless,
     browser_type: values.browser_type,
+    enabled_browser_types: normalizeBrowserTypes(values.enabled_browser_types),
+    prewarmed_browser_types: normalizeBrowserTypes(values.prewarmed_browser_types, true),
+    browser_pool_sizes: normalizeBrowserPoolSizes(values.browser_pool_sizes),
     browser_proxy: values.browser_proxy,
     browser_viewport: values.browser_viewport
   };

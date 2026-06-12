@@ -3013,6 +3013,19 @@ tr:last-child td {
   font-size: var(--type-meta);
 }
 
+.run-config-url {
+  display: block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.run-request-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-field);
+}
+
 .failure-summary-panel {
   background: color-mix(in srgb, var(--panel-strong) 34%, var(--panel));
 }
@@ -4458,6 +4471,7 @@ tr:last-child td {
   .notification-channel-grid,
   .environment-variable-grid,
   .run-detail-meta,
+  .run-request-config-grid,
   .run-evidence-grid,
   .detail-grid,
   .api-assertion-workbench,

@@ -4,7 +4,19 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { checkToPayload, detectBodyMode, normalizeCheckPayload, prepareCheckPayload, sameCheckPayload, type BodyEditorMode } from "../checkPayload";
 import { apiScriptTemplate, blankCheck, checkFromTemplate, checkTemplatesForType } from "../defaults";
-import type { AlertPolicy, Check, CheckPayload, CheckType, Member, NotificationChannel, ProbeRunner, Run, RunnerSelectionMode } from "../types";
+import type {
+  AlertPolicy,
+  BrowserSelectionMode,
+  BrowserType,
+  Check,
+  CheckPayload,
+  CheckType,
+  Member,
+  NotificationChannel,
+  ProbeRunner,
+  Run,
+  RunnerSelectionMode
+} from "../types";
 import { dirtyTagColor } from "../utils";
 import { ApiAssertionsBuilder } from "./ApiAssertionsBuilder";
 import { LazyCodeEditorPanel as CodeEditorPanel } from "./LazyCodeEditorPanel";
@@ -12,6 +24,8 @@ import { RunResultPanel } from "./RunResultPanel";
 import { UiAssertionsBuilder } from "./UiAssertionsBuilder";
 import { UiScriptSections } from "./UiScriptSections";
 import { ViewportModeControl } from "./ViewportModeControl";
+
+const BROWSER_TYPES: BrowserType[] = ["chromium", "firefox", "webkit"];
 
 interface Props {
   open: boolean;
@@ -34,6 +48,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const [notificationChannels, setNotificationChannels] = useState<NotificationChannel[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
+  const [enabledBrowserTypes, setEnabledBrowserTypes] = useState<BrowserType[]>(["chromium"]);
   const [selectedTemplateId, setSelectedTemplateId] = useState(() => checkTemplatesForType(type)[0]?.id || "");
 
   const templates = useMemo(() => checkTemplatesForType(type), [type]);
@@ -42,6 +57,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
   const alertPolicy = useMemo(() => parseCheckAlertPolicy(form.alert_policy_json), [form.alert_policy_json]);
   const alertPolicyMode = useMemo(() => (hasAlertPolicyOverrides(alertPolicy) ? "custom" : "inherit"), [alertPolicy]);
   const selectedRunnerIds = useMemo(() => form.runner_ids ?? ["local"], [form.runner_ids]);
+  const selectedBrowserTypes = useMemo(() => normalizeBrowserTypes(form.browser_types), [form.browser_types]);
   const runnerList = useMemo(() => {
     return runners.length
       ? runners
@@ -52,6 +68,8 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
             address: "127.0.0.1",
             network_region: "local",
             browser_version: "",
+            installed_browser_types: ["chromium"],
+            available_browser_types: ["chromium"],
             status: "ok",
             enabled: true,
             role: "local",
@@ -82,6 +100,15 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     const selected = new Set(selectedRunnerIds);
     return runnerList.filter((runner) => !selected.has(runner.runner_id) && !isSelectableRunner(runner)).length;
   }, [runnerList, selectedRunnerIds]);
+  const browserOptions = useMemo(() => {
+    const enabled = new Set(enabledBrowserTypes);
+    const selected = new Set(selectedBrowserTypes);
+    return BROWSER_TYPES.filter((browserType) => enabled.has(browserType) || selected.has(browserType)).map((browserType) => ({
+      label: browserTypeLabel(browserType, runnerList),
+      value: browserType,
+      disabled: !enabled.has(browserType)
+    }));
+  }, [enabledBrowserTypes, runnerList, selectedBrowserTypes]);
   const running = Boolean(runningMode);
 
   useEffect(() => {
@@ -104,13 +131,17 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
         setNotificationChannels(values.notification_channels || []);
         setMembers(values.members || []);
         setRunners(nextRunners);
+        const nextEnabledBrowserTypes = normalizeBrowserTypes(values.enabled_browser_types);
+        setEnabledBrowserTypes(nextEnabledBrowserTypes);
         const nextAvailableRunnerIds = nextRunners.filter(isSelectableRunner).map((runner) => runner.runner_id);
         if (!check) {
           setForm((current) => {
             const currentIds = current.runner_ids?.filter((runnerId) => nextAvailableRunnerIds.includes(runnerId)) ?? [];
+            const currentBrowserTypes = normalizeBrowserTypes(current.browser_types).filter((browserType) => nextEnabledBrowserTypes.includes(browserType));
             return {
               ...current,
-              runner_ids: currentIds.length ? currentIds : nextAvailableRunnerIds.slice(0, 1)
+              runner_ids: currentIds.length ? currentIds : nextAvailableRunnerIds.slice(0, 1),
+              browser_types: type === "ui" ? currentBrowserTypes.length ? currentBrowserTypes : nextEnabledBrowserTypes.slice(0, 1) : []
             };
           });
         }
@@ -119,14 +150,16 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
         setNotificationChannels([]);
         setMembers([]);
         setRunners([]);
+        setEnabledBrowserTypes(["chromium"]);
       });
-  }, [open]);
+  }, [check, open, type]);
 
   async function save(): Promise<Check> {
     setSaving(true);
     setError(null);
     try {
       validateRunnerSelection(form, availableRunnerIds);
+      validateBrowserSelection(form, enabledBrowserTypes);
       const payload = prepareCheckPayload(form, { bodyMode });
       const saved = activeCheck ? await api.updateCheck(activeCheck.id, payload) : await api.createCheck(payload);
       const savedPayload = checkToPayload(saved);
@@ -207,6 +240,13 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
     patchForm({
       runner_selection_mode: mode,
       runner_ids: form.runner_ids ?? ["local"]
+    });
+  }
+
+  function setBrowserSelectionMode(mode: BrowserSelectionMode) {
+    patchForm({
+      browser_selection_mode: mode,
+      browser_types: form.browser_types ?? ["chromium"]
     });
   }
 
@@ -394,6 +434,37 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
               </Form.Item>
             )}
           </div>
+
+          {type === "ui" && (
+            <div className="field-grid two">
+              <Form.Item label="浏览器策略" required>
+                <Segmented
+                  value={form.browser_selection_mode || "selected_parallel"}
+                  onChange={(value) => setBrowserSelectionMode(value as BrowserSelectionMode)}
+                  options={[
+                    { label: "多选并行", value: "selected_parallel" },
+                    { label: "按节点轮询", value: "round_robin_all" }
+                  ]}
+                />
+              </Form.Item>
+              {form.browser_selection_mode === "round_robin_all" ? (
+                <Form.Item label="浏览器类型">
+                  <Input value="按每个执行节点的已启用且已安装类型轮询" disabled />
+                </Form.Item>
+              ) : (
+                <Form.Item label="浏览器类型" required>
+                  <Select
+                    mode="multiple"
+                    value={selectedBrowserTypes}
+                    onChange={(browser_types) => patchForm({ browser_types: browser_types as BrowserType[] })}
+                    options={browserOptions}
+                    placeholder="选择浏览器类型"
+                    optionFilterProp="label"
+                  />
+                </Form.Item>
+              )}
+            </div>
+          )}
         </Form>
 
         <Collapse
@@ -600,6 +671,36 @@ function validateRunnerSelection(form: CheckPayload, availableRunnerIds: string[
   if (!selected.some((runnerId) => available.has(runnerId))) {
     throw new Error("请选择当前可用的执行节点");
   }
+}
+
+function validateBrowserSelection(form: CheckPayload, enabledBrowserTypes: BrowserType[]) {
+  if (form.type !== "ui") return;
+  if ((form.browser_selection_mode || "selected_parallel") === "round_robin_all") {
+    if (!enabledBrowserTypes.length) throw new Error("请先在设置中启用至少一个 browser type");
+    return;
+  }
+  const enabled = new Set(enabledBrowserTypes);
+  const selected = normalizeBrowserTypes(form.browser_types);
+  if (!selected.some((browserType) => enabled.has(browserType))) {
+    throw new Error("请选择已启用的 browser type");
+  }
+}
+
+function normalizeBrowserTypes(value?: string[] | null): BrowserType[] {
+  const seen = new Set<string>();
+  const result: BrowserType[] = [];
+  for (const item of value || []) {
+    const browserType = String(item || "").trim() as BrowserType;
+    if (!BROWSER_TYPES.includes(browserType) || seen.has(browserType)) continue;
+    seen.add(browserType);
+    result.push(browserType);
+  }
+  return result.length ? result : ["chromium"];
+}
+
+function browserTypeLabel(browserType: BrowserType, runners: ProbeRunner[]): string {
+  const installedCount = runners.filter((runner) => (runner.installed_browser_types || []).includes(browserType)).length;
+  return installedCount ? `${browserType} · ${installedCount} 节点已安装` : `${browserType} · 暂无节点安装`;
 }
 
 function parseCheckAlertPolicy(value?: string | null): AlertPolicy {

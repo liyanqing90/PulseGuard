@@ -13,6 +13,13 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .artifacts import cleanup_old_artifacts
+from .browser_types import (
+    DEFAULT_BROWSER_TYPE,
+    browser_type_status,
+    normalize_browser_selection_mode,
+    normalize_browser_types,
+    normalized_browser_settings,
+)
 from .config import BACKUPS_DIR, DB_PATH, ensure_runtime_dirs
 from .defaults import DEFAULT_SETTINGS, DEMO_CHECKS
 from .monitoring import HEALTH_STATES, next_health_state, run_metadata
@@ -45,6 +52,7 @@ RUN_SUMMARY_COLUMNS = (
     "runner_address",
     "runner_region",
     "runner_browser_version",
+    "browser_type",
     "failure_kind",
     "notification_status",
     "notification_channel",
@@ -91,6 +99,8 @@ def init_db() -> None:
                 alert_policy_json TEXT NOT NULL DEFAULT '{}',
                 runner_selection_mode TEXT NOT NULL DEFAULT 'selected_parallel',
                 runner_ids_json TEXT NOT NULL DEFAULT '["local"]',
+                browser_selection_mode TEXT NOT NULL DEFAULT 'selected_parallel',
+                browser_types_json TEXT NOT NULL DEFAULT '["chromium"]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -117,6 +127,7 @@ def init_db() -> None:
                 runner_address TEXT,
                 runner_region TEXT,
                 runner_browser_version TEXT,
+                browser_type TEXT,
                 failure_kind TEXT,
                 notification_status TEXT,
                 notification_channel TEXT,
@@ -206,6 +217,8 @@ def init_db() -> None:
                 address TEXT NOT NULL DEFAULT '',
                 network_region TEXT NOT NULL DEFAULT 'local',
                 browser_version TEXT NOT NULL DEFAULT '',
+                installed_browser_types_json TEXT NOT NULL DEFAULT '[]',
+                available_browser_types_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'ok',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -359,8 +372,8 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
             INSERT INTO checks (
                 name, type, enabled, interval_seconds, timeout_ms, entry_url, viewport_mode, method,
                 headers_json, body, assertions_json, setup_script, script, tags, alert_policy_json,
-                runner_selection_mode, runner_ids_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                runner_selection_mode, runner_ids_json, browser_selection_mode, browser_types_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["name"].strip(),
@@ -380,6 +393,8 @@ def create_check(data: dict[str, Any]) -> dict[str, Any]:
                 data.get("alert_policy_json") or "{}",
                 _normalize_runner_selection_mode(data.get("runner_selection_mode")),
                 json.dumps(_normalize_runner_ids(data.get("runner_ids") or data.get("runner_ids_json")), ensure_ascii=False),
+                _normalize_browser_selection_mode(data.get("browser_selection_mode")),
+                json.dumps(_normalize_check_browser_types(data), ensure_ascii=False),
                 timestamp,
                 timestamp,
             ),
@@ -396,7 +411,8 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
             UPDATE checks
             SET name = ?, type = ?, enabled = ?, interval_seconds = ?, timeout_ms = ?,
                 entry_url = ?, viewport_mode = ?, method = ?, headers_json = ?, body = ?, assertions_json = ?, setup_script = ?,
-                script = ?, tags = ?, alert_policy_json = ?, runner_selection_mode = ?, runner_ids_json = ?, updated_at = ?
+                script = ?, tags = ?, alert_policy_json = ?, runner_selection_mode = ?, runner_ids_json = ?,
+                browser_selection_mode = ?, browser_types_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -417,6 +433,8 @@ def update_check(check_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("alert_policy_json") or "{}",
                 _normalize_runner_selection_mode(data.get("runner_selection_mode")),
                 json.dumps(_normalize_runner_ids(data.get("runner_ids") or data.get("runner_ids_json")), ensure_ascii=False),
+                _normalize_browser_selection_mode(data.get("browser_selection_mode")),
+                json.dumps(_normalize_check_browser_types(data), ensure_ascii=False),
                 timestamp,
                 check_id,
             ),
@@ -678,10 +696,10 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 check_id, check_name, check_type, status, started_at, finished_at,
                 duration_ms, error_message, error_stack, logs, screenshot_path,
                 trace_path, response_path, request_snapshot, response_snapshot,
-                runner_id, runner_name, runner_address, runner_region, runner_browser_version, failure_kind,
+                runner_id, runner_name, runner_address, runner_region, runner_browser_version, browser_type, failure_kind,
                 notification_status, notification_channel, notification_error,
                 notification_sent_at, trigger, observation_kind, affects_health, run_group_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(check["id"]),
@@ -704,6 +722,7 @@ def create_run(check: dict[str, Any], status: str = "running", error_message: st
                 runner.get("runner_address"),
                 runner.get("runner_region"),
                 runner.get("runner_browser_version"),
+                runner.get("browser_type") or check.get("_browser_type") or check.get("browser_type"),
                 runner.get("failure_kind"),
                 notification_status,
                 None,
@@ -749,7 +768,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 error_stack = ?, logs = ?, screenshot_path = ?, trace_path = ?,
                 response_path = ?, request_snapshot = ?, response_snapshot = ?,
                 runner_id = ?, runner_name = ?, runner_address = ?, runner_region = ?,
-                runner_browser_version = ?, failure_kind = ?
+                runner_browser_version = ?, browser_type = ?, failure_kind = ?
             WHERE id = ?
             """,
             (
@@ -769,6 +788,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("runner_address"),
                 data.get("runner_region"),
                 data.get("runner_browser_version"),
+                data.get("browser_type"),
                 data.get("failure_kind"),
                 run_id,
             ),
@@ -788,14 +808,16 @@ def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
         conn.execute(
             """
             INSERT INTO probe_runners (
-                runner_id, name, address, network_region, browser_version,
+                runner_id, name, address, network_region, browser_version, installed_browser_types_json, available_browser_types_json,
                 status, metadata_json, last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(runner_id) DO UPDATE SET
                 name = excluded.name,
                 address = excluded.address,
                 network_region = excluded.network_region,
                 browser_version = excluded.browser_version,
+                installed_browser_types_json = excluded.installed_browser_types_json,
+                available_browser_types_json = excluded.available_browser_types_json,
                 status = excluded.status,
                 metadata_json = excluded.metadata_json,
                 last_seen_at = excluded.last_seen_at,
@@ -807,6 +829,8 @@ def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
                 str(data.get("address") or "").strip(),
                 str(data.get("network_region") or "local").strip(),
                 str(data.get("browser_version") or "").strip(),
+                json.dumps(_normalize_runner_browser_types(data.get("installed_browser_types")), ensure_ascii=False),
+                json.dumps(_normalize_runner_browser_types(data.get("available_browser_types")), ensure_ascii=False),
                 str(data.get("status") or "ok").strip(),
                 json.dumps(metadata, ensure_ascii=False),
                 timestamp,
@@ -839,10 +863,10 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
         conn.execute(
             """
             INSERT INTO probe_runners (
-                runner_id, name, address, network_region, browser_version, status,
+                runner_id, name, address, network_region, browser_version, installed_browser_types_json, available_browser_types_json, status,
                 metadata_json, enabled, role, token_value, token_hash, token_hint, created_at,
                 last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 runner_id,
@@ -850,6 +874,8 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
                 str(data.get("address") or "").strip(),
                 str(data.get("network_region") or "local").strip(),
                 str(data.get("browser_version") or "").strip(),
+                json.dumps(_normalize_runner_browser_types(data.get("installed_browser_types")), ensure_ascii=False),
+                json.dumps(_normalize_runner_browser_types(data.get("available_browser_types")), ensure_ascii=False),
                 "offline",
                 json.dumps(metadata, ensure_ascii=False),
                 1 if data.get("enabled", True) else 0,
@@ -919,6 +945,8 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
     if status not in {"ok", "warning"}:
         status = "ok"
     browser_version = str(health.get("browser_version") or "").strip()
+    installed_browser_types = _normalize_runner_browser_types(health.get("installed_browser_types"))
+    available_browser_types = _normalize_runner_browser_types(health.get("available_browser_types"))
     metadata = health.get("metadata") if isinstance(health.get("metadata"), dict) else {}
     timestamp = now_iso()
     with _LOCK, _connect() as conn:
@@ -927,6 +955,8 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
             UPDATE probe_runners
             SET status = ?,
                 browser_version = ?,
+                installed_browser_types_json = ?,
+                available_browser_types_json = ?,
                 metadata_json = ?,
                 unavailable_since = NULL,
                 unavailable_notified_at = NULL,
@@ -934,7 +964,16 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
                 updated_at = ?
             WHERE runner_id = ?
             """,
-            (status, browser_version, json.dumps(metadata, ensure_ascii=False), timestamp, timestamp, runner_id),
+            (
+                status,
+                browser_version,
+                json.dumps(installed_browser_types, ensure_ascii=False),
+                json.dumps(available_browser_types, ensure_ascii=False),
+                json.dumps(metadata, ensure_ascii=False),
+                timestamp,
+                timestamp,
+                runner_id,
+            ),
         )
         if cursor.rowcount == 0:
             return None
@@ -1014,13 +1053,19 @@ def list_probe_runners_by_ids(runner_ids: list[str]) -> list[dict[str, Any]]:
     return [by_id[runner_id] for runner_id in ids if runner_id in by_id]
 
 
-def runner_metadata(runner: dict[str, Any], failure_kind: str = "none", browser_version: str | None = None) -> dict[str, str]:
+def runner_metadata(
+    runner: dict[str, Any],
+    failure_kind: str = "none",
+    browser_version: str | None = None,
+    browser_type: str | None = None,
+) -> dict[str, str]:
     return {
         "runner_id": str(runner.get("runner_id") or LOCAL_RUNNER_ID),
         "runner_name": str(runner.get("name") or runner.get("runner_id") or LOCAL_RUNNER_ID),
         "runner_address": str(runner.get("address") or ""),
         "runner_region": str(runner.get("network_region") or "local"),
         "runner_browser_version": str(browser_version if browser_version is not None else runner.get("browser_version") or ""),
+        "browser_type": str(browser_type if browser_type is not None else runner.get("browser_type") or ""),
         "failure_kind": failure_kind if failure_kind in {"none", "target", "runner"} else "runner",
     }
 
@@ -1579,7 +1624,7 @@ def get_settings() -> dict[str, Any]:
             settings[row["key"]] = json.loads(row["value"])
         except json.JSONDecodeError:
             settings[row["key"]] = row["value"]
-    return settings
+    return normalized_browser_settings(settings)
 
 
 def get_public_settings() -> dict[str, Any]:
@@ -1635,7 +1680,14 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
 def normalize_settings_update_values(values: dict[str, Any]) -> dict[str, Any]:
     values = _preserve_notification_channel_secrets(values)
     values = _preserve_environment_variable_secrets(values)
-    return normalize_settings_values(values)
+    normalized = normalize_settings_values(values)
+    if any(key in normalized for key in {"browser_type", "enabled_browser_types", "prewarmed_browser_types", "browser_pool_sizes", "browser_pool_size"}):
+        merged = normalized_browser_settings({**get_settings(), **normalized})
+        normalized["enabled_browser_types"] = merged["enabled_browser_types"]
+        normalized["prewarmed_browser_types"] = merged["prewarmed_browser_types"]
+        normalized["browser_pool_sizes"] = merged["browser_pool_sizes"]
+        normalized["browser_type"] = merged["browser_type"]
+    return normalized
 
 
 def create_read_only_token(name: str) -> dict[str, Any]:
@@ -2034,6 +2086,8 @@ def _ensure_check_columns(conn: sqlite3.Connection) -> None:
         "alert_policy_json": "TEXT NOT NULL DEFAULT '{}'",
         "runner_selection_mode": "TEXT NOT NULL DEFAULT 'selected_parallel'",
         "runner_ids_json": "TEXT NOT NULL DEFAULT '[\"local\"]'",
+        "browser_selection_mode": "TEXT NOT NULL DEFAULT 'selected_parallel'",
+        "browser_types_json": "TEXT NOT NULL DEFAULT '[\"chromium\"]'",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -2050,6 +2104,7 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
         "runner_address": "TEXT",
         "runner_region": "TEXT",
         "runner_browser_version": "TEXT",
+        "browser_type": "TEXT",
         "failure_kind": "TEXT",
         "notification_status": "TEXT",
         "notification_channel": "TEXT",
@@ -2108,6 +2163,8 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
         "token_value": "TEXT NOT NULL DEFAULT ''",
         "token_hash": "TEXT NOT NULL DEFAULT ''",
         "token_hint": "TEXT NOT NULL DEFAULT ''",
+        "installed_browser_types_json": "TEXT NOT NULL DEFAULT '[]'",
+        "available_browser_types_json": "TEXT NOT NULL DEFAULT '[]'",
         "unavailable_since": "TEXT",
         "unavailable_notified_at": "TEXT",
         "created_at": "TEXT NOT NULL DEFAULT ''",
@@ -2130,10 +2187,10 @@ def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT INTO probe_runners (
-            runner_id, name, address, network_region, browser_version, status,
+            runner_id, name, address, network_region, browser_version, installed_browser_types_json, available_browser_types_json, status,
             metadata_json, enabled, role, token_hash, token_hint, created_at,
             last_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(runner_id) DO UPDATE SET
             name = excluded.name,
             address = excluded.address,
@@ -2149,6 +2206,8 @@ def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
             address,
             region,
             "",
+            json.dumps([DEFAULT_BROWSER_TYPE], ensure_ascii=False),
+            json.dumps([DEFAULT_BROWSER_TYPE], ensure_ascii=False),
             "ok",
             "{}",
             1,
@@ -2337,6 +2396,8 @@ def _normalize_check(row: sqlite3.Row) -> dict[str, Any]:
     data["alert_policy_json"] = data.get("alert_policy_json") or "{}"
     data["runner_selection_mode"] = _normalize_runner_selection_mode(data.get("runner_selection_mode"))
     data["runner_ids"] = _normalize_runner_ids(data.get("runner_ids_json"))
+    data["browser_selection_mode"] = _normalize_browser_selection_mode(data.get("browser_selection_mode"))
+    data["browser_types"] = _normalize_check_browser_types(data)
     if not data["enabled"]:
         data["monitor_status"] = "disabled"
     else:
@@ -2356,6 +2417,7 @@ def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
     data["failure_kind"] = _normalize_failure_kind(data.get("failure_kind"), str(data.get("status") or ""))
     data["runner_id"] = data.get("runner_id") or (LOCAL_RUNNER_ID if data.get("runner_name") else "")
+    data["browser_type"] = data.get("browser_type") or (DEFAULT_BROWSER_TYPE if data.get("check_type") == "ui" else "")
     data["trigger"] = data.get("trigger") or "legacy"
     data["observation_kind"] = data.get("observation_kind") or "observation"
     data["affects_health"] = bool(data.get("affects_health"))
@@ -2425,10 +2487,15 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     data.pop("metadata_json", None)
     data["enabled"] = bool(data.get("enabled", True))
     data["role"] = _normalize_runner_role(data.get("role"))
+    data["installed_browser_types"] = _normalize_runner_browser_types(data.get("installed_browser_types_json"))
+    data["available_browser_types"] = _normalize_runner_browser_types(data.get("available_browser_types_json"))
+    data["browser_type_status"] = browser_type_status(data["installed_browser_types"], get_settings())
     data["token_set"] = bool(data.get("token_hash"))
     data["available"] = _runner_available(data)
     data.pop("token_value", None)
     data.pop("token_hash", None)
+    data.pop("installed_browser_types_json", None)
+    data.pop("available_browser_types_json", None)
     return data
 
 
@@ -2451,6 +2518,10 @@ def _normalize_runner_selection_mode(value: Any) -> str:
     return mode if mode in RUNNER_SELECTION_MODES else "selected_parallel"
 
 
+def _normalize_browser_selection_mode(value: Any) -> str:
+    return normalize_browser_selection_mode(value)
+
+
 def _normalize_runner_ids(value: Any) -> list[str]:
     if isinstance(value, str):
         try:
@@ -2470,6 +2541,19 @@ def _normalize_runner_ids(value: Any) -> list[str]:
         seen.add(runner_id)
         result.append(runner_id)
     return result or [LOCAL_RUNNER_ID]
+
+
+def _normalize_check_browser_types(data: dict[str, Any]) -> list[str]:
+    if str(data.get("type") or "ui") != "ui":
+        return []
+    value = data.get("browser_types")
+    if value is None:
+        value = data.get("browser_types_json")
+    return normalize_browser_types(value, default=[DEFAULT_BROWSER_TYPE])
+
+
+def _normalize_runner_browser_types(value: Any) -> list[str]:
+    return normalize_browser_types(value, default=[], allow_empty=True)
 
 
 def _token_hint(token: str) -> str:
@@ -2511,5 +2595,7 @@ def _check_snapshot(check: dict[str, Any]) -> dict[str, Any]:
         "alert_policy_json",
         "runner_selection_mode",
         "runner_ids",
+        "browser_selection_mode",
+        "browser_types",
     )
     return {field: check.get(field) for field in fields}

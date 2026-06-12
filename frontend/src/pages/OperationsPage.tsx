@@ -267,10 +267,21 @@ export function OperationsPage() {
       render: (value: ProbeRunner["status"]) => <Tag color={runnerStatusColor(value)}>{runnerStatusLabel(value)}</Tag>
     },
     {
-      title: "浏览器",
-      dataIndex: "browser_version",
+      title: "Browser Type",
+      dataIndex: "installed_browser_types",
       width: 180,
-      render: (value: string) => value || "-"
+      render: (value: string[] | undefined, runner) => {
+        const types = value && value.length ? value : runner.browser_version ? [runner.browser_version] : [];
+        return types.length ? (
+          <Space size={4} wrap>
+            {types.map((item) => (
+              <Tag key={item}>{item}</Tag>
+            ))}
+          </Space>
+        ) : (
+          "-"
+        );
+      }
     },
     {
       title: "最后心跳",
@@ -508,6 +519,9 @@ function runnerDetail(runner: ProbeRunner): Record<string, unknown> {
     可用状态: runner.available ? "可用" : "不可用",
     状态: runnerStatusLabel(runner.status),
     浏览器: runner.browser_version || "-",
+    "Browser Type": (runner.installed_browser_types || []).join(", ") || "-",
+    "Available Browser Type": (runner.available_browser_types || []).join(", ") || "-",
+    "Browser Type Status": runner.browser_type_status || {},
     最后心跳: formatDate(runner.last_seen_at),
     更新时间: formatDate(runner.updated_at),
     元数据字段数: Object.keys(runner.metadata || {}).length

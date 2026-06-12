@@ -93,6 +93,18 @@ $env:VITE_DEV_API_TARGET="http://127.0.0.1:8787"
 npm run dev -- --host 127.0.0.1 --port 5175
 ```
 
+## UI 浏览器生命周期
+
+UI 任务支持 `chromium`、`firefox`、`webkit` 三类 Playwright browser type。系统设置里可以分别配置：
+
+- `enabled_browser_types`：允许任务选择和执行的 browser type。
+- `prewarmed_browser_types`：后端启动或设置变更时自动预热的 browser type，必须是已启用类型，可以多选或为空。
+- `browser_pool_sizes`：每个 browser type 独立的空 `BrowserContext` 储备数量，单类默认 5。
+
+每个预热的 browser type 会保留 1 个 Playwright browser 进程，并按该 type 的 pool size 预创建空 `BrowserContext`。UI 任务会独占租用 1 个 context/page；任务结束只关闭 context，不关闭 browser，资源池随后补齐空 context。Web 与 H5 尺寸通过 context options 区分，同一个 browser 进程下可以并发运行不同 viewport 的任务。
+
+`browser_type` 只对 UI 任务生效。任务执行时先解析执行节点，再在每个节点内解析 browser type；节点多选和 browser type 多选会按节点 × browser type 矩阵创建运行记录。只有“已启用且该节点已安装”的 browser type 会实际执行，缺失或未启用的组合会记录为 Runner 异常。启用新的 browser type 后，主节点会请求本机和可用子节点安装对应 Playwright browser，子节点也会在健康检查中上报当前已安装和可用的 browser type。
+
 ## 多运行节点
 
 PulseGuard 默认保留并启用内置 `local` 节点。子节点是独立部署的执行服务，只负责暴露受 token 保护的健康检查和执行接口、执行主节点下发的任务、回传运行结果和证据文件；子节点不会主动注册到主节点、不会启动调度器、不会写主节点数据库，也不会发送告警。
@@ -107,8 +119,8 @@ PulseGuard 默认保留并启用内置 `local` 节点。子节点是独立部署
 
 结果展示：
 
-- 多选并行时，同一次触发会为每个节点创建一条运行记录，并写入同一个 `run_group_id`。
-- 运行详情和运行抽屉会在“多节点执行结果”中展示同组所有节点的节点执行状态、运行状态、失败来源、耗时、错误摘要和证据文件入口；点击下方节点详情 Tab 可在当前详情内切换不同节点的完整结果。
+- 多选并行时，同一次触发会为每个节点创建运行记录，并写入同一个 `run_group_id`；如果 UI 任务同时选择多个 browser type，会按节点和 browser type 的矩阵创建记录。
+- 运行详情和运行抽屉会在“多节点执行结果”中展示同组所有节点、browser type、节点执行状态、运行状态、失败来源、耗时、错误摘要和证据文件入口；点击下方节点详情 Tab 可在当前详情内切换不同节点和 browser type 的完整结果。
 - 多节点聚合只更新一次任务健康状态：任一可用节点出现目标失败/超时，本轮任务失败；全部可用节点成功才算成功；节点不可用只记录 `failure_kind=runner`，不计入目标失败。
 - 运行记录页可按执行节点筛选；需要按一次触发查看全量节点结果时，可用 `run_group_id` 查询同组运行记录。
 
@@ -339,10 +351,12 @@ async def setup(ctx):
 - `POST /api/runners/{runner_id}/update` / `GET /api/runners/{runner_id}/update-status`：主节点向子节点推送受控镜像更新和查询更新状态
 - `POST /api/runners/heartbeat`：旧版 Runner 主动心跳兼容接口，新子节点默认不需要配置
 - `GET /api/worker/health` / `POST /api/worker/run`：子节点健康检查和执行入口
+- `POST /api/worker/browser-types/install`：主节点请求子节点安装已启用的 Playwright browser type
 - `POST /api/worker/update` / `GET /api/worker/update-status`：子节点受控更新入口，需要启用 updater profile
 - `GET /api/runs?runner_id=...`：按执行节点筛选运行记录
 - `GET /api/runs?run_group_id=...`：按一次多节点触发分组查看所有节点运行结果
 - `GET /api/runs-page?run_group_id=...`：分页查看同组运行结果
+- `GET /api/runs/{id}`：查看运行详情；响应只附带基础请求信息（UI URL / API Method、URL、Headers、Body、超时），不返回告警、节点策略、校验项或脚本配置，敏感值会脱敏
 - `POST /api/heartbeats/{key}`：被动心跳上报
 
 ## 目录结构

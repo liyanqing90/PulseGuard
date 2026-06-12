@@ -386,13 +386,14 @@ class RunContextPoolTests(unittest.TestCase):
         asyncio.run(scenario())
 
         browser = resources.browser
-        self.assertEqual(resources.browser_acquired, 1)
+        self.assertEqual(resources.context_acquired, 1)
+        self.assertEqual(resources.context_options[0], {"viewport": {"width": 1366, "height": 768}})
         self.assertEqual(len(browser.contexts), 1)
         self.assertEqual(browser.contexts[0].options, {"viewport": {"width": 1366, "height": 768}})
         self.assertEqual(len(browser.contexts[0].pages), 2)
         self.assertTrue(browser.contexts[0].closed)
         self.assertFalse(browser.closed)
-        self.assertEqual(resources.released_browser, resources.browser_lease)
+        self.assertEqual(resources.released_context, resources.context_lease)
         self.assertTrue(resources.release_healthy)
 
 
@@ -503,8 +504,12 @@ class FakeResourcePool:
         self.http_acquired = 0
         self.browser = FakeBrowser()
         self.browser_lease = SimpleNamespace(browser=self.browser, version="chromium 120.0")
+        self.context_lease: object | None = None
         self.browser_acquired = 0
+        self.context_acquired = 0
+        self.context_options: list[dict[str, object]] = []
         self.released_browser: object | None = None
+        self.released_context: object | None = None
         self.release_healthy: bool | None = None
 
     @asynccontextmanager
@@ -518,6 +523,17 @@ class FakeResourcePool:
 
     async def release_browser(self, lease: object, *, healthy: bool = True) -> None:
         self.released_browser = lease
+        self.release_healthy = healthy
+
+    async def acquire_browser_context(self, settings: dict[str, object], context_options: dict[str, object]) -> object:
+        self.context_acquired += 1
+        self.context_options.append(context_options)
+        context = await self.browser.new_context(**context_options)
+        self.context_lease = SimpleNamespace(browser=self.browser, context=context, version="chromium 120.0")
+        return self.context_lease
+
+    async def release_browser_context(self, lease: object, *, healthy: bool = True) -> None:
+        self.released_context = lease
         self.release_healthy = healthy
 
 

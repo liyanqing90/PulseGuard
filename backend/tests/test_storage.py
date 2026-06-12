@@ -306,6 +306,24 @@ class CheckAlertPolicyStorageTests(unittest.TestCase):
         self.assertEqual(updated["alert_policy_json"], json_dumps(updated_policy))
         self.assertEqual(reloaded["alert_policy_json"], json_dumps(updated_policy))
 
+    def test_ui_check_browser_selection_fields_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            check = storage.create_check(
+                {
+                    **ui_check_data("Browser matrix UI"),
+                    "browser_selection_mode": "round_robin_all",
+                    "browser_types": ["firefox", "chromium"],
+                }
+            )
+            loaded = storage.get_check(int(check["id"]))
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["browser_selection_mode"], "round_robin_all")
+        self.assertEqual(loaded["browser_types"], ["firefox", "chromium"])
+
     def test_legacy_check_rows_receive_empty_alert_policy_json_on_migration(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -685,6 +703,29 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(updated["status"], "warning")
         self.assertEqual(updated["metadata"], {"capability": "api"})
         self.assertEqual({runner["runner_id"] for runner in runners}, {"local", "office-1"})
+
+    def test_probe_runner_browser_types_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            runner = storage.upsert_probe_runner(
+                {
+                    "runner_id": "office-1",
+                    "name": "Office Runner",
+                    "address": "http://10.0.0.8:8787",
+                    "network_region": "office-lan",
+                    "browser_version": "chromium 120.0",
+                    "installed_browser_types": ["chromium", "firefox"],
+                    "available_browser_types": ["chromium"],
+                    "status": "ok",
+                    "metadata": {},
+                }
+            )
+
+        self.assertEqual(runner["installed_browser_types"], ["chromium", "firefox"])
+        self.assertEqual(runner["available_browser_types"], ["chromium"])
+        self.assertTrue(runner["browser_type_status"]["chromium"]["installed"])
 
     def test_local_runner_update_persists_to_settings(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(

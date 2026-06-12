@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
-from backend.app.runner import CheckRunner, RunFailure, RunnerEnvironmentFailure
+from backend.app.runner import CheckRunner, RunFailure, RunnerEnvironmentFailure, _TASK_DURATION_ATTR
 
 
 class DraftRunnerTests(unittest.TestCase):
@@ -297,6 +297,71 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(finished_runs[0]["status"], "ok")
         self.assertIn("本次尝试失败，立即重试：flaky", str(finished_runs[0]["logs"]))
 
+    def test_retry_duration_uses_final_failed_attempt_instead_of_cumulative_total(self) -> None:
+        check = {
+            "id": 29,
+            "name": "Retry duration API",
+            "type": "api",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/health",
+            "method": "GET",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"status_code","expected_status":200}]',
+            "script": "",
+            "tags": "",
+        }
+        settings = {
+            "max_task_runtime_seconds": 60,
+            "browser_type": "chromium",
+            "browser_headless": True,
+            "api_retry_attempts": 1,
+        }
+        created_run = {"id": 290, "status": "running"}
+        finished_runs: list[dict[str, object]] = []
+        attempt_count = 0
+
+        async def run_attempt(*_args: object, **_kwargs: object) -> int:
+            nonlocal attempt_count
+            attempt_count += 1
+            exc = RunFailure(f"flaky-{attempt_count}")
+            if attempt_count == 1:
+                setattr(exc, _TASK_DURATION_ATTR, 9000)
+                raise exc
+            setattr(exc, _TASK_DURATION_ATTR, 1200)
+            raise exc
+
+        def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+            finished = {"id": run_id, "check_id": 29, **data}
+            finished_runs.append(finished)
+            return finished
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
+            "backend.app.runner.storage.get_settings",
+            return_value=settings,
+        ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch(
+            "backend.app.runner.storage.finish_run", side_effect=finish_run
+        ), patch(
+            "backend.app.runner.storage.get_run", return_value=None
+        ), patch(
+            "backend.app.runner.storage.update_check_status", return_value={"current_status": "healthy", "previous_status": "unknown"}
+        ), patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ), patch.object(
+            CheckRunner, "_run_check_attempt", side_effect=run_attempt
+        ):
+            result = asyncio.run(CheckRunner().run_check(29))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_message"], "flaky-2")
+        self.assertEqual(attempt_count, 2)
+        self.assertEqual(len(finished_runs), 1)
+        self.assertEqual(finished_runs[0]["duration_ms"], 1200)
+
     def test_runner_environment_failure_does_not_persist_task_run(self) -> None:
         check = {
             "id": 18,
@@ -561,6 +626,53 @@ class RunnerQueueTests(unittest.TestCase):
 
 
 class DistributedRunnerTests(unittest.TestCase):
+    def test_ui_browser_targets_expand_per_runner_and_browser_type(self) -> None:
+        check = {
+            "id": 41,
+            "name": "Browser matrix",
+            "type": "ui",
+            "browser_selection_mode": "selected_parallel",
+            "browser_types": ["chromium", "firefox"],
+        }
+        runners = [
+            {
+                "runner_id": "local",
+                "enabled": True,
+                "available": True,
+                "installed_browser_types": ["chromium", "firefox"],
+            },
+            {
+                "runner_id": "edge-1",
+                "enabled": True,
+                "available": True,
+                "installed_browser_types": ["chromium"],
+            },
+        ]
+
+        with patch(
+            "backend.app.runner.storage.get_settings",
+            return_value={
+                "enabled_browser_types": ["chromium", "firefox"],
+                "prewarmed_browser_types": ["chromium"],
+                "browser_pool_sizes": {"chromium": 5, "firefox": 2, "webkit": 1},
+                "browser_type": "chromium",
+            },
+        ), patch(
+            "backend.app.runner.browser_capabilities",
+            return_value={"installed_browser_types": ["chromium", "firefox"], "available_browser_types": ["chromium", "firefox"], "browser_type_status": {}},
+        ):
+            targets = CheckRunner()._resolve_browser_targets(check, runners)
+
+        self.assertEqual(
+            [(target.runner["runner_id"], target.browser_type, target.skip_reason) for target in targets],
+            [
+                ("local", "chromium", ""),
+                ("local", "firefox", ""),
+                ("edge-1", "chromium", ""),
+                ("edge-1", "firefox", "执行节点未安装 browser type：firefox"),
+            ],
+        )
+
     def test_remote_runner_timeout_covers_retry_budget(self) -> None:
         runner = CheckRunner()
         timeout = runner._remote_runner_timeout_seconds(

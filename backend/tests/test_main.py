@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+from backend.app import main as main_module
 from backend.app import storage
 from backend.app.main import app
 
@@ -454,6 +455,32 @@ class RunnerRouteTests(unittest.TestCase):
             {"target_image": "ghcr.io/liyanqing90/pulseguard-worker:new", "update_id": "upd-1", "force": False},
         )
 
+    def test_child_runner_health_triggers_missing_enabled_browser_install(self) -> None:
+        runner = {"runner_id": "office-1", "address": "http://10.0.0.8:8788", "role": "child"}
+        health = {"installed_browser_types": ["chromium"], "available_browser_types": ["chromium"]}
+
+        async def scenario() -> None:
+            with patch(
+                "backend.app.main.storage.get_settings",
+                return_value={
+                    "browser_type": "chromium",
+                    "enabled_browser_types": ["chromium", "firefox"],
+                    "prewarmed_browser_types": ["chromium"],
+                    "browser_pool_sizes": {"chromium": 5, "firefox": 5, "webkit": 5},
+                },
+            ), patch("backend.app.main._worker_request", new=AsyncMock(return_value={"ok": True})) as worker_request:
+                await main_module._install_missing_enabled_browser_types_on_runner(runner, health)
+
+            worker_request.assert_awaited_once_with(
+                runner,
+                "POST",
+                "/api/worker/browser-types/install",
+                {"browser_types": ["firefox"]},
+                timeout=10,
+            )
+
+        asyncio.run(scenario())
+
     def test_create_runner_stores_supplied_token_without_returning_secret(self) -> None:
         token = "pgrn_abcdefghijklmnopqrstuvwxyzABCDE1234567890_-"
         runner = {
@@ -711,6 +738,67 @@ class RunnerRouteTests(unittest.TestCase):
 
 
 class RunRouteTests(unittest.TestCase):
+    def test_run_detail_includes_basic_request_config_only(self) -> None:
+        run = {
+            "id": 41,
+            "check_id": 7,
+            "check_name": "Checkout API",
+            "check_type": "api",
+            "status": "failed",
+            "started_at": "2026-06-12T10:00:00+08:00",
+            "finished_at": "2026-06-12T10:00:01+08:00",
+            "duration_ms": 1200,
+            "trigger": "manual",
+            "observation_kind": "observation",
+            "affects_health": True,
+            "created_at": "2026-06-12T10:00:00+08:00",
+        }
+        check = {
+            "id": 7,
+            "name": "Checkout API",
+            "type": "api",
+            "enabled": True,
+            "interval_seconds": 60,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/checkout",
+            "viewport_mode": "web",
+            "method": "POST",
+            "headers_json": json.dumps({"Accept": "application/json", "Authorization": "Bearer token-secret-123"}),
+            "body": '{"account":"token-secret-123"}',
+            "assertions_json": '[{"type":"status_code","expected_status":200}]',
+            "setup_script": "async def setup(ctx, page): pass",
+            "script": "async def check(ctx): pass",
+            "tags": "checkout",
+            "alert_policy_json": '{"member_ids":["member-1"]}',
+            "runner_selection_mode": "selected_parallel",
+            "runner_ids": ["local", "office"],
+        }
+        settings = {
+            "environment_variables": [
+                {"id": "token", "name": "SERVICE_TOKEN", "value": "token-secret-123", "secret": True}
+            ]
+        }
+
+        with patch("backend.app.main.storage.get_run", return_value=run), patch(
+            "backend.app.main.storage.get_check", return_value=check
+        ) as get_check, patch(
+            "backend.app.main.storage.get_settings", return_value=settings
+        ):
+            response = TestClient(app).get("/api/runs/41")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["check"]["entry_url"], "https://example.com/checkout")
+        self.assertEqual(payload["check"]["method"], "POST")
+        self.assertEqual(payload["check"]["headers"]["Accept"], "application/json")
+        self.assertEqual(payload["check"]["headers"]["Authorization"], "***")
+        self.assertEqual(payload["check"]["body"], '{"account":"***"}')
+        self.assertNotIn("assertions_json", payload["check"])
+        self.assertNotIn("alert_policy_json", payload["check"])
+        self.assertNotIn("runner_ids", payload["check"])
+        self.assertNotIn("script", payload["check"])
+        get_check.assert_called_once_with(7, refresh_stale=False)
+
     def test_runs_route_accepts_run_group_filter(self) -> None:
         with patch("backend.app.main.storage.list_runs", return_value=[]) as list_runs:
             response = TestClient(app).get("/api/runs?run_group_id=rg-test&limit=25")

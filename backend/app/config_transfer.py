@@ -33,6 +33,8 @@ CHECK_EXPORT_FIELDS = (
     "alert_policy_json",
     "runner_selection_mode",
     "runner_ids",
+    "browser_selection_mode",
+    "browser_types",
 )
 
 
@@ -339,6 +341,8 @@ def _check_payload(raw_check: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("alert_policy_json", "{}")
     payload.setdefault("runner_selection_mode", "selected_parallel")
     payload.setdefault("runner_ids", ["local"])
+    payload.setdefault("browser_selection_mode", "selected_parallel")
+    payload.setdefault("browser_types", ["chromium"] if check_type == "ui" else [])
     return payload
 
 

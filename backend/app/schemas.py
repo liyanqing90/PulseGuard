@@ -9,12 +9,14 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .api_assertions import has_enabled_api_assertions, normalize_api_assertions
+from .browser_types import BROWSER_TYPE_SET, normalize_browser_pool_sizes, normalize_browser_selection_mode, normalize_browser_types
 from .ui_assertions import has_enabled_ui_assertions, normalize_ui_assertions
 from .variables import VARIABLE_NAME_PATTERN
 
 
 CheckType = Literal["ui", "api"]
 RunnerSelectionMode = Literal["selected_parallel", "round_robin_all"]
+BrowserSelectionMode = Literal["selected_parallel", "round_robin_all"]
 RunStatus = Literal["pending", "running", "ok", "failed", "timeout", "skipped"]
 NotificationStatus = Literal["disabled", "not_required", "suppressed", "sent", "failed"]
 NOTIFICATION_STATUSES = {"disabled", "not_required", "suppressed", "sent", "failed"}
@@ -38,6 +40,8 @@ class CheckBase(BaseModel):
     alert_policy_json: str | None = "{}"
     runner_selection_mode: RunnerSelectionMode = "selected_parallel"
     runner_ids: list[str] = Field(default_factory=lambda: ["local"])
+    browser_selection_mode: BrowserSelectionMode = "selected_parallel"
+    browser_types: list[str] = Field(default_factory=lambda: ["chromium"])
 
     @field_validator("script")
     @classmethod
@@ -111,12 +115,19 @@ class CheckBase(BaseModel):
             result.append(runner_id)
         return result or ["local"]
 
+    @field_validator("browser_types")
+    @classmethod
+    def browser_types_must_be_unique(cls, value: list[str] | None) -> list[str]:
+        return normalize_browser_types(value, default=["chromium"])
+
     @model_validator(mode="after")
     def normalize_method(self) -> "CheckBase":
         if self.type == "api":
             self.method = (self.method or "GET").upper()
             self.viewport_mode = "web"
             self.setup_script = ""
+            self.browser_selection_mode = "selected_parallel"
+            self.browser_types = []
             self.assertions_json = json.dumps(normalize_api_assertions(self.assertions_json), ensure_ascii=False)
             if not has_enabled_api_assertions(self.assertions_json) and not (self.script or "").strip():
                 raise ValueError("接口任务请至少添加一个校验项，或填写高级脚本")
@@ -125,6 +136,8 @@ class CheckBase(BaseModel):
             self.setup_script = self.setup_script or ""
             self.headers_json = "{}"
             self.body = ""
+            self.browser_selection_mode = normalize_browser_selection_mode(self.browser_selection_mode)  # type: ignore[assignment]
+            self.browser_types = normalize_browser_types(self.browser_types, default=["chromium"])
             self.assertions_json = json.dumps(normalize_ui_assertions(self.assertions_json), ensure_ascii=False)
             if not has_enabled_ui_assertions(self.assertions_json) and "async def check" not in (self.script or ""):
                 raise ValueError("UI 任务请至少添加一个校验项，或填写高级脚本 async def check(ctx)")
@@ -252,7 +265,7 @@ SETTING_LABELS = {
     "max_ui_concurrency": "最大 UI 并发数",
     "max_queue_size": "执行队列容量",
     "api_pool_size": "API 请求池大小",
-    "browser_pool_size": "浏览器池大小",
+    "browser_pool_size": "浏览器 Context 池大小",
     "max_task_runtime_seconds": "单任务最大运行时长",
     "alert_cooldown_minutes": "告警冷却时间",
     "alert_detail_base_url": "告警详情链接前缀",
@@ -314,7 +327,6 @@ BOOLEAN_SETTINGS = {
 }
 
 WEBHOOK_TYPES = {"feishu", "wecom", "dingtalk"}
-BROWSER_TYPES = {"chromium", "firefox", "webkit"}
 VIEWPORT_PATTERN = re.compile(r"^[1-9]\d{2,4}x[1-9]\d{2,4}$")
 
 
@@ -336,7 +348,13 @@ def normalize_settings_values(values: dict[str, Any]) -> dict[str, Any]:
         elif key == "alert_detail_base_url":
             normalized[key] = _absolute_http_url(key, value)
         elif key == "browser_type":
-            normalized[key] = _enum(key, value, BROWSER_TYPES)
+            normalized[key] = _enum(key, value, BROWSER_TYPE_SET)
+        elif key == "enabled_browser_types":
+            normalized[key] = normalize_browser_types(value, default=["chromium"])
+        elif key == "prewarmed_browser_types":
+            normalized[key] = normalize_browser_types(value, default=["chromium"], allow_empty=True)
+        elif key == "browser_pool_sizes":
+            normalized[key] = normalize_browser_pool_sizes(value)
         elif key == "browser_proxy":
             normalized[key] = _string(key, value, max_length=2048)
         elif key == "read_only_token":
@@ -363,8 +381,15 @@ class RunnerHeartbeatRequest(BaseModel):
     address: str = Field(default="", max_length=2048)
     network_region: str = Field(default="local", max_length=120)
     browser_version: str = Field(default="", max_length=120)
+    installed_browser_types: list[str] = Field(default_factory=list)
+    available_browser_types: list[str] = Field(default_factory=list)
     status: Literal["ok", "warning", "offline"] = "ok"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("installed_browser_types", "available_browser_types")
+    @classmethod
+    def heartbeat_browser_types_must_be_valid(cls, value: list[str] | None) -> list[str]:
+        return normalize_browser_types(value, default=[], allow_empty=True)
 
 
 class ProbeRunnerCreate(BaseModel):
@@ -429,6 +454,15 @@ class WorkerUpdateRequest(BaseModel):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}", text):
             raise ValueError("更新批次 ID 格式无效")
         return text
+
+
+class BrowserInstallRequest(BaseModel):
+    browser_types: list[str] = Field(default_factory=list)
+
+    @field_validator("browser_types")
+    @classmethod
+    def browser_types_must_be_valid(cls, value: list[str] | None) -> list[str]:
+        return normalize_browser_types(value, default=[], allow_empty=True)
 
 
 class ReadOnlyTokenCreate(BaseModel):

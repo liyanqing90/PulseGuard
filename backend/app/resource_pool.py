@@ -7,7 +7,9 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from .browser_types import browser_pool_size_for, prewarmed_browser_types, settings_for_browser_type
 from .variables import resolve_text
+from .viewport import browser_context_options, browser_viewport
 
 
 class ResourcePoolError(Exception):
@@ -34,6 +36,15 @@ class BrowserLease:
     browser: Any
     version: str
     config: BrowserLaunchConfig
+
+
+@dataclass(eq=False)
+class BrowserContextLease:
+    browser: Any
+    context: Any
+    version: str
+    config: BrowserLaunchConfig
+    context_options: dict[str, Any]
 
 
 class HttpClientPool:
@@ -111,12 +122,15 @@ class HttpClientPool:
 class BrowserPool:
     def __init__(self, size: int) -> None:
         self._target_size = max(1, int(size))
-        self._leases: set[BrowserLease] = set()
-        self._available: asyncio.Queue[BrowserLease] = asyncio.Queue()
-        self._lock = asyncio.Lock()
+        self._browser_lease: BrowserLease | None = None
+        self._ready_contexts: list[BrowserContextLease] = []
+        self._active_contexts: set[BrowserContextLease] = set()
+        self._condition = asyncio.Condition()
         self._closing = False
         self._config: BrowserLaunchConfig | None = None
+        self._default_context_options: dict[str, Any] = {}
         self._playwright: Any = None
+        self._retire_browser_when_idle = False
         self._last_error = ""
 
     async def start(self, settings: dict[str, Any]) -> None:
@@ -124,80 +138,154 @@ class BrowserPool:
 
     async def resize(self, size: int, settings: dict[str, Any]) -> None:
         config = self._config_from_settings(settings)
-        async with self._lock:
+        default_context_options = default_context_options_from_settings(settings)
+        async with self._condition:
             self._target_size = max(1, int(size))
             self._closing = False
-            self._config = config
-            to_close = self._drain_idle_locked(config=config, remove_all=False)
-        await self._close_leases(to_close)
-        async with self._lock:
-            if self._closing or self._config != config:
-                return
-            await self._fill_locked(config)
+            self._default_context_options = default_context_options
+            if self._config != config:
+                self._config = config
+                if self._browser_lease is not None:
+                    self._retire_browser_when_idle = True
+            await self._reconcile_locked()
+            self._condition.notify_all()
 
     async def acquire(self, settings: dict[str, Any]) -> BrowserLease:
         config = self._config_from_settings(settings)
-        try:
-            await self.resize(self._target_size, settings)
-        except ResourcePoolError:
-            if self._available.empty():
-                raise
-        lease = await self._available.get()
-        if lease.config != config:
-            await self.release(lease, healthy=False)
-            raise ResourcePoolError(self._last_error or "浏览器池没有可用实例")
-        return lease
+        default_context_options = default_context_options_from_settings(settings)
+        async with self._condition:
+            self._closing = False
+            self._default_context_options = default_context_options
+            if self._config != config:
+                self._config = config
+                if self._browser_lease is not None:
+                    self._retire_browser_when_idle = True
+            while True:
+                await self._reconcile_locked()
+                if self._browser_lease is not None and not self._retire_browser_when_idle:
+                    return self._browser_lease
+                await self._condition.wait()
+
+    async def acquire_context(self, settings: dict[str, Any], context_options: dict[str, Any]) -> BrowserContextLease:
+        config = self._config_from_settings(settings)
+        default_context_options = default_context_options_from_settings(settings)
+        requested_options = dict(context_options)
+        async with self._condition:
+            self._closing = False
+            self._default_context_options = default_context_options
+            if self._config != config:
+                self._config = config
+                if self._browser_lease is not None:
+                    self._retire_browser_when_idle = True
+            while True:
+                await self._reconcile_locked()
+                if self._browser_lease is None or self._retire_browser_when_idle:
+                    await self._condition.wait()
+                    continue
+                lease = self._pop_ready_context_locked(requested_options)
+                if lease is None:
+                    if self._context_count_locked() >= self._target_size:
+                        if self._ready_contexts:
+                            await self._close_context(self._ready_contexts.pop(0))
+                        else:
+                            await self._condition.wait()
+                            continue
+                    lease = await self._new_context_locked(requested_options)
+                self._active_contexts.add(lease)
+                self._condition.notify_all()
+                return lease
 
     async def release(self, lease: BrowserLease, *, healthy: bool = True) -> None:
-        to_close: list[BrowserLease] = []
-        refill_settings: dict[str, Any] | None = None
-        async with self._lock:
-            stale = (
-                self._closing
-                or not healthy
-                or lease.config != self._config
-                or not self._browser_connected(lease.browser)
-                or len(self._leases) > self._target_size
-            )
-            if stale:
-                self._leases.discard(lease)
-                to_close.append(lease)
-            else:
-                self._available.put_nowait(lease)
-            if not self._closing and self._config is not None and len(self._leases) < self._target_size:
-                refill_settings = settings_from_config(self._config)
-        await self._close_leases(to_close)
-        if refill_settings is not None:
+        async with self._condition:
+            if lease is self._browser_lease and (not healthy or not self._browser_connected(lease.browser)):
+                self._retire_browser_when_idle = True
             try:
-                await self.resize(self._target_size, refill_settings)
+                await self._reconcile_locked()
             except ResourcePoolError:
                 pass
+            self._condition.notify_all()
+        await self._stop_playwright_if_idle()
+
+    async def release_context(self, lease: BrowserContextLease, *, healthy: bool = True) -> None:
+        async with self._condition:
+            self._active_contexts.discard(lease)
+            await self._close_context(lease)
+            if not healthy:
+                self._retire_browser_when_idle = True
+            try:
+                if healthy and not self._closing and not self._retire_browser_when_idle and self._browser_lease is not None:
+                    await self._fill_contexts_locked(lease.context_options)
+                await self._reconcile_locked()
+            except ResourcePoolError:
+                pass
+            self._condition.notify_all()
         await self._stop_playwright_if_idle()
 
     async def shutdown(self) -> None:
-        async with self._lock:
+        async with self._condition:
             self._closing = True
-            to_close = self._drain_idle_locked(config=self._config, remove_all=True)
-        await self._close_leases(to_close)
+            await self._reconcile_locked()
+            self._condition.notify_all()
         await self._stop_playwright_if_idle()
 
     def snapshot(self) -> dict[str, Any]:
-        ready = self._available.qsize()
-        total = len(self._leases)
+        ready = len(self._ready_contexts)
+        active = len(self._active_contexts)
         return {
             "limit": self._target_size,
             "ready": ready,
-            "in_use": max(0, total - ready),
-            "total": total,
+            "in_use": active,
+            "total": ready + active,
+            "browser_processes": int(self._browser_lease is not None and self._browser_connected(self._browser_lease.browser)),
             "error": self._last_error,
         }
 
-    async def _fill_locked(self, config: BrowserLaunchConfig) -> None:
-        while not self._closing and len(self._leases) < self._target_size:
-            lease = await self._launch_locked(config)
-            self._leases.add(lease)
-            self._available.put_nowait(lease)
+    async def _reconcile_locked(self) -> None:
+        if self._browser_lease is not None and not self._browser_connected(self._browser_lease.browser):
+            self._retire_browser_when_idle = True
+
+        if self._closing:
+            await self._close_ready_contexts_locked()
+            if not self._active_contexts:
+                await self._close_browser_locked()
+            return
+
+        if self._retire_browser_when_idle:
+            await self._close_ready_contexts_locked()
+            if self._active_contexts:
+                return
+            await self._close_browser_locked()
+            self._retire_browser_when_idle = False
+
+        if self._browser_lease is None:
+            if self._config is None:
+                return
+            self._browser_lease = await self._launch_locked(self._config)
+
+        await self._trim_ready_contexts_locked()
+        await self._fill_contexts_locked(self._default_context_options)
+
+    async def _fill_contexts_locked(self, context_options: dict[str, Any]) -> None:
+        while not self._closing and self._browser_lease is not None and self._context_count_locked() < self._target_size:
+            self._ready_contexts.append(await self._new_context_locked(context_options))
         self._last_error = ""
+
+    async def _new_context_locked(self, context_options: dict[str, Any]) -> BrowserContextLease:
+        if self._browser_lease is None:
+            raise ResourcePoolError("浏览器池没有可用实例")
+        options = dict(context_options)
+        try:
+            context = await self._browser_lease.browser.new_context(**options)
+        except Exception as exc:
+            self._last_error = f"浏览器 Context 创建失败：{exc}"
+            raise ResourcePoolError(self._last_error) from exc
+        return BrowserContextLease(
+            browser=self._browser_lease.browser,
+            context=context,
+            version=self._browser_lease.version,
+            config=self._browser_lease.config,
+            context_options=options,
+        )
 
     async def _launch_locked(self, config: BrowserLaunchConfig) -> BrowserLease:
         try:
@@ -231,32 +319,44 @@ class BrowserPool:
             self._playwright = await async_playwright().start()
         return self._playwright
 
-    def _drain_idle_locked(self, *, config: BrowserLaunchConfig | None, remove_all: bool) -> list[BrowserLease]:
-        to_close: list[BrowserLease] = []
-        keep: list[BrowserLease] = []
-        while not self._available.empty():
-            lease = self._available.get_nowait()
-            should_close = remove_all or lease.config != config or len(self._leases) - len(to_close) > self._target_size
-            if should_close:
-                self._leases.discard(lease)
-                to_close.append(lease)
-            else:
-                keep.append(lease)
-        for lease in keep:
-            self._available.put_nowait(lease)
-        return to_close
+    def _pop_ready_context_locked(self, context_options: dict[str, Any]) -> BrowserContextLease | None:
+        key = context_options_key(context_options)
+        for index, lease in enumerate(self._ready_contexts):
+            if context_options_key(lease.context_options) == key:
+                return self._ready_contexts.pop(index)
+        return None
 
-    async def _close_leases(self, leases: list[BrowserLease]) -> None:
-        for lease in leases:
+    def _context_count_locked(self) -> int:
+        return len(self._ready_contexts) + len(self._active_contexts)
+
+    async def _trim_ready_contexts_locked(self) -> None:
+        while self._ready_contexts and self._context_count_locked() > self._target_size:
+            await self._close_context(self._ready_contexts.pop())
+
+    async def _close_ready_contexts_locked(self) -> None:
+        while self._ready_contexts:
+            await self._close_context(self._ready_contexts.pop())
+
+    async def _close_browser_locked(self) -> None:
+        await self._close_ready_contexts_locked()
+        if self._browser_lease is not None:
             try:
-                await lease.browser.close()
+                await self._browser_lease.browser.close()
             except Exception:
                 pass
+            finally:
+                self._browser_lease = None
+
+    async def _close_context(self, lease: BrowserContextLease) -> None:
+        try:
+            await lease.context.close()
+        except Exception:
+            pass
 
     async def _stop_playwright_if_idle(self) -> None:
         playwright = None
-        async with self._lock:
-            if self._closing and not self._leases and self._playwright is not None:
+        async with self._condition:
+            if self._closing and self._browser_lease is None and not self._active_contexts and self._playwright is not None:
                 playwright = self._playwright
                 self._playwright = None
                 self._config = None
@@ -280,23 +380,24 @@ class BrowserPool:
 
 
 class ProbeResourcePool:
-    def __init__(self, api_pool_size: int, browser_pool_size: int) -> None:
+    def __init__(self, api_pool_size: int, browser_pool_sizes_value: dict[str, int] | int) -> None:
         self.http_clients = HttpClientPool(api_pool_size)
-        self.browsers = BrowserPool(browser_pool_size)
+        self.browsers: dict[str, BrowserPool] = {}
+        self._browser_pool_sizes = _coerce_pool_sizes(browser_pool_sizes_value)
 
-    async def start(self, settings: dict[str, Any], *, api_pool_size: int, browser_pool_size: int) -> None:
+    async def start(self, settings: dict[str, Any], *, api_pool_size: int, browser_pool_sizes_value: dict[str, int] | int) -> None:
         await self.http_clients.resize(api_pool_size)
-        try:
-            await self.browsers.resize(browser_pool_size, settings)
-        except ResourcePoolError:
-            pass
+        self._browser_pool_sizes = _coerce_pool_sizes(browser_pool_sizes_value)
+        await self._resize_browser_pools(settings)
 
-    async def reload(self, settings: dict[str, Any], *, api_pool_size: int, browser_pool_size: int) -> None:
-        await self.start(settings, api_pool_size=api_pool_size, browser_pool_size=browser_pool_size)
+    async def reload(self, settings: dict[str, Any], *, api_pool_size: int, browser_pool_sizes_value: dict[str, int] | int) -> None:
+        await self.start(settings, api_pool_size=api_pool_size, browser_pool_sizes_value=browser_pool_sizes_value)
 
     async def shutdown(self) -> None:
         await self.http_clients.shutdown()
-        await self.browsers.shutdown()
+        pools = list(self.browsers.values())
+        for pool in pools:
+            await pool.shutdown()
 
     @asynccontextmanager
     async def http_client(self) -> AsyncIterator[httpx.AsyncClient]:
@@ -304,16 +405,50 @@ class ProbeResourcePool:
             yield client
 
     async def acquire_browser(self, settings: dict[str, Any]) -> BrowserLease:
-        return await self.browsers.acquire(settings)
+        browser_type = str(settings.get("browser_type") or "chromium")
+        pool = self._browser_pool(browser_type)
+        return await pool.acquire(settings_for_browser_type(settings, browser_type))
 
     async def release_browser(self, lease: BrowserLease, *, healthy: bool = True) -> None:
-        await self.browsers.release(lease, healthy=healthy)
+        pool = self.browsers.get(lease.config.browser_type)
+        if pool is not None:
+            await pool.release(lease, healthy=healthy)
+
+    async def acquire_browser_context(self, settings: dict[str, Any], context_options: dict[str, Any]) -> BrowserContextLease:
+        browser_type = str(settings.get("browser_type") or "chromium")
+        pool = self._browser_pool(browser_type)
+        return await pool.acquire_context(settings_for_browser_type(settings, browser_type), context_options)
+
+    async def release_browser_context(self, lease: BrowserContextLease, *, healthy: bool = True) -> None:
+        pool = self.browsers.get(lease.config.browser_type)
+        if pool is not None:
+            await pool.release_context(lease, healthy=healthy)
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "api": self.http_clients.snapshot(),
-            "browser": self.browsers.snapshot(),
+            "browser": {browser_type: pool.snapshot() for browser_type, pool in sorted(self.browsers.items())},
         }
+
+    async def _resize_browser_pools(self, settings: dict[str, Any]) -> None:
+        wanted = set(prewarmed_browser_types(settings))
+        for browser_type in wanted:
+            pool = self._browser_pool(browser_type)
+            try:
+                await pool.resize(browser_pool_size_for(settings, browser_type), settings_for_browser_type(settings, browser_type))
+            except ResourcePoolError:
+                pass
+        for browser_type in list(self.browsers):
+            if browser_type in wanted:
+                continue
+            await self.browsers[browser_type].shutdown()
+
+    def _browser_pool(self, browser_type: str) -> BrowserPool:
+        pool = self.browsers.get(browser_type)
+        if pool is None:
+            pool = BrowserPool(self._browser_pool_sizes.get(browser_type, 5))
+            self.browsers[browser_type] = pool
+        return pool
 
 
 async def _close_http_clients(clients: list[httpx.AsyncClient]) -> None:
@@ -329,3 +464,26 @@ def settings_from_config(config: BrowserLaunchConfig | None) -> dict[str, Any]:
         "browser_headless": config.headless,
         "browser_proxy": config.proxy_url,
     }
+
+
+def default_context_options_from_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    return browser_context_options("web", browser_viewport(settings))
+
+
+def context_options_key(options: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    return tuple(sorted((str(key), _freeze_context_option(value)) for key, value in options.items()))
+
+
+def _freeze_context_option(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _freeze_context_option(item)) for key, item in value.items()))
+    if isinstance(value, list):
+        return tuple(_freeze_context_option(item) for item in value)
+    return value
+
+
+def _coerce_pool_sizes(value: dict[str, int] | int) -> dict[str, int]:
+    if isinstance(value, dict):
+        return {str(key): max(1, int(size)) for key, size in value.items()}
+    size = max(1, int(value))
+    return dict.fromkeys(("chromium", "firefox", "webkit"), size)

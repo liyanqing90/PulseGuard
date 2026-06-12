@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../api";
 import { RunnerExecutionTag, failureKindTag } from "./shared/businessTags";
-import type { Run, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
+import type { Run, RunCheckRequestInfo, RunComparison, RunComparisonAssertion, RunComparisonField, RunFailureSummary } from "../types";
 import { artifactHref, formatDate, formatDuration, parseSnapshot, runnerExecutionMeta, runnerSummary, runStatusLabel, runStatusTagColor } from "../utils";
 import { StructuredViewer } from "./StructuredViewer";
 
@@ -207,9 +207,11 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
           {!compactNodeDetail && <Descriptions.Item label="节点 ID">{run.runner_id || "local"}</Descriptions.Item>}
           {run.runner_address && <Descriptions.Item label="节点地址">{run.runner_address}</Descriptions.Item>}
           {run.runner_region && <Descriptions.Item label="网络区域">{run.runner_region}</Descriptions.Item>}
+          {run.browser_type && <Descriptions.Item label="Browser Type">{run.browser_type}</Descriptions.Item>}
           {run.runner_browser_version && <Descriptions.Item label="浏览器版本">{run.runner_browser_version}</Descriptions.Item>}
         </Descriptions>
       </DetailSection>
+      {run.check && <CheckRequestSection check={run.check} />}
       {showGroupResults && run.run_group_id && (
         <DetailSection title="多节点执行结果" extra={<RunGroupSummaryTag summary={groupSummary} />}>
           <RunGroupPanel
@@ -376,6 +378,28 @@ function FailureSummaryPanel({
         </div>
       )}
     </section>
+  );
+}
+
+function CheckRequestSection({ check }: { check: RunCheckRequestInfo }) {
+  const isApi = check.type === "api";
+  return (
+    <DetailSection title="基础请求信息">
+      <Descriptions bordered column={2} size="small">
+        <Descriptions.Item label={isApi ? "接口 URL" : "页面 URL"} span={2}>
+          <code className="run-config-url">{check.entry_url || "-"}</code>
+        </Descriptions.Item>
+        {isApi && <Descriptions.Item label="Method">{check.method || "GET"}</Descriptions.Item>}
+        {!isApi && <Descriptions.Item label="页面模式">{viewportModeLabel(check.viewport_mode)}</Descriptions.Item>}
+        <Descriptions.Item label="超时时间">{formatDuration(check.timeout_ms)}</Descriptions.Item>
+      </Descriptions>
+      {isApi && (
+        <div className="run-request-config-grid">
+          <StructuredViewer title="Headers" value={check.headers || {}} defaultMode="json" />
+          <StructuredViewer title="Body" value={check.body || ""} defaultMode="auto" />
+        </div>
+      )}
+    </DetailSection>
   );
 }
 
@@ -627,6 +651,12 @@ function RunGroupPanel({
       )
     },
     {
+      title: "Browser Type",
+      dataIndex: "browser_type",
+      width: 120,
+      render: (value: string | null | undefined) => value || "-"
+    },
+    {
       title: "执行结果",
       dataIndex: "failure_kind",
       width: 108,
@@ -692,6 +722,7 @@ function RunGroupTabLabel({ run }: { run: Run }) {
   return (
     <span className="run-group-node-tab">
       <span>{runnerSummary(run)}</span>
+      {run.browser_type && <span>{run.browser_type}</span>}
     </span>
   );
 }
@@ -927,19 +958,27 @@ function extractStageTimings(value: unknown, checkType?: Run["check_type"]): Sta
 function singleRunMetaItems(run: Run): MetaItemData[] {
   return [
     { label: "类型", value: run.check_type === "ui" ? "UI" : "API" },
+    ...(run.browser_type ? [{ label: "Browser Type", value: run.browser_type }] : []),
     { label: "耗时", value: formatDuration(run.duration_ms) },
     { label: "开始", value: formatDate(run.started_at) },
     { label: "结束", value: formatDate(run.finished_at) }
   ];
 }
 
+function viewportModeLabel(value?: RunCheckRequestInfo["viewport_mode"]): string {
+  return value === "h5" ? "H5" : "Web";
+}
+
 function summarizeRunGroupMeta(run: Run | null, runs: Run[]): MetaItemData[] {
   const source = runs.length ? runs : run ? [run] : [];
   const startedAt = earliestDate(source.map((item) => item.started_at));
   const finishedAt = latestDate(source.map((item) => item.finished_at).filter(Boolean) as string[]);
+  const nodeCount = new Set(source.map((item) => item.runner_id || item.runner_name || "local")).size;
+  const browserTypeCount = new Set(source.map((item) => item.browser_type).filter(Boolean)).size;
   return [
     { label: "类型", value: run?.check_type === "api" ? "API" : "UI" },
-    { label: "节点", value: source.length ? `${source.length} 个` : "-" },
+    { label: "节点", value: source.length ? `${nodeCount} 个` : "-" },
+    ...(browserTypeCount ? [{ label: "Browser Type", value: `${browserTypeCount} 类 / ${source.length} 组合` }] : []),
     { label: "开始", value: formatDate(startedAt || run?.started_at) },
     { label: "结束", value: formatDate(finishedAt || run?.finished_at) }
   ];

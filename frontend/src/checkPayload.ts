@@ -1,6 +1,8 @@
 import { hasEnabledApiAssertions, parseApiAssertions, serializeApiAssertions } from "./apiAssertions";
 import { hasEnabledUiAssertions, parseUiAssertions, serializeUiAssertions } from "./uiAssertions";
-import type { ApiInspectPayload, Check, CheckPayload, CheckType } from "./types";
+import type { ApiInspectPayload, BrowserType, Check, CheckPayload, CheckType } from "./types";
+
+const BROWSER_TYPES: BrowserType[] = ["chromium", "firefox", "webkit"];
 
 export type BodyEditorMode = "json" | "text";
 
@@ -22,7 +24,9 @@ export function checkToPayload(check: Check): CheckPayload {
     tags: check.tags || "",
     alert_policy_json: check.alert_policy_json || "{}",
     runner_selection_mode: check.runner_selection_mode || "selected_parallel",
-    runner_ids: normalizeRunnerIds(check.runner_ids)
+    runner_ids: normalizeRunnerIds(check.runner_ids),
+    browser_selection_mode: check.type === "ui" ? check.browser_selection_mode || "selected_parallel" : "selected_parallel",
+    browser_types: check.type === "ui" ? normalizeBrowserTypes(check.browser_types) : []
   };
 }
 
@@ -131,7 +135,9 @@ export function normalizeCheckPayload(value: CheckPayload): CheckPayload {
     script: value.script || "",
     alert_policy_json: normalizeAlertPolicyJson(value.alert_policy_json),
     runner_selection_mode: value.runner_selection_mode === "round_robin_all" ? "round_robin_all" : "selected_parallel",
-    runner_ids: normalizeRunnerIds(value.runner_ids)
+    runner_ids: normalizeRunnerIds(value.runner_ids),
+    browser_selection_mode: value.type === "ui" && value.browser_selection_mode === "round_robin_all" ? "round_robin_all" : "selected_parallel",
+    browser_types: value.type === "ui" ? normalizeBrowserTypes(value.browser_types) : []
   };
 }
 
@@ -192,4 +198,16 @@ function normalizeRunnerIds(value?: string[] | null): string[] {
     result.push(runnerId);
   }
   return result.length ? result : ["local"];
+}
+
+function normalizeBrowserTypes(value?: string[] | null): BrowserType[] {
+  const seen = new Set<string>();
+  const result: BrowserType[] = [];
+  for (const item of value || []) {
+    const browserType = String(item || "").trim() as BrowserType;
+    if (!BROWSER_TYPES.includes(browserType) || seen.has(browserType)) continue;
+    seen.add(browserType);
+    result.push(browserType);
+  }
+  return result.length ? result : ["chromium"];
 }

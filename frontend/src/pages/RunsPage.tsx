@@ -505,6 +505,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
               <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
               <HistoryMeta label="执行节点" value={runnerSummary(run)} />
+              {run.browser_type && <HistoryMeta label="Browser Type" value={run.browser_type} />}
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
               <HistoryMeta label="连续失败" value={run.consecutive_failures || "-"} />
             </div>
@@ -568,6 +569,7 @@ function runnerTooltip(run: Run): string {
   const details = [
     `执行节点: ${runnerSummary(run)}`,
     run.runner_address ? `地址: ${run.runner_address}` : "",
+    run.browser_type ? `Browser Type: ${run.browser_type}` : "",
     run.runner_browser_version ? `浏览器: ${run.runner_browser_version}` : ""
   ].filter(Boolean);
   return details.join("\n");

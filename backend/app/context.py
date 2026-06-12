@@ -123,6 +123,7 @@ class RunContext:
         self._playwright: Any = None
         self._browser: Any = None
         self._browser_lease: Any = None
+        self._browser_context_lease: Any = None
         self._browser_context: Any = None
         self._trace_started = False
         self._pages: list[Any] = []
@@ -193,9 +194,13 @@ class RunContext:
         if self._browser_context is None:
             try:
                 if self.resources is not None:
-                    self._browser_lease = await self.resources.acquire_browser(self.settings)
-                    self._browser = self._browser_lease.browser
-                    self.browser_version = self._browser_lease.version
+                    self._browser_context_lease = await self.resources.acquire_browser_context(
+                        self.settings,
+                        self._browser_context_options(),
+                    )
+                    self._browser = self._browser_context_lease.browser
+                    self._browser_context = self._browser_context_lease.context
+                    self.browser_version = self._browser_context_lease.version
                 else:
                     try:
                         from playwright.async_api import async_playwright
@@ -222,24 +227,17 @@ class RunContext:
                     self.browser_version = " ".join(
                         part for part in (browser_type_name, str(raw_version or "").strip()) if part
                     )
-                self._browser_context = await self._browser.new_context(**self._browser_context_options())
+                    self._browser_context = await self._browser.new_context(**self._browser_context_options())
                 await self._browser_context.tracing.start(screenshots=True, snapshots=True, sources=True)
                 self._trace_started = True
             except RunnerEnvironmentFailure:
-                if self._browser_lease is not None and self.resources is not None:
-                    await self.resources.release_browser(self._browser_lease, healthy=False)
-                    self._browser_lease = None
-                    self._browser = None
+                await self._release_pooled_browser_context(False)
                 raise
             except ResourcePoolError as exc:
-                self._browser_lease = None
-                self._browser = None
+                await self._release_pooled_browser_context(False)
                 raise RunnerEnvironmentFailure(str(exc)) from exc
             except Exception as exc:
-                if self._browser_lease is not None and self.resources is not None:
-                    await self.resources.release_browser(self._browser_lease, healthy=False)
-                    self._browser_lease = None
-                    self._browser = None
+                await self._release_pooled_browser_context(False)
                 raise RunnerEnvironmentFailure(f"浏览器环境启动失败：{exc}") from exc
 
         page = await self._browser_context.new_page()
@@ -353,6 +351,10 @@ class RunContext:
                 browser_context_error = exc
             finally:
                 self._browser_context = None
+        if self._browser_context_lease is not None and self.resources is not None:
+            await self.resources.release_browser_context(self._browser_context_lease, healthy=browser_context_error is None)
+            self._browser_context_lease = None
+            self._browser = None
         if self._browser_lease is not None and self.resources is not None:
             await self.resources.release_browser(self._browser_lease, healthy=browser_context_error is None)
             self._browser_lease = None
@@ -366,6 +368,13 @@ class RunContext:
         await self.http.close()
         if browser_context_error is not None:
             raise browser_context_error
+
+    async def _release_pooled_browser_context(self, healthy: bool) -> None:
+        if self._browser_context_lease is not None and self.resources is not None:
+            await self.resources.release_browser_context(self._browser_context_lease, healthy=healthy)
+            self._browser_context_lease = None
+            self._browser_context = None
+            self._browser = None
 
     def response_snapshot_from(self, response: httpx.Response, include_body: bool = False) -> dict[str, Any]:
         body_text = response.text
