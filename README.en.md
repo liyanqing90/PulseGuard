@@ -163,7 +163,7 @@ Structured UI/API assertions do not require an advanced script. Complex login, m
 - `GET /api/metrics.json`: JSON metrics
 - `GET /api/metrics`: Prometheus metrics
 - `GET /api/read-only/snapshot`: read-only snapshot, requires a configured read-only token
-- `GET /api/runs/{id}`: run detail with only basic request info attached (UI URL / API method, URL, headers, body, timeout); alert policies, runner selection, assertions, and scripts are not returned, and sensitive values are redacted
+- `GET /api/runs/{id}`: run detail based on execution snapshots; UI runs attach the request basics captured for that run (URL, viewport, timeout), while API runs keep request/response snapshots instead of reloading the current task definition
 - `POST /api/runners/heartbeat`: Runner heartbeat
 - `GET /api/worker/health` / `POST /api/worker/run`: child worker health and execution entry points
 - `POST /api/worker/browser-types/install`: request a worker to install enabled Playwright browser types

@@ -217,7 +217,7 @@ export interface RunCheckRequestInfo {
   name: string;
   type: CheckType;
   entry_url: string;
-  timeout_ms: number;
+  timeout_ms?: number | null;
   viewport_mode?: ViewportMode;
   method?: string;
   headers?: Record<string, unknown>;

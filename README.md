@@ -356,7 +356,7 @@ async def setup(ctx):
 - `GET /api/runs?runner_id=...`：按执行节点筛选运行记录
 - `GET /api/runs?run_group_id=...`：按一次多节点触发分组查看所有节点运行结果
 - `GET /api/runs-page?run_group_id=...`：分页查看同组运行结果
-- `GET /api/runs/{id}`：查看运行详情；响应只附带基础请求信息（UI URL / API Method、URL、Headers、Body、超时），不返回告警、节点策略、校验项或脚本配置，敏感值会脱敏
+- `GET /api/runs/{id}`：查看基于执行快照的运行详情；UI 运行只附带当次快照中的基础请求信息（URL、页面模式、超时），API 运行保留 request/response snapshots，不再重新加载当前任务定义
 - `POST /api/heartbeats/{key}`：被动心跳上报
 
 ## 目录结构
