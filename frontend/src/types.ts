@@ -16,7 +16,7 @@ export type TaskSurfaceStatus =
 export type ObservationKind = "observation" | "verification" | "draft";
 export type WebhookType = "feishu" | "wecom" | "dingtalk";
 export type ConfigBundle = Record<string, unknown>;
-export type CheckBatchAction = "enable" | "disable" | "run" | "update_interval";
+export type CheckBatchAction = "enable" | "disable" | "run";
 export interface AlertPolicy {
   alert_cooldown_minutes?: number;
   recovery_notification?: boolean;
@@ -211,9 +211,8 @@ export interface Check {
 export interface CheckBatchPayload {
   action: CheckBatchAction;
   type: CheckType;
-  tag?: string;
+  ids: number[];
   expected_count?: number;
-  interval_seconds?: number;
 }
 
 export interface CheckBatchResult {

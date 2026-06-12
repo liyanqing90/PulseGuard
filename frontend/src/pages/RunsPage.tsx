@@ -8,15 +8,14 @@ import { cloneElement, isValidElement, lazy, Suspense, useEffect, useState } fro
 import type { ReactElement } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { RunnerExecutionTag, failureKindTag } from "../components/shared/businessTags";
-import type { CheckType, NotificationStatus, ObservationKind, ProbeRunner, Run, RunStatus } from "../types";
+import { RunnerExecutionTag } from "../components/shared/businessTags";
+import type { CheckType, NotificationStatus, ProbeRunner, Run, RunStatus } from "../types";
 import {
   formatDate,
   formatDuration,
   notificationChannelLabel,
   notificationStatusMeta,
   notificationStatusTagColor,
-  runnerExecutionMeta,
   runnerSummary,
   runStatusLabel,
   runStatusTagColor
@@ -25,12 +24,6 @@ import {
 const { RangePicker } = DatePicker;
 const HISTORY_PAGE_SIZE = 12;
 const NOTIFICATION_STATUS_VALUES = ["sent", "failed", "suppressed", "disabled", "not_required"] as const;
-const OBSERVATION_KIND_OPTIONS: Array<{ label: string; value: ObservationKind | "" }> = [
-  { label: "全部来源", value: "" },
-  { label: "正式运行", value: "observation" },
-  { label: "历史人工验证", value: "verification" },
-  { label: "配置试运行", value: "draft" }
-];
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
 
 const runPaginationItemRender: PaginationProps["itemRender"] = (_, itemType, originalElement) => {
@@ -97,9 +90,6 @@ export function RunsPage() {
   const [notificationStatus, setNotificationStatus] = useState<NotificationStatus | "">(() =>
     parseNotificationStatusParam(searchParams.get("notification_status"))
   );
-  const [observationKind, setObservationKind] = useState<ObservationKind | "">(
-    () => (searchParams.get("observation_kind") as ObservationKind | null) || ""
-  );
   const [runnerId, setRunnerId] = useState(() => searchParams.get("runner_id") || "");
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
   const [q, setQ] = useState(() => searchParams.get("q") || "");
@@ -114,7 +104,7 @@ export function RunsPage() {
   const [total, setTotal] = useState(0);
   const checkId = searchParams.get("check_id");
   const normalizedQ = q.trim();
-  const hasFilters = Boolean(type || status || notificationStatus || observationKind || runnerId || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
+  const hasFilters = Boolean(type || status || notificationStatus || runnerId || normalizedQ || dateRange?.[0] || dateRange?.[1] || checkId);
   const scopedCheckName = checkId ? runs.find((run) => String(run.check_id) === checkId)?.check_name : null;
 
   async function load() {
@@ -124,7 +114,7 @@ export function RunsPage() {
           type,
           status,
           notification_status: notificationStatus,
-          observation_kind: observationKind,
+          observation_kind: "observation",
           q: normalizedQ,
           check_id: checkId,
           runner_id: runnerId,
@@ -147,7 +137,6 @@ export function RunsPage() {
     const nextType = parseCheckTypeParam(searchParams.get("type"));
     const nextStatus = parseRunStatusParam(searchParams.get("status"));
     const nextNotificationStatus = parseNotificationStatusParam(searchParams.get("notification_status"));
-    const nextObservationKind = (searchParams.get("observation_kind") as ObservationKind | null) || "";
     const nextRunnerId = searchParams.get("runner_id") || "";
     const nextQ = searchParams.get("q") || "";
     const nextDateRange = parseDateRangeParams(searchParams);
@@ -155,7 +144,6 @@ export function RunsPage() {
     if (type !== nextType) setType(nextType);
     if (status !== nextStatus) setStatus(nextStatus);
     if (notificationStatus !== nextNotificationStatus) setNotificationStatus(nextNotificationStatus);
-    if (observationKind !== nextObservationKind) setObservationKind(nextObservationKind);
     if (runnerId !== nextRunnerId) setRunnerId(nextRunnerId);
     if (q !== nextQ) setQ(nextQ);
     if (!sameDateRange(dateRange, nextDateRange)) setDateRange(nextDateRange);
@@ -166,7 +154,6 @@ export function RunsPage() {
     if (type) next.set("type", type);
     if (status) next.set("status", status);
     if (notificationStatus) next.set("notification_status", notificationStatus);
-    if (observationKind) next.set("observation_kind", observationKind);
     if (runnerId) next.set("runner_id", runnerId);
     if (normalizedQ) next.set("q", normalizedQ);
     if (dateRange?.[0]) next.set("start", dateRange[0].format("YYYY-MM-DD"));
@@ -176,15 +163,15 @@ export function RunsPage() {
     if (next.toString() !== searchParams.toString()) {
       setSearchParams(next, { replace: true });
     }
-  }, [checkId, dateRange, normalizedQ, notificationStatus, observationKind, runnerId, searchParams, setSearchParams, status, type]);
+  }, [checkId, dateRange, normalizedQ, notificationStatus, runnerId, searchParams, setSearchParams, status, type]);
 
   useEffect(() => {
     load();
-  }, [type, status, notificationStatus, observationKind, runnerId, normalizedQ, dateRange, checkId, page]);
+  }, [type, status, notificationStatus, runnerId, normalizedQ, dateRange, checkId, page]);
 
   useEffect(() => {
     setPage(1);
-  }, [type, status, notificationStatus, observationKind, runnerId, normalizedQ, dateRange, checkId]);
+  }, [type, status, notificationStatus, runnerId, normalizedQ, dateRange, checkId]);
 
   useEffect(() => {
     api.runners().then(setRunners).catch(() => setRunners([]));
@@ -227,7 +214,6 @@ export function RunsPage() {
     setType("");
     setStatus("");
     setNotificationStatus("");
-    setObservationKind("");
     setRunnerId("");
     setQ("");
     setDateRange(null);
@@ -253,7 +239,7 @@ export function RunsPage() {
         <Space orientation="vertical" size={2}>
           <Button
             type="link"
-            className="table-link strong"
+            className="table-link"
             onClick={(event) => {
               event.stopPropagation();
               setDetailRunId(run.id);
@@ -262,9 +248,6 @@ export function RunsPage() {
             {value}
           </Button>
           {run.check_id <= 0 && <Tag>草稿调试</Tag>}
-          <Tooltip title={runnerTooltip(run)}>
-            <span className="history-runner-meta">{runnerSummary(run)}</span>
-          </Tooltip>
         </Space>
       )
     },
@@ -274,7 +257,7 @@ export function RunsPage() {
       width: 150,
       render: (_, run) => (
         <Tooltip title={runnerTooltip(run)}>
-          <Space orientation="vertical" size={2}>
+          <Space className="history-runner-inline" size={6} wrap>
             <Tag>{run.runner_name || run.runner_id || "local"}</Tag>
             <RunnerExecutionTag run={run} />
           </Space>
@@ -282,27 +265,6 @@ export function RunsPage() {
       )
     },
     { title: "运行状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 92, align: "center" },
-    {
-      title: "节点结果",
-      dataIndex: "failure_kind",
-      render: (_, run) => <RunnerExecutionTag run={run} />,
-      width: 104,
-      align: "center"
-    },
-    {
-      title: "来源",
-      dataIndex: "observation_kind",
-      render: (_, run) => <Tag color={run.affects_health ? "blue" : "default"}>{observationKindLabel(run.observation_kind)}</Tag>,
-      width: 96,
-      align: "center"
-    },
-    {
-      title: "失败来源",
-      dataIndex: "failure_kind",
-      render: (_, run) => failureKindTag(run.failure_kind, <span className="history-empty-cell">-</span>),
-      width: 92,
-      align: "center"
-    },
     {
       title: "告警",
       dataIndex: "notification_status",
@@ -314,7 +276,12 @@ export function RunsPage() {
       }
     },
     { title: "耗时", dataIndex: "duration_ms", render: (value?: number | null) => formatDuration(value), width: 88, align: "right" },
-    { title: "错误摘要", dataIndex: "error_message", ellipsis: true, width: 144 },
+    {
+      title: "错误摘要",
+      dataIndex: "error_message",
+      width: 220,
+      render: (_, run) => <RunIssueSummary run={run} />
+    },
     {
       title: "操作",
       width: 92,
@@ -378,12 +345,6 @@ export function RunsPage() {
             options={NOTIFICATION_FILTER_OPTIONS}
           />
           <Select
-            value={observationKind}
-            className="history-filter-control"
-            onChange={(value) => setObservationKind(value)}
-            options={OBSERVATION_KIND_OPTIONS}
-          />
-          <Select
             value={runnerId}
             className="history-filter-control"
             onChange={(value) => setRunnerId(value)}
@@ -425,7 +386,6 @@ export function RunsPage() {
         {type && <Tag>{type === "ui" ? "UI" : "API"}</Tag>}
         {status && <Tag>{runStatusFilterLabel(status)}</Tag>}
         {notificationStatus && <Tag>告警：{notificationStatusMeta(notificationStatus).label}</Tag>}
-        {observationKind && <Tag>来源：{observationKindLabel(observationKind)}</Tag>}
         {runnerId && <Tag>执行节点：{runnerLabel(runnerId, runners)}</Tag>}
         {checkId && (
           <Tag
@@ -471,7 +431,7 @@ export function RunsPage() {
             itemRender: runPaginationItemRender,
             onChange: setPage
           }}
-          scroll={{ x: 1060 }}
+          scroll={{ x: 960 }}
         />
       )}
       {detailRunId && (
@@ -532,19 +492,17 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
                 <Button type="link" className="history-card-title" onClick={() => onOpen(run)}>
                   {run.check_name}
                 </Button>
-                {run.error_message && <div className="history-card-error">{run.error_message}</div>}
+                <RunIssueSummary run={run} compact />
               </div>
               <div className="history-card-state">
                 <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>
                 <RunnerExecutionTag run={run} />
-                {failureKindTag(run.failure_kind, <span className="history-empty-cell">-</span>)}
                 <Tag color={notificationStatusTagColor(run.notification_status)}>{notification.label}</Tag>
               </div>
             </header>
 
             <div className="history-card-meta">
               <HistoryMeta label="执行时间" value={formatDate(run.started_at)} />
-              <HistoryMeta label="记录来源" value={observationKindLabel(run.observation_kind)} />
               <HistoryMeta label="耗时" value={formatDuration(run.duration_ms)} />
               <HistoryMeta label="执行节点" value={runnerSummary(run)} />
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
@@ -588,7 +546,16 @@ function HistoryMeta({ label, value }: { label: string; value: string | number }
   return (
     <div className="meta-field">
       <span>{label}</span>
-      <strong>{value}</strong>
+      <span>{value}</span>
+    </div>
+  );
+}
+
+function RunIssueSummary({ compact = false, run }: { compact?: boolean; run: Run }) {
+  if (!run.error_message) return <span className="history-empty-cell">-</span>;
+  return (
+    <div className={compact ? "history-issue-summary history-issue-summary-compact" : "history-issue-summary"}>
+      <span>{run.error_message}</span>
     </div>
   );
 }
@@ -608,12 +575,4 @@ function runnerTooltip(run: Run): string {
 
 function runStatusFilterLabel(status: RunStatus): string {
   return status === "failed" ? "失败/超时" : runStatusLabel(status);
-}
-
-function observationKindLabel(kind: ObservationKind): string {
-  return {
-    observation: "正式运行",
-    verification: "历史人工验证",
-    draft: "配置试运行"
-  }[kind];
 }

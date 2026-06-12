@@ -275,10 +275,18 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_runner_id ON runs(runner_id, started_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(run_group_id, started_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation_kind_started ON runs(observation_kind, started_at DESC, id DESC)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_observation_kind_check_started ON runs(observation_kind, check_id, started_at DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_page_filter_started ON runs(observation_kind, check_type, status, started_at DESC, id DESC)"
+        )
 
 
-def list_checks(check_type: str | None = None, enabled_only: bool = False) -> list[dict[str, Any]]:
-    refresh_stale_statuses()
+def list_checks(check_type: str | None = None, enabled_only: bool = False, refresh_stale: bool = True) -> list[dict[str, Any]]:
+    if refresh_stale:
+        refresh_stale_statuses()
     sql = """
         SELECT c.*, s.current_status, s.monitor_status, s.consecutive_failures,
                s.consecutive_successes, s.last_success_at, s.last_failed_at,
@@ -315,8 +323,9 @@ def select_checks_for_batch(check_type: str | None = None, tag: str | None = Non
     return [check for check in checks if normalized_tag in check_tag_set(check.get("tags"))]
 
 
-def get_check(check_id: int) -> dict[str, Any] | None:
-    refresh_stale_statuses(check_id)
+def get_check(check_id: int, refresh_stale: bool = True) -> dict[str, Any] | None:
+    if refresh_stale:
+        refresh_stale_statuses(check_id)
     with _LOCK, _connect() as conn:
         row = conn.execute(
             """
@@ -1302,7 +1311,7 @@ def list_recent_business_incidents(limit: int = 20) -> list[dict[str, Any]]:
     return [_normalize_run(row) for row in rows]
 
 
-def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def list_runs(filters: dict[str, Any] | None = None, limit: int = 100, summary_only: bool = False) -> list[dict[str, Any]]:
     filters = filters or {}
     clauses: list[str] = []
     params: list[Any] = []
@@ -1344,7 +1353,8 @@ def list_runs(filters: dict[str, Any] | None = None, limit: int = 100) -> list[d
         clauses.append("started_at <= ?")
         params.append(filters["end"])
 
-    sql = "SELECT * FROM runs"
+    select_columns = _run_summary_select() if summary_only else "*"
+    sql = f"SELECT {select_columns} FROM runs"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY started_at DESC, id DESC LIMIT ?"
@@ -1367,7 +1377,7 @@ def list_runs_page(
     with _LOCK, _connect() as conn:
         total = int(conn.execute(f"SELECT COUNT(*) AS count FROM runs{where}", params).fetchone()["count"])
         rows = conn.execute(
-            f"SELECT * FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+            f"SELECT {_run_summary_select()} FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
             [*params, page_size, (page - 1) * page_size],
         ).fetchall()
     return {

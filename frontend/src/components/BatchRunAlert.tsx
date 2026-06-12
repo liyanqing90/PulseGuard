@@ -85,7 +85,7 @@ export function batchRunNotificationType(notice: BatchRunNotice): "success" | "i
 
 export function batchRunMessage(notice: BatchRunNotice): string {
   const typeLabel = notice.type === "ui" ? " UI" : "接口";
-  return notice.total ? `执行全部${typeLabel}任务完成` : `没有可执行的${typeLabel}任务`;
+  return notice.total ? `批量执行选中${typeLabel}任务完成` : `选中任务里没有可执行的${typeLabel}任务`;
 }
 
 export function batchRunHistoryPath(notice: BatchRunNotice): string {
@@ -98,7 +98,7 @@ export function batchRunHistoryPath(notice: BatchRunNotice): string {
 
 export function BatchRunBreakdown({ notice }: { notice: BatchRunNotice }) {
   if (!notice.total) {
-    return `当前没有启用的${notice.type === "ui" ? " UI" : "接口"}任务。`;
+    return `选中任务里没有启用的${notice.type === "ui" ? " UI" : "接口"}任务。`;
   }
 
   return (

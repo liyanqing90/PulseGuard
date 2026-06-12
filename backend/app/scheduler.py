@@ -43,14 +43,14 @@ class PulseScheduler:
             if job.id.startswith("check-"):
                 self.scheduler.remove_job(job.id)
         for check in storage.list_checks(enabled_only=True):
-            self.sync_check(int(check["id"]))
+            self.sync_check(int(check["id"]), check=check)
 
-    def sync_check(self, check_id: int) -> None:
+    def sync_check(self, check_id: int, check: dict[str, Any] | None = None) -> None:
         job_id = self._job_id(check_id)
         if self.scheduler.get_job(job_id):
             self.scheduler.remove_job(job_id)
 
-        check = storage.get_check(check_id)
+        check = check or storage.get_check(check_id)
         if not check or not check.get("enabled"):
             return
 

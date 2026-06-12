@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any, AsyncIterator
 
@@ -22,6 +23,8 @@ from .context import RunContext, RunFailure, RunnerEnvironmentFailure
 from .monitoring import run_metadata
 from .resource_pool import ProbeResourcePool
 from .variables import mask_data, mask_text
+
+_TASK_DURATION_ATTR = "_pulseguard_task_duration_ms"
 
 
 @dataclass
@@ -131,8 +134,63 @@ class CheckRunner:
     async def run_draft(self, check: dict[str, Any], trigger: str = "draft") -> dict[str, Any]:
         draft = dict(check)
         draft["id"] = 0
-        local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())
-        return await self._submit(draft, trigger, record_status=False, notify=False, runner_metadata=storage.runner_metadata(local))
+        started = datetime.now().astimezone()
+        settings = storage.get_settings()
+        local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(settings)
+        runner_payload = storage.runner_metadata(local)
+        try:
+            if self._uses_browser(draft):
+                async with self._ui_limiter.slot():
+                    async with self._global_limiter.slot():
+                        result_data = await self._execute_core(draft, trigger, 0, settings)
+            else:
+                async with self._global_limiter.slot():
+                    result_data = await self._execute_core(draft, trigger, 0, settings)
+        except Exception as exc:
+            message = mask_text(str(exc) or exc.__class__.__name__, settings)
+            finished = datetime.now().astimezone()
+            result_data = {
+                "status": "failed",
+                "finished_at": finished.isoformat(timespec="seconds"),
+                "duration_ms": self._task_duration_from_exception(exc),
+                "error_message": message,
+                "error_stack": mask_text(traceback.format_exc(), settings),
+                "logs": message,
+                "screenshot_path": None,
+                "trace_path": None,
+                "response_path": None,
+                "request_snapshot": None,
+                "response_snapshot": None,
+                **self._runner_metadata(settings, failure_kind="runner"),
+            }
+        result_data.update(
+            {
+                "runner_id": runner_payload.get("runner_id"),
+                "runner_name": runner_payload.get("runner_name"),
+                "runner_address": runner_payload.get("runner_address"),
+                "runner_region": runner_payload.get("runner_region"),
+                "runner_browser_version": result_data.get("runner_browser_version") or runner_payload.get("runner_browser_version"),
+            }
+        )
+        metadata = run_metadata(trigger)
+        return {
+            "id": 0,
+            "check_id": 0,
+            "check_name": str(draft.get("name") or "草稿调试"),
+            "check_type": str(draft.get("type") or "api"),
+            "started_at": started.isoformat(timespec="seconds"),
+            "notification_status": "not_required",
+            "notification_channel": None,
+            "notification_error": None,
+            "notification_sent_at": None,
+            "trigger": trigger,
+            "observation_kind": metadata["observation_kind"],
+            "affects_health": False,
+            "run_group_id": None,
+            "created_at": started.isoformat(timespec="seconds"),
+            "consecutive_failures": 0,
+            **result_data,
+        }
 
     async def execute_worker_run(
         self,
@@ -389,7 +447,7 @@ class CheckRunner:
         settings: dict[str, Any],
     ) -> dict[str, Any]:
         ctx: RunContext | None = None
-        started = datetime.now().astimezone()
+        duration_ms = 0
         status = "ok"
         error_message: str | None = None
         error_stack: str | None = None
@@ -406,37 +464,43 @@ class CheckRunner:
                 ctx.log(f"任务入口：{check.get('entry_url')}")
                 if max_attempts > 1:
                     ctx.log(f"执行尝试：{attempt}/{max_attempts}")
-                await self._run_check_attempt(ctx, check, settings)
+                duration_ms += await self._run_check_attempt(ctx, check, settings)
                 status = "ok"
                 error_message = None
                 error_stack = None
                 failure_kind = "none"
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
+                duration_ms += self._task_duration_from_exception(exc)
                 status = "skipped"
                 error_message = "执行被取消，可能是服务关闭或运行设置刷新"
                 error_stack = None
                 failure_kind = "runner"
             except asyncio.TimeoutError as exc:
+                duration_ms += self._task_duration_from_exception(exc)
                 status = "timeout"
                 error_message = str(exc).strip() or f"执行超过超时限制：{check.get('timeout_ms')}ms"
                 error_stack = traceback.format_exc()
                 failure_kind = "target"
             except RunnerEnvironmentFailure as exc:
+                duration_ms += self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc)
                 error_stack = traceback.format_exc()
                 failure_kind = "runner"
             except RunFailure as exc:
+                duration_ms += self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc)
                 error_stack = traceback.format_exc()
                 failure_kind = "target"
             except AssertionError as exc:
+                duration_ms += self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc) or "断言失败"
                 error_stack = traceback.format_exc()
                 failure_kind = "target"
             except Exception as exc:
+                duration_ms += self._task_duration_from_exception(exc)
                 status = "failed"
                 error_message = str(exc) or exc.__class__.__name__
                 error_stack = traceback.format_exc()
@@ -465,7 +529,6 @@ class CheckRunner:
             break
 
         finished = datetime.now().astimezone()
-        duration_ms = int((finished - started).total_seconds() * 1000)
         safe_error_message = mask_text(error_message, settings) if error_message is not None else None
         safe_error_stack = mask_text(error_stack, settings) if error_stack is not None else None
         safe_logs = mask_text("\n".join(log_lines), settings)
@@ -485,7 +548,7 @@ class CheckRunner:
             "response_snapshot": json.dumps(safe_response_snapshot, ensure_ascii=False) if safe_response_snapshot else None,
             **self._runner_metadata(settings, ctx=ctx, failure_kind=failure_kind),
         }
-    async def _run_check_attempt(self, ctx: RunContext, check: dict[str, Any], settings: dict[str, Any]) -> None:
+    async def _run_check_attempt(self, ctx: RunContext, check: dict[str, Any], settings: dict[str, Any]) -> int:
         max_runtime_seconds = int(settings.get("max_task_runtime_seconds", 60))
         timeout_seconds = min(
             int(check.get("timeout_ms") or 15000) / 1000,
@@ -494,7 +557,7 @@ class CheckRunner:
         uses_structured_api = self._uses_structured_api_check(check)
         uses_structured_ui = self._uses_structured_ui_check(check)
         if uses_structured_api:
-            await run_structured_api_check(ctx)
+            return await self._measure_task_duration(run_structured_api_check(ctx))
         elif uses_structured_ui:
             setup_func = None
             setup_script = str(check.get("setup_script") or "")
@@ -506,10 +569,27 @@ class CheckRunner:
                     expected_signature="async def setup(ctx, page)",
                     script_label="前置脚本",
                 )
-            await run_structured_ui_check(ctx, setup_func=setup_func)
+            return await self._measure_task_duration(run_structured_ui_check(ctx, setup_func=setup_func))
         else:
             check_func = self._load_check_function(check.get("script") or "", ctx)
-            await asyncio.wait_for(check_func(ctx), timeout=timeout_seconds)
+            return await self._measure_task_duration(asyncio.wait_for(check_func(ctx), timeout=timeout_seconds))
+
+    @staticmethod
+    async def _measure_task_duration(awaitable: Any) -> int:
+        started = perf_counter()
+        try:
+            await awaitable
+        except BaseException as exc:
+            setattr(exc, _TASK_DURATION_ATTR, int((perf_counter() - started) * 1000))
+            raise
+        return int((perf_counter() - started) * 1000)
+
+    @staticmethod
+    def _task_duration_from_exception(exc: BaseException) -> int:
+        try:
+            return max(0, int(getattr(exc, _TASK_DURATION_ATTR, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _max_attempts(check: dict[str, Any], settings: dict[str, Any]) -> int:

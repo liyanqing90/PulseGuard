@@ -1,5 +1,5 @@
-import { Alert, App, Button, Card, Drawer, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
-import type { UploadProps } from "antd";
+import { Alert, App, Button, Card, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
+import type { MenuProps, UploadProps } from "antd";
 import {
   BellRing,
   CheckCircle2,
@@ -10,6 +10,7 @@ import {
   Info,
   KeyRound,
   Monitor,
+  MoreHorizontal,
   Pencil,
   Plus,
   RefreshCw,
@@ -1019,7 +1020,7 @@ export function SettingsPage() {
         open={Boolean(createdReadOnlyToken)}
         okText="我已保存"
         cancelButtonProps={{ style: { display: "none" } }}
-        maskClosable={false}
+        mask={{ closable: false }}
         onOk={() => setCreatedReadOnlyToken(null)}
         onCancel={() => setCreatedReadOnlyToken(null)}
       >
@@ -1241,6 +1242,17 @@ function RunnerNodePanel() {
     }
   }
 
+  function confirmRunnerDelete(runner: ProbeRunner) {
+    Modal.confirm({
+      title: "删除执行节点",
+      content: "删除后，仍引用该节点的任务会在执行时回退到可用节点。",
+      okText: "删除",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: () => deleteRunner(runner)
+    });
+  }
+
   function confirmRunnerUpdate(runner: ProbeRunner) {
     const targetImage = runnerMetaText(runner, "update_target_image");
     const currentImage = runnerMetaText(runner, "image");
@@ -1320,77 +1332,84 @@ function RunnerNodePanel() {
               const targetImage = runnerMetaText(runner, "update_target_image");
               const updateSupported = runnerMetaBool(runner, "update_supported");
               const updateAvailable = runnerMetaBool(runner, "update_available");
+              const isBusy = busyId === runner.runner_id;
+              const tokenStatus = runner.token_set ? runner.token_hint || "已配置" : "未配置";
+              const imageSummary = image ? runnerImageSummary(image) : "-";
+              const buildSummary = buildSha && buildSha !== "unknown" ? buildSha.slice(0, 8) : "-";
+              const runnerMenuItems: MenuProps["items"] = [
+                { key: "auth", icon: <KeyRound size={15} />, label: "更新认证" },
+                { key: "update", icon: <Download size={15} />, label: "更新节点", disabled: !updateSupported || !runner.available },
+                { key: "status", icon: <Info size={15} />, label: "更新状态", disabled: !updateSupported },
+                { type: "divider" },
+                { key: "delete", icon: <Trash2 size={15} />, label: "删除", danger: true }
+              ];
+              const onRunnerMenuClick: MenuProps["onClick"] = ({ key }) => {
+                if (key === "auth") setAuthRunner({ runner, token: "" });
+                if (key === "update") confirmRunnerUpdate(runner);
+                if (key === "status") void showRunnerUpdateStatus(runner);
+                if (key === "delete") confirmRunnerDelete(runner);
+              };
               return (
-                <Card size="small" key={runner.runner_id}>
-                  <div className="read-only-token-card">
-                    <div>
-                      <Space size={8} wrap>
-                        <strong>{runner.name || runner.runner_id}</strong>
-                        <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
-                        <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
-                        <Tag color={runner.available ? "success" : "error"}>{runner.available ? "可用" : "不可用"}</Tag>
-                        <Tag>{runner.network_region || "local"}</Tag>
-                        {version && <Tag color="blue">v{version}</Tag>}
-                        {runner.role !== "local" && (
-                          <Tag color={updateSupported ? (updateAvailable ? "warning" : "processing") : "default"}>
-                            {updateSupported ? (updateAvailable ? "有可更新镜像" : "支持平台更新") : "未启用 updater"}
-                          </Tag>
-                        )}
-                      </Space>
-                      <span>
-                        {runner.address || "-"} · 最近心跳 {runner.last_seen_at ? formatDate(runner.last_seen_at) : "无"}
-                      </span>
-                      <span>
-                        token {runner.token_set ? runner.token_hint || "已配置" : "未配置"}
-                        {image ? ` · 镜像 ${runnerImageSummary(image)}` : ""}
-                        {buildSha && buildSha !== "unknown" ? ` · ${buildSha.slice(0, 8)}` : ""}
-                      </span>
-                      {targetImage && targetImage !== image && <span>目标镜像 {runnerImageSummary(targetImage)}</span>}
+                <Card size="small" key={runner.runner_id} className="runner-node-card">
+                  <div className="runner-node-card-shell">
+                    <div className="runner-node-main">
+                      <div className="runner-node-heading">
+                        <div className="runner-node-title-row">
+                          <strong>{runner.name || runner.runner_id}</strong>
+                          <Space size={6} wrap className="runner-node-tags">
+                            <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
+                            <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
+                            <Tag color={runner.available ? "success" : "error"}>{runner.available ? "可用" : "不可用"}</Tag>
+                            <Tag>{runner.network_region || "local"}</Tag>
+                            {version && <Tag color="blue">v{version}</Tag>}
+                            {runner.role !== "local" && (
+                              <Tag color={updateSupported ? (updateAvailable ? "warning" : "processing") : "default"}>
+                                {updateSupported ? (updateAvailable ? "有可更新镜像" : "支持平台更新") : "未启用 updater"}
+                              </Tag>
+                            )}
+                          </Space>
+                        </div>
+                        <span className="runner-node-address">
+                          {runner.address || "-"} · 最近心跳 {runner.last_seen_at ? formatDate(runner.last_seen_at) : "无"}
+                        </span>
+                      </div>
+                      <div className="runner-node-facts">
+                        <div className="runner-node-fact">
+                          <span>认证</span>
+                          <strong>{tokenStatus}</strong>
+                        </div>
+                        <div className="runner-node-fact">
+                          <span>镜像</span>
+                          <strong>{imageSummary}</strong>
+                        </div>
+                        <div className="runner-node-fact">
+                          <span>构建</span>
+                          <strong>{buildSummary}</strong>
+                        </div>
+                      </div>
+                      {targetImage && targetImage !== image && <span className="runner-node-target">目标镜像 {runnerImageSummary(targetImage)}</span>}
                     </div>
-                    <Space size={8} wrap>
-                      <Switch
-                        checked={runner.enabled}
-                        loading={busyId === runner.runner_id}
-                        onChange={(enabled) => updateRunnerEnabled(runner, enabled)}
-                        aria-label={`切换执行节点 ${runner.runner_id}`}
-                      />
-                      <Button icon={<Pencil size={15} />} loading={busyId === runner.runner_id} onClick={() => openEditDrawer(runner)}>
-                        编辑
-                      </Button>
-                      <Button loading={busyId === runner.runner_id} onClick={() => testRunner(runner)}>
-                        测试连接
-                      </Button>
-                      {runner.role !== "local" && (
-                        <Button icon={<KeyRound size={15} />} loading={busyId === runner.runner_id} onClick={() => setAuthRunner({ runner, token: "" })}>
-                          更新认证
+                    <div className="runner-node-controls">
+                      <div className="runner-node-toggle">
+                        <span>{runner.enabled ? "启用" : "停用"}</span>
+                        <Switch checked={runner.enabled} loading={isBusy} onChange={(enabled) => updateRunnerEnabled(runner, enabled)} aria-label={`切换执行节点 ${runner.runner_id}`} />
+                      </div>
+                      <div className="runner-node-actions">
+                        <Button size="small" icon={<Pencil size={15} />} loading={isBusy} onClick={() => openEditDrawer(runner)}>
+                          编辑
                         </Button>
-                      )}
-                      {runner.role !== "local" && (
-                        <Tooltip title={updateSupported ? "由子节点 updater 执行 docker pull 和重建 worker" : "启动子节点时启用 updater profile 后可用"}>
-                          <Button icon={<Download size={15} />} disabled={!updateSupported || !runner.available} loading={busyId === runner.runner_id} onClick={() => confirmRunnerUpdate(runner)}>
-                            更新节点
-                          </Button>
-                        </Tooltip>
-                      )}
-                      {runner.role !== "local" && (
-                        <Button icon={<Info size={15} />} disabled={!updateSupported} loading={busyId === runner.runner_id} onClick={() => showRunnerUpdateStatus(runner)}>
-                          更新状态
+                        <Button size="small" loading={isBusy} onClick={() => testRunner(runner)}>
+                          测试
                         </Button>
-                      )}
-                      {runner.role !== "local" && (
-                        <Popconfirm
-                          title="删除执行节点"
-                          description="删除后，仍引用该节点的任务会在执行时回退到可用节点。"
-                          okText="删除"
-                          cancelText="取消"
-                          onConfirm={() => deleteRunner(runner)}
-                        >
-                          <Button danger icon={<Trash2 size={15} />} loading={busyId === runner.runner_id}>
-                            删除
-                          </Button>
-                        </Popconfirm>
-                      )}
-                    </Space>
+                        {runner.role !== "local" && (
+                          <Dropdown menu={{ items: runnerMenuItems, onClick: onRunnerMenuClick }} trigger={["click"]}>
+                            <Button size="small" icon={<MoreHorizontal size={15} />} loading={isBusy}>
+                              更多
+                            </Button>
+                          </Dropdown>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </Card>
               );
@@ -1724,7 +1743,7 @@ function ConfigTransferPanel({
         width={720}
         destroyOnHidden={false}
         closable={!importing}
-        maskClosable={!importing}
+        mask={{ closable: !importing }}
         onClose={onCloseImport}
         extra={
           <Button icon={<RotateCcw size={15} />} disabled={!canResetImport || importing} onClick={onResetImport}>

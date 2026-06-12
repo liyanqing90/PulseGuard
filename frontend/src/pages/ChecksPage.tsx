@@ -1,7 +1,7 @@
-import { Alert, App, Button, Card, Dropdown, Empty, Input, InputNumber, Select, Skeleton, Space, Statistic, Switch, Table, Tag } from "antd";
+import { Alert, App, Button, Card, Checkbox, Dropdown, Empty, Input, Select, Skeleton, Space, Statistic, Switch, Table, Tag } from "antd";
 import type { MenuProps, PaginationProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { Clock3, Copy, Edit3, FilterX, History, MoreHorizontal, Play, Plus, Power, PowerOff, RefreshCw, Search, Trash2 } from "lucide-react";
+import { Copy, Edit3, FilterX, History, MoreHorizontal, Play, Plus, Power, PowerOff, RefreshCw, Search, Trash2 } from "lucide-react";
 import { cloneElement, isValidElement, lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { ReactElement } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
@@ -18,7 +18,7 @@ import type { Check, CheckBatchAction, CheckType, ProbeRunner, Run, TaskSurfaceS
 import { compactUrl, formatDate, formatDuration, intervalLabel, taskStatus, taskStatusLabel, taskStatusTagColor } from "../utils";
 
 type EnabledFilter = "" | "enabled" | "disabled";
-type BusyState = number | "all" | "batch" | null;
+type BusyState = number | "batch" | null;
 
 const CheckEditorDrawer = lazy(() => import("../components/CheckEditorDrawer").then((module) => ({ default: module.CheckEditorDrawer })));
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
@@ -59,7 +59,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
   const [tagFilter, setTagFilter] = useState("");
   const [runnerFilter, setRunnerFilter] = useState("");
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
-  const [batchIntervalSeconds, setBatchIntervalSeconds] = useState(300);
+  const [selectedCheckIds, setSelectedCheckIds] = useState<number[]>([]);
   const [isCompactList, setIsCompactList] = useState(() => window.matchMedia("(max-width: 720px)").matches);
   const navigate = useNavigate();
   const focusedCheckId = searchParams.get("check_id");
@@ -113,6 +113,14 @@ export function ChecksPage({ type }: { type: CheckType }) {
     });
   }, [checks, enabledFilter, focusedCheckId, query, runnerFilter, runners, statusFilter, tagFilter]);
 
+  useEffect(() => {
+    const visibleIds = new Set(filtered.map((check) => check.id));
+    setSelectedCheckIds((current) => {
+      const next = current.filter((id) => visibleIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [filtered]);
+
   const tagOptions = useMemo(() => {
     const tags = new Set<string>();
     checks.forEach((check) => checkTagTokens(check.tags).forEach((tag) => tags.add(tag)));
@@ -121,11 +129,12 @@ export function ChecksPage({ type }: { type: CheckType }) {
       .map((tag) => ({ label: tag, value: tag }));
   }, [checks]);
 
-  const batchTargetChecks = useMemo(
-    () => checks.filter((check) => !tagFilter || checkTagTokens(check.tags).includes(tagFilter)),
-    [checks, tagFilter]
-  );
-  const batchRunnableCount = useMemo(() => batchTargetChecks.filter((check) => check.enabled).length, [batchTargetChecks]);
+  const selectedChecks = useMemo(() => {
+    const selected = new Set(selectedCheckIds);
+    return filtered.filter((check) => selected.has(check.id));
+  }, [filtered, selectedCheckIds]);
+  const selectedIds = useMemo(() => selectedChecks.map((check) => check.id), [selectedChecks]);
+  const selectedEnabledIds = useMemo(() => selectedChecks.filter((check) => check.enabled).map((check) => check.id), [selectedChecks]);
 
   const summary = useMemo(() => {
     const counts: Record<TaskSurfaceStatus, number> = {
@@ -149,13 +158,10 @@ export function ChecksPage({ type }: { type: CheckType }) {
   }, [checks, filtered.length]);
 
   const hasFilters = Boolean(query || statusFilter || enabledFilter || tagFilter || runnerFilter || focusedCheckId);
-  const batchTargetCount = batchTargetChecks.length;
-  const batchTargetText = tagFilter ? `标签「${tagFilter}」` : `全部${type === "ui" ? " UI" : "接口"}任务`;
-  const batchActionItems: MenuProps["items"] = [
-    { key: "run", icon: <Play size={15} />, label: `执行匹配任务（${batchRunnableCount}）`, disabled: batchRunnableCount === 0 },
-    { key: "enable", icon: <Power size={15} />, label: `批量启用（${batchTargetCount}）`, disabled: batchTargetCount === 0 },
-    { key: "disable", icon: <PowerOff size={15} />, label: `批量禁用（${batchTargetCount}）`, disabled: batchTargetCount === 0 },
-    { key: "update_interval", icon: <Clock3 size={15} />, label: `调整频率（${batchTargetCount}）`, disabled: batchTargetCount === 0 }
+  const selectedCount = selectedChecks.length;
+  const selectedStateActionItems: MenuProps["items"] = [
+    { key: "enable", icon: <Power size={15} />, label: `启用选中任务（${selectedCount}）`, disabled: selectedCount === 0 },
+    { key: "disable", icon: <PowerOff size={15} />, label: `禁用选中任务（${selectedCount}）`, disabled: selectedCount === 0 }
   ];
 
   async function runCheck(check: Check) {
@@ -234,20 +240,6 @@ export function ChecksPage({ type }: { type: CheckType }) {
     });
   }
 
-  async function runAll() {
-    setBusy("all");
-    setError(null);
-    try {
-      const result = await api.runAll(type);
-      notifyBatchRun(result.runs);
-      await load();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(null);
-    }
-  }
-
   function notifyBatchRun(runs: Run[]) {
     const notice = summarizeBatchRuns(type, runs);
     message.open({
@@ -273,23 +265,23 @@ export function ChecksPage({ type }: { type: CheckType }) {
     });
   }
 
-  async function executeBatchAction(action: CheckBatchAction, expectedCount: number) {
+  async function executeBatchAction(action: CheckBatchAction, ids: number[]) {
     setBusy("batch");
     setError(null);
     try {
       const result = await api.batchChecks({
         action,
         type,
-        tag: tagFilter,
-        expected_count: expectedCount,
-        interval_seconds: action === "update_interval" ? batchIntervalSeconds : undefined
+        ids,
+        expected_count: ids.length
       });
       if (action === "run") {
         notifyBatchRun(result.runs);
       } else {
-        const actionLabel = action === "enable" ? "启用" : action === "disable" ? "禁用" : "调整频率";
+        const actionLabel = action === "enable" ? "启用" : "禁用";
         message.success(`${actionLabel} ${result.changed} 条任务，匹配 ${result.matched} 条`);
       }
+      setSelectedCheckIds([]);
       await load();
     } catch (err) {
       setError((err as Error).message);
@@ -299,30 +291,26 @@ export function ChecksPage({ type }: { type: CheckType }) {
   }
 
   function requestBatchAction(action: CheckBatchAction) {
-    const expectedCount = action === "run" ? batchRunnableCount : batchTargetCount;
-    if (!expectedCount) {
-      message.warning("没有匹配的任务");
+    const ids = action === "run" ? selectedEnabledIds : selectedIds;
+    if (!ids.length) {
+      message.warning(action === "run" ? "选中任务里没有可运行任务" : "请先选择任务");
       return;
     }
 
     if (action === "run") {
-      void executeBatchAction(action, expectedCount);
+      void executeBatchAction(action, ids);
       return;
     }
 
-    const title =
-      action === "enable" ? "批量启用任务" : action === "disable" ? "批量禁用任务" : "批量调整执行频率";
-    const content =
-      action === "update_interval"
-        ? `将 ${batchTargetText} 的执行频率调整为 ${intervalLabel(batchIntervalSeconds)}，共 ${expectedCount} 条。`
-        : `将${action === "enable" ? "启用" : "禁用"} ${batchTargetText}，共 ${expectedCount} 条。`;
+    const title = action === "enable" ? "批量启用任务" : "批量禁用任务";
+    const content = `将${action === "enable" ? "启用" : "禁用"}已选中的 ${ids.length} 条任务。`;
 
     modal.confirm({
       title,
       content,
-      okText: action === "update_interval" ? "调整频率" : action === "enable" ? "启用" : "禁用",
+      okText: action === "enable" ? "启用" : "禁用",
       cancelText: "取消",
-      onOk: () => executeBatchAction(action, expectedCount)
+      onOk: () => executeBatchAction(action, ids)
     });
   }
 
@@ -353,7 +341,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
       dataIndex: "name",
       render: (value: string, check) => (
         <div>
-          <Button type="link" className="table-link strong" onClick={() => check.last_run_id && setDetailRunId(check.last_run_id)}>
+          <Button type="link" className="table-link" onClick={() => check.last_run_id && setDetailRunId(check.last_run_id)}>
             {value}
           </Button>
           {check.tags && <div className="tag-line">{check.tags}</div>}
@@ -541,33 +529,6 @@ export function ChecksPage({ type }: { type: CheckType }) {
           <Button icon={<RefreshCw size={16} />} onClick={load} loading={loading}>
             刷新
           </Button>
-          <Button icon={<Play size={16} />} onClick={runAll} loading={busy === "all"}>
-            执行全部
-          </Button>
-          <Space className="checks-batch-controls" size={6}>
-            <InputNumber
-              className="checks-batch-interval"
-              min={5}
-              max={86400}
-              step={60}
-              value={batchIntervalSeconds}
-              onChange={(value) => setBatchIntervalSeconds(Number(value || 300))}
-              aria-label="批量执行频率秒数"
-            />
-            <span className="checks-batch-unit">秒</span>
-            <Dropdown
-              trigger={["click"]}
-              placement="bottomRight"
-              menu={{
-                items: batchActionItems,
-                onClick: ({ key }) => requestBatchAction(key as CheckBatchAction)
-              }}
-            >
-              <Button icon={<MoreHorizontal size={16} />} loading={busy === "batch"} disabled={batchTargetCount === 0}>
-                批量操作
-              </Button>
-            </Dropdown>
-          </Space>
           <Button type="primary" icon={<Plus size={16} />} onClick={openCreateDrawer}>
             新增{type === "ui" ? " UI" : "接口"}任务
           </Button>
@@ -596,6 +557,32 @@ export function ChecksPage({ type }: { type: CheckType }) {
         {query && <Tag>关键词：{query}</Tag>}
       </div>
 
+      {selectedCount > 0 && (
+        <section className="checks-selection-bar" aria-label="已选任务操作">
+          <span>
+            已选择 <strong>{selectedCount}</strong> 条任务
+          </span>
+          <Space wrap>
+            <Button icon={<Play size={16} />} loading={busy === "batch"} disabled={selectedEnabledIds.length === 0} onClick={() => requestBatchAction("run")}>
+              批量执行
+            </Button>
+            <Dropdown
+              trigger={["click"]}
+              placement="bottomRight"
+              menu={{
+                items: selectedStateActionItems,
+                onClick: ({ key }) => requestBatchAction(key as CheckBatchAction)
+              }}
+            >
+              <Button icon={<MoreHorizontal size={16} />} loading={busy === "batch"}>
+                启用/禁用
+              </Button>
+            </Dropdown>
+            <Button onClick={() => setSelectedCheckIds([])}>取消选择</Button>
+          </Space>
+        </section>
+      )}
+
       {isCompactList ? (
         <CompactCheckList
           busy={busy}
@@ -617,6 +604,10 @@ export function ChecksPage({ type }: { type: CheckType }) {
           onConfirmRecovery={confirmRecovery}
           onToggle={toggle}
           duplicatingId={duplicatingId}
+          selectedIds={selectedCheckIds}
+          onToggleSelection={(checkId, selected) =>
+            setSelectedCheckIds((current) => (selected ? Array.from(new Set([...current, checkId])) : current.filter((id) => id !== checkId)))
+          }
         />
       ) : (
         <Table
@@ -624,6 +615,10 @@ export function ChecksPage({ type }: { type: CheckType }) {
           columns={columns}
           dataSource={filtered}
           loading={loading}
+          rowSelection={{
+            selectedRowKeys: selectedCheckIds,
+            onChange: (keys) => setSelectedCheckIds(keys.map((key) => Number(key)).filter((key) => Number.isFinite(key)))
+          }}
           pagination={{ pageSize: 10, showSizeChanger: false, itemRender: checkPaginationItemRender }}
           locale={{
             emptyText: (
@@ -677,6 +672,8 @@ interface CompactCheckListProps {
   onRun: (check: Check) => void;
   onConfirmRecovery: (check: Check) => void;
   onToggle: (check: Check) => void;
+  selectedIds: number[];
+  onToggleSelection: (checkId: number, selected: boolean) => void;
 }
 
 function CompactCheckList({
@@ -695,7 +692,9 @@ function CompactCheckList({
   onOpenLastRun,
   onRun,
   onConfirmRecovery,
-  onToggle
+  onToggle,
+  selectedIds,
+  onToggleSelection
 }: CompactCheckListProps) {
   if (loading) {
     return (
@@ -727,11 +726,13 @@ function CompactCheckList({
     <section className="check-card-list" aria-label="任务列表">
       {checks.map((check) => {
         const status = taskStatus(check);
+        const selected = selectedIds.includes(check.id);
         return (
           <article className={`check-card check-card-${status}`} key={check.id}>
             <header className="check-card-header">
               <div className="check-card-main">
                 <div className="check-card-context">
+                  <Checkbox checked={selected} aria-label={`选择 ${check.name}`} onChange={(event) => onToggleSelection(check.id, event.target.checked)} />
                   <span>{type === "ui" ? "UI 任务" : "接口任务"}</span>
                   {type === "api" && check.method && <Tag>{check.method}</Tag>}
                 </div>
@@ -740,7 +741,7 @@ function CompactCheckList({
                     {check.name}
                   </Button>
                 ) : (
-                  <strong className="check-card-title-static">{check.name}</strong>
+                  <span className="check-card-title-static">{check.name}</span>
                 )}
                 <div className="check-card-url" title={check.entry_url}>
                   {compactUrl(check.entry_url)}
@@ -811,7 +812,7 @@ function CheckMeta({ label, value }: { label: string; value: string | number }) 
   return (
     <div className="meta-field meta-field-card">
       <span>{label}</span>
-      <strong>{value}</strong>
+      <span>{value}</span>
     </div>
   );
 }

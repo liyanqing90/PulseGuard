@@ -625,6 +625,10 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual({run["runner_id"] for run in grouped}, {"edge-1", "edge-2"})
         self.assertEqual(grouped_page["total"], 2)
         self.assertEqual({run["runner_id"] for run in grouped_page["items"]}, {"edge-1", "edge-2"})
+        self.assertNotIn("logs", grouped_page["items"][0])
+        self.assertNotIn("error_stack", grouped_page["items"][0])
+        self.assertNotIn("request_snapshot", grouped_page["items"][0])
+        self.assertNotIn("response_snapshot", grouped_page["items"][0])
 
     def test_failed_run_without_failure_kind_defaults_to_target(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(

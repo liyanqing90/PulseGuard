@@ -201,7 +201,6 @@ export const api = {
     request<UiInspectResult>("/api/checks/inspect-ui", { method: "POST", body: JSON.stringify(payload) }),
   inspectUiRules: (payload: UiRuleInspectPayload) =>
     request<UiRuleInspectResult>("/api/checks/inspect-ui-rules", { method: "POST", body: JSON.stringify(payload) }),
-  runAll: (type: CheckType) => request<{ runs: Run[] }>(`/api/checks/run-all?type=${type}`, { method: "POST" }),
   batchChecks: (payload: CheckBatchPayload) =>
     request<CheckBatchResult>("/api/checks/batch", { method: "POST", body: JSON.stringify(payload) }),
   auditEvents: () => request<AuditEvent[]>("/api/audit-events"),

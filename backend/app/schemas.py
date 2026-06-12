@@ -140,21 +140,30 @@ class CheckUpdate(CheckBase):
 
 
 class CheckBatchRequest(BaseModel):
-    action: Literal["enable", "disable", "run", "update_interval"]
+    action: Literal["enable", "disable", "run"]
     type: CheckType
-    tag: str | None = Field(default="", max_length=80)
+    ids: list[int] = Field(..., min_length=1, max_length=1000)
     expected_count: int | None = Field(default=None, ge=0, le=10000)
-    interval_seconds: int | None = Field(default=None, ge=5, le=86400)
 
-    @field_validator("tag")
+    @field_validator("ids")
     @classmethod
-    def normalize_tag(cls, value: str | None) -> str:
-        return (value or "").strip()
+    def normalize_ids(cls, value: list[int]) -> list[int]:
+        result: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            check_id = int(raw)
+            if check_id <= 0 or check_id in seen:
+                continue
+            seen.add(check_id)
+            result.append(check_id)
+        if not result:
+            raise ValueError("请选择要操作的任务")
+        return result
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "CheckBatchRequest":
-        if self.action == "update_interval" and self.interval_seconds is None:
-            raise ValueError("批量调整频率必须提供执行频率")
+        if self.expected_count is not None and self.expected_count != len(self.ids):
+            raise ValueError("选中任务数量已变化，请刷新后重试")
         return self
 
 

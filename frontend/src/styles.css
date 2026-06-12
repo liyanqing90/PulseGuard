@@ -1070,7 +1070,7 @@ tr:last-child td {
   gap: var(--space-inner);
   color: var(--muted);
   font-size: var(--type-caption);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-regular);
 }
 
 .history-card-title.ant-btn {
@@ -1079,18 +1079,10 @@ tr:last-child td {
   padding: 0;
   color: var(--ink);
   font-size: var(--type-section);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-regular);
   line-height: 1.35;
   text-align: left;
   white-space: normal;
-}
-
-.history-card-error {
-  margin-top: 7px;
-  color: var(--danger);
-  font-size: var(--type-meta);
-  line-height: 1.45;
-  overflow-wrap: anywhere;
 }
 
 .history-card-state {
@@ -1128,10 +1120,15 @@ tr:last-child td {
   margin-top: 5px;
   color: var(--ink);
   font-size: var(--type-meta);
+  font-weight: var(--weight-regular);
   line-height: 1.3;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.history-card-meta .meta-field > span:last-child {
+  font-weight: var(--weight-regular);
 }
 
 .history-card-actions {
@@ -1222,20 +1219,6 @@ tr:last-child td {
   width: 150px;
 }
 
-.checks-batch-controls {
-  min-width: 0;
-}
-
-.checks-batch-interval {
-  width: 96px;
-}
-
-.checks-batch-unit {
-  color: var(--muted);
-  font-size: var(--type-small);
-  white-space: nowrap;
-}
-
 .checks-table .check-status-cell .ant-tag {
   margin-inline-end: 0;
   white-space: nowrap;
@@ -1270,6 +1253,27 @@ tr:last-child td {
 }
 
 .checks-result-bar strong {
+  color: var(--ink);
+  font-family: var(--font-numeric);
+  font-size: var(--type-section);
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+}
+
+.checks-selection-bar {
+  min-height: 46px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-surface);
+  padding: var(--space-inner) var(--space-field);
+  color: var(--muted);
+}
+
+.checks-selection-bar strong {
   color: var(--ink);
   font-family: var(--font-numeric);
   font-size: var(--type-section);
@@ -1356,7 +1360,7 @@ tr:last-child td {
   gap: 6px;
   color: var(--muted);
   font-size: var(--type-caption);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-regular);
 }
 
 .check-card-title.ant-btn {
@@ -1366,7 +1370,7 @@ tr:last-child td {
   color: var(--ink);
   font-family: var(--font-heading);
   font-size: var(--type-title);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-regular);
   line-height: 1.35;
   text-align: left;
   white-space: normal;
@@ -1378,6 +1382,7 @@ tr:last-child td {
   color: var(--ink);
   font-family: var(--font-heading);
   font-size: var(--type-title);
+  font-weight: var(--weight-regular);
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
@@ -1443,7 +1448,7 @@ tr:last-child td {
   color: var(--ink);
   font-family: var(--font-numeric);
   font-size: var(--type-title);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-regular);
   line-height: 1.3;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1544,28 +1549,46 @@ tr:last-child td {
   min-height: 32px;
   padding: 0;
   height: auto;
+  font-weight: var(--weight-regular);
   text-align: left;
   white-space: normal;
 }
 
-.table-link.strong {
-  font-weight: var(--weight-semibold);
-  color: var(--ink);
-}
-
-.history-runner-meta,
 .history-empty-cell {
   color: var(--muted);
   font-size: var(--type-caption);
   line-height: 1.35;
 }
 
-.history-runner-meta {
-  display: block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.history-runner-inline.ant-space {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-inner) !important;
+}
+
+.history-runner-inline .ant-tag {
+  margin-inline-end: 0;
+}
+
+.history-issue-summary {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.history-issue-summary > span {
+  color: var(--ink);
+  font-size: var(--type-meta);
+  line-height: var(--lh-caption);
+  overflow-wrap: anywhere;
+}
+
+.history-issue-summary-compact {
+  margin-top: 7px;
+}
+
+.history-issue-summary-compact > span {
+  color: var(--danger);
 }
 
 .status-badge {
@@ -3410,6 +3433,119 @@ tr:last-child td {
   font-size: var(--type-caption);
 }
 
+.runner-node-card .ant-card-body {
+  padding: var(--space-surface);
+}
+
+.runner-node-card-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-surface);
+  align-items: start;
+}
+
+.runner-node-main,
+.runner-node-heading {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.runner-node-heading {
+  gap: 5px;
+}
+
+.runner-node-title-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-inner);
+}
+
+.runner-node-title-row > strong {
+  color: var(--ink);
+  font-size: var(--type-title);
+  font-weight: var(--weight-medium);
+  line-height: var(--lh-normal);
+  overflow-wrap: anywhere;
+}
+
+.runner-node-tags.ant-space {
+  min-width: 0;
+}
+
+.runner-node-tags .ant-tag {
+  margin-inline-end: 0;
+}
+
+.runner-node-address,
+.runner-node-target {
+  color: var(--muted);
+  font-size: var(--type-caption);
+  line-height: var(--lh-caption);
+  overflow-wrap: anywhere;
+}
+
+.runner-node-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(118px, 1fr));
+  gap: var(--space-inner);
+}
+
+.runner-node-fact {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-tight);
+  background: color-mix(in srgb, var(--panel-strong) 58%, transparent);
+  padding: 7px 9px;
+  display: grid;
+  gap: 3px;
+}
+
+.runner-node-fact span {
+  color: var(--muted);
+  font-size: var(--type-small);
+  line-height: var(--lh-caption);
+}
+
+.runner-node-fact strong {
+  color: var(--ink);
+  font-size: var(--type-meta);
+  font-weight: var(--weight-regular);
+  line-height: var(--lh-normal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runner-node-controls {
+  min-width: 220px;
+  display: grid;
+  justify-items: end;
+  gap: var(--space-inner);
+}
+
+.runner-node-toggle {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-inner);
+  color: var(--muted);
+  font-size: var(--type-meta);
+}
+
+.runner-node-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: var(--space-inner);
+}
+
+.runner-node-actions .ant-btn {
+  min-width: 64px;
+}
+
 .worker-help-block {
   display: grid;
   gap: 6px;
@@ -4039,9 +4175,10 @@ tr:last-child td {
   padding: 9px var(--space-sm);
 }
 
-.meta-field-card > strong {
+.meta-field-card > span:last-child {
   font-family: var(--font-numeric);
   font-size: var(--type-title);
+  font-weight: var(--weight-regular);
 }
 
 .meta-field-preview {
@@ -4377,6 +4514,36 @@ tr:last-child td {
     width: 100%;
   }
 
+  .runner-node-card-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .runner-node-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .runner-node-controls {
+    min-width: 0;
+    width: 100%;
+    justify-items: stretch;
+  }
+
+  .runner-node-toggle {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .runner-node-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .runner-node-actions .ant-btn {
+    flex: 1 1 88px;
+    min-width: 0;
+  }
+
   .settings-form-grid {
     grid-template-columns: 1fr;
   }
@@ -4455,24 +4622,23 @@ tr:last-child td {
     flex-basis: 100% !important;
   }
 
-  .checks-batch-controls {
-    width: 100%;
-    flex-wrap: wrap;
-  }
-
-  .checks-batch-interval {
-    flex: 1 1 96px;
-    width: auto;
-  }
-
-  .checks-batch-controls .ant-btn {
-    flex: 1 1 150px;
-  }
-
   .checks-search .ant-input-group-wrapper,
   .checks-search .ant-input-wrapper,
   .checks-search .ant-input-affix-wrapper {
     width: 100%;
+  }
+
+  .checks-selection-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .checks-selection-bar .ant-space {
+    width: 100%;
+  }
+
+  .checks-selection-bar .ant-btn {
+    flex: 1 1 140px;
   }
 
   .history-toolbar .ant-btn,

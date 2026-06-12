@@ -348,10 +348,11 @@ def read_only_snapshot(
 ) -> dict[str, Any]:
     _verify_read_only_token(_read_only_token_value(token, x_pulseguard_read_only_token, authorization))
     settings = storage.get_settings()
+    overview = storage.get_overview()
     return {
-        "overview": _read_only_overview_payload(storage.get_overview(), settings),
-        "checks": [_read_only_check_payload(check, settings) for check in storage.list_checks()],
-        "recent_runs": [_read_only_run_payload(run, settings) for run in storage.list_runs(limit=100)],
+        "overview": _read_only_overview_payload(overview, settings),
+        "checks": [_read_only_check_payload(check, settings) for check in storage.list_checks(refresh_stale=False)],
+        "recent_runs": [_read_only_run_payload(run, settings) for run in storage.list_runs(limit=100, summary_only=True)],
     }
 
 
@@ -440,26 +441,33 @@ async def run_all_checks(request: Request, type: str | None = Query(default=None
 
 @app.post("/api/checks/batch")
 async def batch_checks(payload: CheckBatchRequest, request: Request) -> dict[str, Any]:
-    checks_to_apply = storage.select_checks_for_batch(payload.type, payload.tag, enabled_only=payload.action == "run")
-    ids = [int(check["id"]) for check in checks_to_apply]
+    storage.refresh_stale_statuses()
+    checks_by_id: dict[int, dict[str, Any]] = {}
+    for check_id in payload.ids:
+        check = storage.get_check(check_id, refresh_stale=False)
+        if check and check.get("type") == payload.type:
+            checks_by_id[int(check["id"])] = check
+
+    ids = [check_id for check_id in payload.ids if check_id in checks_by_id]
     if payload.expected_count is not None and payload.expected_count != len(ids):
-        raise HTTPException(status_code=409, detail=f"命中数量已变化：当前 {len(ids)} 条，请刷新后重试")
+        raise HTTPException(status_code=409, detail=f"选中任务数量已变化：当前 {len(ids)} 条，请刷新后重试")
 
     if payload.action == "run":
+        runnable_ids = [check_id for check_id in ids if bool(checks_by_id[check_id].get("enabled"))]
+        if len(runnable_ids) != len(ids):
+            raise HTTPException(status_code=409, detail="选中任务包含已禁用项，请刷新后重新选择")
         runs = await asyncio.gather(
             *[
                 request.app.state.runner.run_check(check_id, trigger="manual-batch")
-                for check_id in ids
+                for check_id in runnable_ids
             ]
         )
-        return {"matched": len(ids), "changed": 0, "ids": ids, "runs": runs}
+        return {"matched": len(runnable_ids), "changed": 0, "ids": runnable_ids, "runs": runs}
 
     if payload.action == "enable":
         changed = storage.batch_set_check_enabled(ids, True)
-    elif payload.action == "disable":
-        changed = storage.batch_set_check_enabled(ids, False)
     else:
-        changed = storage.batch_update_check_interval(ids, int(payload.interval_seconds or 300))
+        changed = storage.batch_set_check_enabled(ids, False)
 
     for check_id in ids:
         request.app.state.scheduler.sync_check(check_id)
@@ -468,7 +476,7 @@ async def batch_checks(payload: CheckBatchRequest, request: Request) -> dict[str
         "check_batch",
         entity_name=payload.type,
         summary="批量操作任务",
-        payload={"type": payload.type, "tag": payload.tag, "matched": len(ids), "changed": changed, "ids": ids},
+        payload={"type": payload.type, "matched": len(ids), "changed": changed, "ids": ids},
     )
     return {"matched": len(ids), "changed": changed, "ids": ids, "runs": []}
 
@@ -1080,7 +1088,7 @@ def _read_only_run_payload(run: dict[str, Any] | None, settings: dict[str, Any])
 def _status_page_payload() -> dict[str, Any]:
     settings = storage.get_settings()
     overview = storage.get_overview()
-    checks = [_status_check_payload(check, settings) for check in storage.list_checks()]
+    checks = [_status_check_payload(check, settings) for check in storage.list_checks(refresh_stale=False)]
     incidents = [
         _status_incident_payload(run, settings)
         for run in storage.list_recent_business_incidents(limit=20)
@@ -1164,7 +1172,7 @@ def _run_failure_summary_payload(run: dict[str, Any], baseline: dict[str, Any] |
 
 def _metrics_payload() -> dict[str, Any]:
     overview = storage.get_overview()
-    checks = storage.list_checks()
+    checks = storage.list_checks(refresh_stale=False)
     runs_24h = next((item for item in overview.get("trends", []) if item.get("key") == "24h"), {})
     trend_totals_24h = _trend_totals(runs_24h)
     return {

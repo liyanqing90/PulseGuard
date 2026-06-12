@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Empty, Space, Statistic, Table, Tag } from "antd";
+import { Alert, Button, Card, Empty, Space, Statistic, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   AlertTriangle,
@@ -14,21 +14,12 @@ import {
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
-import {
-  BatchRunActions,
-  BatchRunBreakdown,
-  batchRunMessage,
-  batchRunNotificationType,
-  summarizeBatchRuns
-} from "../components/BatchRunAlert";
-import { failureKindTag } from "../components/shared/businessTags";
 import type { CheckType, Overview, OverviewTrend, OverviewTrendSeries, Run, RuntimeStatus, SettingsValues } from "../types";
 import { checkListPath, formatDate, formatDuration, runStatusLabel, runStatusTagColor } from "../utils";
 
 const RunDetailDrawer = lazy(() => import("../components/RunDetailDrawer").then((module) => ({ default: module.RunDetailDrawer })));
 
 export function OverviewPage() {
-  const { message } = App.useApp();
   const location = useLocation();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [settings, setSettings] = useState<SettingsValues | null>(null);
@@ -36,7 +27,6 @@ export function OverviewPage() {
   const [detailRunId, setDetailRunId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<number | null>(null);
-  const [batchRunning, setBatchRunning] = useState<CheckType | null>(null);
   const navigate = useNavigate();
 
   async function load() {
@@ -70,41 +60,6 @@ export function OverviewPage() {
     }
   }
 
-  async function runAll(type: CheckType) {
-    setBatchRunning(type);
-    setError(null);
-    try {
-      const result = await api.runAll(type);
-      const notice = summarizeBatchRuns(type, result.runs);
-      message.open({
-        key: `batch-run-${type}`,
-        type: batchRunNotificationType(notice),
-        duration: 8,
-        content: (
-          <div className="batch-run-toast">
-            <strong>{batchRunMessage(notice)}</strong>
-            <BatchRunBreakdown notice={notice} />
-            <BatchRunActions
-              notice={notice}
-              onOpenHistory={(path) => navigate(path)}
-              onOpenRun={setDetailRunId}
-              emptyAction={
-                <Button size="small" onClick={() => navigate(checkListPath(notice.type))}>
-                  查看任务列表
-                </Button>
-              }
-            />
-          </div>
-        )
-      });
-      await load();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBatchRunning(null);
-    }
-  }
-
   const confirmingCount = (overview?.suspected_failing_count || 0) + (overview?.suspected_recovery_count || 0);
   const staleOrUnknownCount = (overview?.unknown_count || 0) + (overview?.stale_count || 0);
   const abnormalCount = (overview?.failing_count || 0) + confirmingCount + staleOrUnknownCount;
@@ -124,9 +79,13 @@ export function OverviewPage() {
       )
     },
     { title: "状态", dataIndex: "status", render: (_, run) => <Tag color={runStatusTagColor(run.status)}>{runStatusLabel(run.status)}</Tag>, width: 100 },
-    { title: "失败来源", dataIndex: "failure_kind", render: (_, run) => failureKindTag(run.failure_kind, <span>-</span>), width: 118 },
     { title: "耗时", dataIndex: "duration_ms", render: (value: number | null) => formatDuration(value), width: 110 },
-    { title: "错误摘要", dataIndex: "error_message", ellipsis: true },
+    {
+      title: "错误摘要",
+      dataIndex: "error_message",
+      width: 220,
+      render: (_, run) => <OverviewRunIssueSummary run={run} />
+    },
     { title: "连续失败", dataIndex: "consecutive_failures", render: (value?: number) => value || "-", width: 110 },
     {
       title: "操作",
@@ -153,17 +112,9 @@ export function OverviewPage() {
               : `页面和接口监控正常，今日完成 ${overview?.today_runs ?? 0} 次定时观测。`}
           </p>
         </div>
-        <Space wrap>
-          <Button icon={<Play size={16} />} loading={batchRunning === "ui"} onClick={() => runAll("ui")}>
-            执行全部 UI
-          </Button>
-          <Button icon={<Play size={16} />} loading={batchRunning === "api"} onClick={() => runAll("api")}>
-            执行全部 API
-          </Button>
-          <Button icon={<Settings2 size={16} />} onClick={() => navigate("/settings")}>
-            告警设置
-          </Button>
-        </Space>
+        <Button icon={<Settings2 size={16} />} onClick={() => navigate("/settings")}>
+          告警设置
+        </Button>
       </section>
 
       <section className="overview-status-grid">
@@ -241,18 +192,7 @@ export function OverviewPage() {
           dataSource={overview?.recent_failures || []}
           pagination={false}
           locale={{
-            emptyText: (
-              <Empty description="暂无失败记录">
-                <Space wrap>
-                  <Button icon={<Play size={16} />} loading={batchRunning === "ui"} onClick={() => runAll("ui")}>
-                    执行全部 UI
-                  </Button>
-                  <Button icon={<Play size={16} />} loading={batchRunning === "api"} onClick={() => runAll("api")}>
-                    执行全部 API
-                  </Button>
-                </Space>
-              </Empty>
-            )
+            emptyText: <Empty description="暂无失败记录" />
           }}
           scroll={{ x: 980 }}
         />
@@ -327,6 +267,15 @@ function formatSuccessRate(value: number | null | undefined): string {
 
 function TrendValue({ value }: { value: string }) {
   return <strong className="trend-value">{value}</strong>;
+}
+
+function OverviewRunIssueSummary({ run }: { run: Run }) {
+  if (!run.error_message) return <span className="history-empty-cell">-</span>;
+  return (
+    <div className="history-issue-summary">
+      <span>{run.error_message}</span>
+    </div>
+  );
 }
 
 function alertChannel(settings: SettingsValues): string {

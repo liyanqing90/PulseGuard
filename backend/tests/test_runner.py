@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -24,16 +25,35 @@ class DraftRunnerTests(unittest.TestCase):
             "script": "async def check(ctx):\n    print('draft ok')\n",
             "tags": "",
         }
-        created_run = {"id": 123, "status": "running"}
-        finished_run = {"id": 123, "check_id": 0, "status": "ok"}
-        final_run = {**finished_run, "notification_status": "not_required"}
+        result_data = {
+            "status": "ok",
+            "finished_at": "2026-01-01T00:00:01+08:00",
+            "duration_ms": 10,
+            "error_message": None,
+            "error_stack": None,
+            "logs": "draft ok",
+            "screenshot_path": None,
+            "trace_path": None,
+            "response_path": None,
+            "request_snapshot": None,
+            "response_snapshot": None,
+            "failure_kind": "none",
+        }
 
         with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
             "backend.app.runner.storage.get_settings",
             return_value={"max_task_runtime_seconds": 60, "browser_type": "chromium", "browser_headless": True},
-        ), patch("backend.app.runner.storage.create_run", return_value=created_run) as create_run, patch(
-            "backend.app.runner.storage.finish_run", return_value=finished_run
-        ), patch("backend.app.runner.storage.get_run", return_value=final_run), patch(
+        ), patch(
+            "backend.app.runner.storage.get_probe_runner",
+            return_value={"runner_id": "local", "name": "本机节点", "network_region": "local", "address": "", "browser_version": ""},
+        ), patch.object(
+            CheckRunner,
+            "_execute_core",
+            new_callable=AsyncMock,
+            return_value=result_data,
+        ) as execute_core, patch("backend.app.runner.storage.create_run") as create_run, patch(
+            "backend.app.runner.storage.finish_run"
+        ) as finish_run, patch("backend.app.runner.storage.get_run") as get_run, patch(
             "backend.app.runner.storage.update_run_notification"
         ) as update_run_notification, patch(
             "backend.app.runner.storage.update_check_status"
@@ -43,11 +63,20 @@ class DraftRunnerTests(unittest.TestCase):
             runner = CheckRunner()
             result = asyncio.run(runner.run_draft(check))
 
-        self.assertEqual(result, final_run)
-        draft_payload = create_run.call_args.args[0]
-        self.assertEqual(draft_payload["_run"]["observation_kind"], "draft")
-        self.assertFalse(draft_payload["_run"]["affects_health"])
-        update_run_notification.assert_called_once_with(123, "not_required", channel=None, error=None, sent_at=None)
+        self.assertEqual(result["id"], 0)
+        self.assertEqual(result["check_id"], 0)
+        self.assertEqual(result["check_name"], "草稿调试")
+        self.assertEqual(result["check_type"], "api")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["notification_status"], "not_required")
+        self.assertEqual(result["observation_kind"], "draft")
+        self.assertFalse(result["affects_health"])
+        self.assertEqual(result["runner_id"], "local")
+        execute_core.assert_awaited_once()
+        create_run.assert_not_called()
+        finish_run.assert_not_called()
+        get_run.assert_not_called()
+        update_run_notification.assert_not_called()
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
 
@@ -98,6 +127,61 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertTrue(manual_payload["_run"]["affects_health"])
         run_structured_api_check.assert_awaited_once()
         maybe_notify.assert_awaited_once()
+
+    def test_duration_excludes_preparation_and_notification_latency(self) -> None:
+        check = {
+            "id": 27,
+            "name": "Precise duration API",
+            "type": "api",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com/health",
+            "method": "GET",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": "[]",
+            "script": "async def check(ctx): pass",
+            "tags": "",
+        }
+        created_run = {"id": 270, "status": "running"}
+        captured_duration: list[int] = []
+
+        async def actual_task(_ctx: object) -> None:
+            await asyncio.sleep(0.01)
+
+        def load_check_function(*_args: object, **_kwargs: object) -> object:
+            time.sleep(0.2)
+            return actual_task
+
+        def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+            captured_duration.append(int(data["duration_ms"]))
+            return {"id": run_id, "check_id": 27, **data}
+
+        async def slow_notify(*_args: object, **_kwargs: object) -> None:
+            await asyncio.sleep(0.2)
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
+            "backend.app.runner.storage.get_settings",
+            return_value={"max_task_runtime_seconds": 60, "browser_type": "chromium", "browser_headless": True},
+        ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch(
+            "backend.app.runner.storage.finish_run", side_effect=finish_run
+        ), patch(
+            "backend.app.runner.storage.get_run", return_value=None
+        ), patch(
+            "backend.app.runner.storage.update_check_status", return_value={"current_status": "ok", "previous_status": None}
+        ), patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock, side_effect=slow_notify
+        ), patch.object(
+            CheckRunner, "_load_check_function", side_effect=load_check_function
+        ):
+            result = asyncio.run(CheckRunner().run_check(27, trigger="manual"))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(captured_duration), 1)
+        self.assertLess(captured_duration[0], 150)
 
     def test_target_failure_records_runner_metadata_and_failure_kind(self) -> None:
         check = {

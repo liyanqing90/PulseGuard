@@ -85,107 +85,105 @@ class RunAllRouteTests(unittest.TestCase):
         self.assertGreaterEqual(runner.max_running, 2)
         list_checks.assert_called_once_with("api", enabled_only=True)
 
-    def test_batch_enable_route_uses_tag_selection_and_syncs_matches(self) -> None:
+    def test_batch_enable_route_uses_selected_ids_and_syncs_matches(self) -> None:
         scheduler = FakeScheduler()
-        checks = [
-            {"id": 1, "name": "API 1", "type": "api"},
-            {"id": 2, "name": "API 2", "type": "api"},
-        ]
+        checks_by_id = {
+            1: {"id": 1, "name": "API 1", "type": "api"},
+            2: {"id": 2, "name": "API 2", "type": "api"},
+        }
 
         with patch.object(app.state, "scheduler", scheduler, create=True), patch(
-            "backend.app.main.storage.select_checks_for_batch",
-            return_value=checks,
-        ) as select_checks, patch(
+            "backend.app.main.storage.get_check",
+            side_effect=lambda check_id, **_: checks_by_id.get(check_id),
+        ) as get_check, patch(
             "backend.app.main.storage.batch_set_check_enabled",
             return_value=2,
         ) as batch_set_enabled, patch(
+            "backend.app.main.storage.select_checks_for_batch"
+        ) as select_checks, patch(
             "backend.app.main.storage.record_audit_event"
         ) as record_audit_event:
             response = TestClient(app).post(
                 "/api/checks/batch",
-                json={"action": "enable", "type": "api", "tag": "smoke", "expected_count": 2},
+                json={"action": "enable", "type": "api", "ids": [1, 2], "expected_count": 2},
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"matched": 2, "changed": 2, "ids": [1, 2], "runs": []})
-        select_checks.assert_called_once_with("api", "smoke", enabled_only=False)
+        self.assertEqual(get_check.call_count, 2)
+        select_checks.assert_not_called()
         batch_set_enabled.assert_called_once_with([1, 2], True)
         record_audit_event.assert_called_once()
         self.assertEqual(scheduler.synced, [1, 2])
 
     def test_batch_disable_route_updates_storage_and_syncs_matches(self) -> None:
         scheduler = FakeScheduler()
+        checks_by_id = {5: {"id": 5, "name": "API 5", "type": "api"}}
 
         with patch.object(app.state, "scheduler", scheduler, create=True), patch(
-            "backend.app.main.storage.select_checks_for_batch",
-            return_value=[{"id": 5, "name": "API 5", "type": "api"}],
-        ) as select_checks, patch(
+            "backend.app.main.storage.get_check",
+            side_effect=lambda check_id, **_: checks_by_id.get(check_id),
+        ) as get_check, patch(
             "backend.app.main.storage.batch_set_check_enabled",
             return_value=1,
         ) as batch_set_enabled, patch(
+            "backend.app.main.storage.select_checks_for_batch"
+        ) as select_checks, patch(
             "backend.app.main.storage.record_audit_event"
         ) as record_audit_event:
             response = TestClient(app).post(
                 "/api/checks/batch",
-                json={"action": "disable", "type": "api", "tag": "smoke", "expected_count": 1},
+                json={"action": "disable", "type": "api", "ids": [5], "expected_count": 1},
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"matched": 1, "changed": 1, "ids": [5], "runs": []})
-        select_checks.assert_called_once_with("api", "smoke", enabled_only=False)
+        get_check.assert_called_once_with(5, refresh_stale=False)
+        select_checks.assert_not_called()
         batch_set_enabled.assert_called_once_with([5], False)
         record_audit_event.assert_called_once()
         self.assertEqual(scheduler.synced, [5])
 
-    def test_batch_update_interval_route_syncs_matches(self) -> None:
-        scheduler = FakeScheduler()
-
-        with patch.object(app.state, "scheduler", scheduler, create=True), patch(
-            "backend.app.main.storage.select_checks_for_batch",
-            return_value=[{"id": 3, "name": "UI 1", "type": "ui"}],
-        ) as select_checks, patch(
-            "backend.app.main.storage.batch_update_check_interval",
-            return_value=1,
-        ) as batch_update_interval, patch(
-            "backend.app.main.storage.record_audit_event"
-        ) as record_audit_event:
+    def test_batch_route_rejects_removed_interval_action(self) -> None:
+        with patch("backend.app.main.storage.get_check") as get_check, patch(
+            "backend.app.main.storage.batch_update_check_interval"
+        ) as batch_update_interval:
             response = TestClient(app).post(
                 "/api/checks/batch",
-                json={"action": "update_interval", "type": "ui", "tag": "", "expected_count": 1, "interval_seconds": 600},
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"matched": 1, "changed": 1, "ids": [3], "runs": []})
-        select_checks.assert_called_once_with("ui", "", enabled_only=False)
-        batch_update_interval.assert_called_once_with([3], 600)
-        record_audit_event.assert_called_once()
-        self.assertEqual(scheduler.synced, [3])
-
-    def test_batch_update_interval_requires_interval_seconds(self) -> None:
-        with patch("backend.app.main.storage.select_checks_for_batch") as select_checks:
-            response = TestClient(app).post(
-                "/api/checks/batch",
-                json={"action": "update_interval", "type": "api", "expected_count": 1},
+                json={"action": "update_interval", "type": "api", "ids": [1], "expected_count": 1},
             )
 
         self.assertEqual(response.status_code, 422)
-        self.assertIn("批量调整频率必须提供执行频率", response.json()["detail"])
-        select_checks.assert_not_called()
+        get_check.assert_not_called()
+        batch_update_interval.assert_not_called()
+
+    def test_batch_route_requires_selected_ids(self) -> None:
+        with patch("backend.app.main.storage.get_check") as get_check, patch(
+            "backend.app.main.storage.batch_set_check_enabled"
+        ) as batch_set_enabled:
+            response = TestClient(app).post(
+                "/api/checks/batch",
+                json={"action": "disable", "type": "api", "expected_count": 0},
+            )
+
+        self.assertEqual(response.status_code, 422)
+        get_check.assert_not_called()
+        batch_set_enabled.assert_not_called()
 
     def test_batch_run_route_uses_enabled_selection_and_manual_batch_trigger(self) -> None:
         runner = FakeConcurrentRunner()
-        checks = [
-            {"id": 1, "name": "API 1", "type": "api"},
-            {"id": 2, "name": "API 2", "type": "api"},
-        ]
+        checks_by_id = {
+            1: {"id": 1, "name": "API 1", "type": "api", "enabled": True},
+            2: {"id": 2, "name": "API 2", "type": "api", "enabled": True},
+        }
 
         with patch.object(app.state, "runner", runner, create=True), patch(
-            "backend.app.main.storage.select_checks_for_batch",
-            return_value=checks,
-        ) as select_checks:
+            "backend.app.main.storage.get_check",
+            side_effect=lambda check_id, **_: checks_by_id.get(check_id),
+        ) as get_check, patch("backend.app.main.storage.select_checks_for_batch") as select_checks:
             response = TestClient(app).post(
                 "/api/checks/batch",
-                json={"action": "run", "type": "api", "tag": "smoke", "expected_count": 2},
+                json={"action": "run", "type": "api", "ids": [1, 2], "expected_count": 2},
             )
 
         body: dict[str, Any] = response.json()
@@ -195,20 +193,42 @@ class RunAllRouteTests(unittest.TestCase):
         self.assertEqual(body["ids"], [1, 2])
         self.assertEqual([run["trigger"] for run in body["runs"]], ["manual-batch", "manual-batch"])
         self.assertGreaterEqual(runner.max_running, 2)
-        select_checks.assert_called_once_with("api", "smoke", enabled_only=True)
+        self.assertEqual(get_check.call_count, 2)
+        select_checks.assert_not_called()
 
-    def test_batch_route_rejects_stale_expected_count(self) -> None:
-        with patch(
-            "backend.app.main.storage.select_checks_for_batch",
-            return_value=[{"id": 1, "name": "API 1", "type": "api"}],
-        ), patch("backend.app.main.storage.batch_set_check_enabled") as batch_set_enabled:
+    def test_batch_run_route_rejects_disabled_selection(self) -> None:
+        runner = FakeConcurrentRunner()
+        checks_by_id = {
+            1: {"id": 1, "name": "API 1", "type": "api", "enabled": True},
+            2: {"id": 2, "name": "API 2", "type": "api", "enabled": False},
+        }
+
+        with patch.object(app.state, "runner", runner, create=True), patch(
+            "backend.app.main.storage.get_check",
+            side_effect=lambda check_id, **_: checks_by_id.get(check_id),
+        ):
             response = TestClient(app).post(
                 "/api/checks/batch",
-                json={"action": "disable", "type": "api", "tag": "smoke", "expected_count": 2},
+                json={"action": "run", "type": "api", "ids": [1, 2], "expected_count": 2},
             )
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn("命中数量已变化", response.json()["detail"])
+        self.assertIn("选中任务包含已禁用项", response.json()["detail"])
+        self.assertEqual(runner.max_running, 0)
+
+    def test_batch_route_rejects_stale_expected_count(self) -> None:
+        checks_by_id = {1: {"id": 1, "name": "API 1", "type": "api"}}
+
+        with patch("backend.app.main.storage.get_check", side_effect=lambda check_id, **_: checks_by_id.get(check_id)), patch(
+            "backend.app.main.storage.batch_set_check_enabled"
+        ) as batch_set_enabled:
+            response = TestClient(app).post(
+                "/api/checks/batch",
+                json={"action": "disable", "type": "api", "ids": [1, 2], "expected_count": 2},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("选中任务数量已变化", response.json()["detail"])
         batch_set_enabled.assert_not_called()
 
     def test_inspect_ui_rules_route_delegates_to_runner(self) -> None:
