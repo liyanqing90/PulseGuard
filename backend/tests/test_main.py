@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+from backend.app import storage
 from backend.app.main import app
 
 
@@ -44,9 +45,48 @@ class FakeInspectRunner:
 class FakeScheduler:
     def __init__(self) -> None:
         self.synced: list[int] = []
+        self.pause_count = 0
+        self.resume_count = 0
+        self.refresh_count = 0
 
     def sync_check(self, check_id: int) -> None:
         self.synced.append(check_id)
+
+    def pause(self) -> None:
+        self.pause_count += 1
+
+    def resume(self) -> None:
+        self.resume_count += 1
+        self.refresh_all()
+
+    def refresh_all(self) -> None:
+        self.refresh_count += 1
+
+    def runtime_status(self) -> dict[str, object]:
+        return {
+            "running": True,
+            "paused": self.pause_count > self.resume_count,
+            "scheduled_checks": len(self.synced),
+            "next_due_at": None,
+            "overdue_jobs": 0,
+        }
+
+
+class FakeDeploymentRunner:
+    def __init__(self) -> None:
+        self.waits: list[int] = []
+        self.runs: list[tuple[int, str]] = []
+
+    async def wait_for_idle(self, timeout_seconds: int) -> dict[str, object]:
+        self.waits.append(timeout_seconds)
+        return {"idle": True, "queued": 0, "running": 0, "active_checks": 0}
+
+    async def run_check(self, check_id: int, trigger: str = "manual") -> dict[str, object]:
+        self.runs.append((check_id, trigger))
+        return {"id": check_id, "check_id": check_id, "trigger": trigger}
+
+    def runtime_status(self) -> dict[str, object]:
+        return {"queue": {"queued": 0}, "workers": {"running": 0}, "active_checks": 0}
 
 
 class FrontendRouteTests(unittest.TestCase):
@@ -250,6 +290,59 @@ class RunAllRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["results"][0]["status"], "ok")
         self.assertEqual(json.loads(str(runner.payload["assertions_json"])), json.loads(payload["assertions_json"]))
+
+
+class DeploymentRouteTests(unittest.TestCase):
+    def test_prepare_deployment_marks_window_pauses_scheduler_and_waits_for_runner(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            runner = FakeDeploymentRunner()
+            scheduler = FakeScheduler()
+
+            with patch.object(app.state, "runner", runner, create=True), patch.object(
+                app.state, "scheduler", scheduler, create=True
+            ):
+                response = TestClient(app).post("/api/deployment/prepare?wait_seconds=0&reason=test-deploy")
+
+        body: dict[str, Any] = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body["deployment"]["active"])
+        self.assertEqual(body["deployment"]["reason"], "test-deploy")
+        self.assertEqual(runner.waits, [0])
+        self.assertEqual(scheduler.pause_count, 1)
+        self.assertTrue(body["scheduler"]["paused"])
+
+    def test_complete_deployment_reruns_enabled_checks_before_resuming_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            storage.start_deployment_window("test-deploy")
+            runner = FakeDeploymentRunner()
+            scheduler = FakeScheduler()
+
+            with patch.object(app.state, "runner", runner, create=True), patch.object(
+                app.state, "scheduler", scheduler, create=True
+            ), patch(
+                "backend.app.main.storage.list_checks",
+                return_value=[
+                    {"id": 10, "name": "API 10", "type": "api", "enabled": True},
+                    {"id": 11, "name": "API 11", "type": "api", "enabled": True},
+                ],
+            ) as list_checks:
+                response = TestClient(app).post("/api/deployment/complete")
+
+        body: dict[str, Any] = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(body["deployment"]["active"])
+        self.assertEqual(runner.runs, [(10, "post-deploy"), (11, "post-deploy")])
+        self.assertEqual(runner.waits, [300])
+        self.assertEqual(body["discarded_incomplete_runs"], 0)
+        list_checks.assert_called_once_with(None, enabled_only=True)
+        self.assertEqual(scheduler.refresh_count, 1)
+        self.assertEqual(scheduler.resume_count, 1)
 
 
 class HeartbeatRouteTests(unittest.TestCase):

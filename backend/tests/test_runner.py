@@ -297,7 +297,7 @@ class DraftRunnerTests(unittest.TestCase):
         self.assertEqual(finished_runs[0]["status"], "ok")
         self.assertIn("本次尝试失败，立即重试：flaky", str(finished_runs[0]["logs"]))
 
-    def test_runner_environment_failure_records_runner_failure_kind(self) -> None:
+    def test_runner_environment_failure_does_not_persist_task_run(self) -> None:
         check = {
             "id": 18,
             "name": "Runner browser failure",
@@ -322,7 +322,6 @@ class DraftRunnerTests(unittest.TestCase):
             "local_runner_region": "office-lan",
         }
         created_run = {"id": 180, "status": "running"}
-        finished_run = {"id": 180, "check_id": 18, "status": "failed"}
 
         with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
             "backend.app.runner.storage.get_settings",
@@ -330,23 +329,27 @@ class DraftRunnerTests(unittest.TestCase):
         ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
             "backend.app.runner.storage.create_run", return_value=created_run
         ), patch(
-            "backend.app.runner.storage.finish_run", return_value=finished_run
+            "backend.app.runner.storage.finish_run"
         ) as finish_run, patch(
-            "backend.app.runner.storage.get_run", return_value=finished_run
-        ), patch(
-            "backend.app.runner.storage.update_check_status", return_value={"current_status": "failed", "previous_status": None}
-        ), patch(
+            "backend.app.runner.storage.discard_incomplete_run", return_value=True
+        ) as discard_incomplete_run, patch(
+            "backend.app.runner.storage.update_check_status"
+        ) as update_check_status, patch(
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
-        ), patch(
+        ) as maybe_notify, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RunnerEnvironmentFailure("browser failed")
         ):
             runner = CheckRunner()
             result = asyncio.run(runner.run_check(18))
 
-        self.assertEqual(result, finished_run)
-        finish_payload = finish_run.call_args.args[1]
-        self.assertEqual(finish_payload["status"], "failed")
-        self.assertEqual(finish_payload["failure_kind"], "runner")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "runner")
+        self.assertFalse(result["affects_health"])
+        self.assertEqual(result["observation_kind"], "runner")
+        finish_run.assert_not_called()
+        discard_incomplete_run.assert_called_once_with(180)
+        update_check_status.assert_not_called()
+        maybe_notify.assert_not_called()
 
     def test_structured_ui_check_runs_without_loading_user_script(self) -> None:
         check = {
@@ -632,7 +635,9 @@ class DistributedRunnerTests(unittest.TestCase):
             "backend.app.runner.storage.create_run", return_value={"id": 310, "check_id": 31, "status": "pending"}
         ), patch("backend.app.runner.storage.finish_run", side_effect=finish_run), patch(
             "backend.app.runner.storage.get_run", return_value=None
-        ), patch("backend.app.runner.storage.update_run_notification") as update_run_notification, patch(
+        ), patch("backend.app.runner.storage.discard_incomplete_run", return_value=True) as discard_incomplete_run, patch(
+            "backend.app.runner.storage.update_run_notification"
+        ) as update_run_notification, patch(
             "backend.app.runner.storage.update_check_status"
         ) as update_check_status, patch(
             "backend.app.runner.storage.get_probe_runner", return_value=local_runner
@@ -645,8 +650,10 @@ class DistributedRunnerTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["failure_kind"], "runner")
+        self.assertFalse(result["affects_health"])
         execute.assert_not_awaited()
-        update_run_notification.assert_called_once()
+        discard_incomplete_run.assert_called_once_with(310)
+        update_run_notification.assert_not_called()
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
 

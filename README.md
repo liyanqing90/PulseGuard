@@ -296,8 +296,7 @@ Docker：
 
 ```powershell
 uv lock --check
-docker compose build
-docker compose up -d
+.\scripts\deploy.ps1
 ```
 
 ## 脚本任务入口

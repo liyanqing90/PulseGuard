@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(health_poll_task, return_exceptions=True)
     if scheduler is not None:
         scheduler.shutdown()
-    await runner.shutdown()
+    await runner.shutdown(record_cancelled=not storage.is_deployment_window_active())
 
 
 ensure_runtime_dirs()
@@ -226,11 +226,84 @@ def overview() -> dict[str, Any]:
 def runtime_status(request: Request) -> dict[str, Any]:
     payload = request.app.state.runner.runtime_status()
     scheduler = request.app.state.scheduler
-    payload["scheduler"] = scheduler.runtime_status() if hasattr(scheduler, "runtime_status") else {"running": False, "scheduled_checks": 0, "next_due_at": None, "overdue_jobs": 0}
+    payload["scheduler"] = _scheduler_runtime_status(scheduler)
+    payload["deployment"] = storage.get_deployment_state()
     payload["node_role"] = NODE_ROLE
     payload["version"] = APP_VERSION
     payload["build_sha"] = BUILD_SHA
     return payload
+
+
+@app.post("/api/deployment/prepare")
+async def prepare_deployment(
+    request: Request,
+    wait_seconds: int = Query(default=60, ge=0, le=300),
+    reason: str = Query(default="docker-deploy", min_length=1, max_length=80),
+) -> dict[str, Any]:
+    state = storage.start_deployment_window(reason)
+    scheduler = request.app.state.scheduler
+    if hasattr(scheduler, "pause"):
+        scheduler.pause()
+    runner = request.app.state.runner
+    runner_status = (
+        await runner.wait_for_idle(wait_seconds)
+        if hasattr(runner, "wait_for_idle")
+        else runner.runtime_status()
+    )
+    storage.record_audit_event(
+        "started",
+        "deployment",
+        entity_name=state["reason"],
+        summary="进入部署维护窗口",
+        payload={"wait_seconds": wait_seconds, "runner": runner_status},
+    )
+    return {
+        "ok": True,
+        "deployment": storage.get_deployment_state(),
+        "runner": runner_status,
+        "scheduler": _scheduler_runtime_status(scheduler),
+    }
+
+
+@app.post("/api/deployment/complete")
+async def complete_deployment(
+    request: Request,
+    run_enabled: bool = Query(default=True),
+) -> dict[str, Any]:
+    scheduler = request.app.state.scheduler
+    runs = await _run_enabled_checks(request, "post-deploy", concurrent=False) if run_enabled else []
+    runner = request.app.state.runner
+    runner_status = (
+        await runner.wait_for_idle(300)
+        if hasattr(runner, "wait_for_idle")
+        else runner.runtime_status()
+    )
+    discarded_incomplete_runs = storage.discard_incomplete_runs()
+    state = storage.finish_deployment_window()
+    if hasattr(scheduler, "resume"):
+        scheduler.resume()
+    elif hasattr(scheduler, "refresh_all"):
+        scheduler.refresh_all()
+    storage.record_audit_event(
+        "completed",
+        "deployment",
+        entity_name=state.get("reason") or "docker-deploy",
+        summary="完成部署维护窗口",
+        payload={
+            "run_enabled": run_enabled,
+            "run_count": len(runs),
+            "discarded_incomplete_runs": discarded_incomplete_runs,
+            "runner": runner_status,
+        },
+    )
+    return {
+        "ok": True,
+        "deployment": storage.get_deployment_state(),
+        "runs": runs,
+        "discarded_incomplete_runs": discarded_incomplete_runs,
+        "runner": runner_status,
+        "scheduler": _scheduler_runtime_status(scheduler),
+    }
 
 
 @app.get("/api/runners")
@@ -429,13 +502,7 @@ def create_check(payload: CheckCreate, request: Request) -> dict[str, Any]:
 async def run_all_checks(request: Request, type: str | None = Query(default=None)) -> dict[str, Any]:
     if type and type not in {"ui", "api"}:
         raise HTTPException(status_code=400, detail="任务类型无效")
-    checks_to_run = [check for check in storage.list_checks(type, enabled_only=True)]
-    results = await asyncio.gather(
-        *[
-            request.app.state.runner.run_check(int(check["id"]), trigger="manual-batch")
-            for check in checks_to_run
-        ]
-    )
+    results = await _run_enabled_checks(request, "manual-batch", type)
     return {"runs": results}
 
 
@@ -907,6 +974,38 @@ def _runner_response(runner: dict[str, Any]) -> dict[str, Any]:
     if token:
         visible["token"] = token
     return visible
+
+
+def _scheduler_runtime_status(scheduler: Any) -> dict[str, Any]:
+    if hasattr(scheduler, "runtime_status"):
+        return scheduler.runtime_status()
+    return {
+        "running": False,
+        "paused": False,
+        "scheduled_checks": 0,
+        "next_due_at": None,
+        "overdue_jobs": 0,
+    }
+
+
+async def _run_enabled_checks(
+    request: Request,
+    trigger: str,
+    check_type: str | None = None,
+    concurrent: bool = True,
+) -> list[dict[str, Any]]:
+    checks_to_run = [check for check in storage.list_checks(check_type, enabled_only=True)]
+    if not concurrent:
+        results: list[dict[str, Any]] = []
+        for check in checks_to_run:
+            results.append(await request.app.state.runner.run_check(int(check["id"]), trigger=trigger))
+        return results
+    return await asyncio.gather(
+        *[
+            request.app.state.runner.run_check(int(check["id"]), trigger=trigger)
+            for check in checks_to_run
+        ]
+    )
 
 
 async def _fetch_runner_health(runner: dict[str, Any]) -> dict[str, Any]:

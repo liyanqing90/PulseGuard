@@ -788,6 +788,49 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(second_scope, [0, 1, 0])
 
 
+class DeploymentStorageTests(unittest.TestCase):
+    def test_deployment_window_discards_interrupted_runs_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Deploy API"))
+            completed = storage.create_run(check)
+            storage.finish_run(int(completed["id"]), run_payload("ok"))
+            pending = storage.create_run(check, "pending")
+            running = storage.create_run(check, "pending")
+            storage.start_run(int(running["id"]))
+
+            state = storage.start_deployment_window("unit-test")
+            storage.init_db()
+            remaining_runs = storage.list_runs(limit=10)
+            deployment = storage.get_deployment_state()
+
+        self.assertTrue(state["active"])
+        self.assertTrue(deployment["active"])
+        self.assertEqual({run["id"] for run in remaining_runs}, {completed["id"]})
+        self.assertNotIn(pending["id"], {run["id"] for run in remaining_runs})
+        self.assertNotIn(running["id"], {run["id"] for run in remaining_runs})
+
+    def test_deployment_window_state_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            started = storage.start_deployment_window("unit-test")
+            active = storage.get_deployment_state()
+            finished = storage.finish_deployment_window()
+            inactive = storage.get_deployment_state()
+
+        self.assertTrue(started["active"])
+        self.assertTrue(active["active"])
+        self.assertEqual(active["reason"], "unit-test")
+        self.assertFalse(finished["active"])
+        self.assertFalse(inactive["active"])
+        self.assertIsNotNone(inactive["finished_at"])
+
+
 class SettingsVariableStorageTests(unittest.TestCase):
     def test_public_settings_masks_secret_environment_variable_value_but_reports_value_set(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(

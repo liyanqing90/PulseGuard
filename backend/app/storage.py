@@ -26,6 +26,7 @@ LOCAL_RUNNER_ID = "local"
 RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 120
 RUNNER_ROLES = {"local", "child"}
 RUNNER_SELECTION_MODES = {"selected_parallel", "round_robin_all"}
+DEPLOYMENT_STATE_KEY = "deployment_window"
 RUN_SUMMARY_COLUMNS = (
     "id",
     "check_id",
@@ -147,6 +148,12 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS runtime_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -503,6 +510,62 @@ def get_heartbeat(key: str) -> dict[str, Any] | None:
     with _LOCK, _connect() as conn:
         row = conn.execute("SELECT * FROM heartbeats WHERE key = ?", (heartbeat_key,)).fetchone()
     return _normalize_heartbeat(row) if row else None
+
+
+def get_deployment_state() -> dict[str, Any]:
+    with _LOCK, _connect() as conn:
+        return _read_deployment_state(conn)
+
+
+def start_deployment_window(reason: str = "docker-deploy") -> dict[str, Any]:
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        previous = _read_deployment_state(conn)
+        started_at = previous.get("started_at") if previous.get("active") else timestamp
+        state = {
+            "active": True,
+            "reason": str(reason or "docker-deploy").strip() or "docker-deploy",
+            "started_at": started_at,
+            "finished_at": None,
+            "updated_at": timestamp,
+        }
+        _write_runtime_state(conn, DEPLOYMENT_STATE_KEY, state, timestamp)
+        return state
+
+
+def finish_deployment_window() -> dict[str, Any]:
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        previous = _read_deployment_state(conn)
+        state = {
+            "active": False,
+            "reason": previous.get("reason") or "",
+            "started_at": previous.get("started_at"),
+            "finished_at": timestamp,
+            "updated_at": timestamp,
+        }
+        _write_runtime_state(conn, DEPLOYMENT_STATE_KEY, state, timestamp)
+        return state
+
+
+def is_deployment_window_active() -> bool:
+    return bool(get_deployment_state().get("active"))
+
+
+def discard_incomplete_runs() -> int:
+    with _LOCK, _connect() as conn:
+        return _discard_incomplete_runs(conn)
+
+
+def discard_incomplete_run(run_id: int) -> bool:
+    with _LOCK, _connect() as conn:
+        conn.execute("UPDATE check_status SET last_run_id = NULL WHERE last_run_id = ?", (run_id,))
+        conn.execute("UPDATE check_status SET last_scheduled_run_id = NULL WHERE last_scheduled_run_id = ?", (run_id,))
+        cursor = conn.execute(
+            "DELETE FROM runs WHERE id = ? AND status IN ('pending', 'running')",
+            (run_id,),
+        )
+        return cursor.rowcount > 0
 
 
 def record_audit_event(
@@ -2153,7 +2216,62 @@ def _read_setting_value(conn: sqlite3.Connection, key: str) -> Any:
         return row["value"]
 
 
+def _read_runtime_state(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
+    try:
+        row = conn.execute("SELECT value, updated_at FROM runtime_state WHERE key = ?", (key,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table: runtime_state" in str(exc):
+            return None
+        raise
+    if not row:
+        return None
+    try:
+        value = json.loads(row["value"])
+    except json.JSONDecodeError:
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    value["updated_at"] = value.get("updated_at") or row["updated_at"]
+    return value
+
+
+def _write_runtime_state(conn: sqlite3.Connection, key: str, value: dict[str, Any], timestamp: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO runtime_state(key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, json.dumps(value, ensure_ascii=False), timestamp),
+    )
+
+
+def _read_deployment_state(conn: sqlite3.Connection) -> dict[str, Any]:
+    state = _read_runtime_state(conn, DEPLOYMENT_STATE_KEY) or {}
+    return {
+        "active": bool(state.get("active")),
+        "reason": str(state.get("reason") or ""),
+        "started_at": state.get("started_at"),
+        "finished_at": state.get("finished_at"),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+def _discard_incomplete_runs(conn: sqlite3.Connection) -> int:
+    rows = conn.execute("SELECT id FROM runs WHERE status IN ('pending', 'running')").fetchall()
+    run_ids = [int(row["id"]) for row in rows]
+    if not run_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in run_ids)
+    conn.execute(f"UPDATE check_status SET last_run_id = NULL WHERE last_run_id IN ({placeholders})", run_ids)
+    conn.execute(f"UPDATE check_status SET last_scheduled_run_id = NULL WHERE last_scheduled_run_id IN ({placeholders})", run_ids)
+    cursor = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", run_ids)
+    return cursor.rowcount
+
+
 def _mark_interrupted_runs(conn: sqlite3.Connection) -> None:
+    if _read_deployment_state(conn).get("active"):
+        _discard_incomplete_runs(conn)
+        return
     timestamp = now_iso()
     conn.execute(
         """

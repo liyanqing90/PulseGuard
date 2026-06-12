@@ -111,8 +111,7 @@ Docker:
 
 ```powershell
 uv lock --check
-docker compose build
-docker compose up -d
+.\scripts\deploy.ps1
 ```
 
 ## Script Task Entry Points

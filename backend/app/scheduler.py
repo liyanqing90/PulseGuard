@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from apscheduler.schedulers.base import STATE_PAUSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from . import storage
@@ -16,8 +17,11 @@ class PulseScheduler:
         self.scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
     def start(self) -> None:
+        paused = storage.is_deployment_window_active()
         if not self.scheduler.running:
-            self.scheduler.start()
+            self.scheduler.start(paused=paused)
+        elif paused:
+            self.scheduler.pause()
         self.scheduler.add_job(
             storage.cleanup_old_data,
             "interval",
@@ -32,6 +36,15 @@ class PulseScheduler:
             id="refresh-stale-checks",
             replace_existing=True,
         )
+        self.refresh_all()
+
+    def pause(self) -> None:
+        if self.scheduler.running:
+            self.scheduler.pause()
+
+    def resume(self) -> None:
+        if self.scheduler.running:
+            self.scheduler.resume()
         self.refresh_all()
 
     def shutdown(self) -> None:
@@ -75,6 +88,7 @@ class PulseScheduler:
         overdue = sum(1 for next_time in next_times if next_time < now)
         return {
             "running": self.scheduler.running,
+            "paused": self.scheduler.state == STATE_PAUSED,
             "scheduled_checks": len(jobs),
             "next_due_at": min(next_times).isoformat(timespec="seconds") if next_times else None,
             "overdue_jobs": overdue,
