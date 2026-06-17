@@ -1,0 +1,24 @@
+[project]
+name = "pulseguard"
+version = "0.1.0"
+description = "Local UI/API health check console with scheduled probes, artifacts, and webhook alerts."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "apscheduler==3.11.0",
+    "fastapi==0.115.6",
+    "httpx[socks]==0.28.1",
+    "jsonschema==4.23.0",
+    "playwright==1.49.1",
+    "pydantic==2.10.4",
+    "python-dotenv==1.0.1",
+    "uvicorn[standard]==0.34.0",
+    "websockets==16.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

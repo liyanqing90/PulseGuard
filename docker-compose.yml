@@ -1,0 +1,19 @@
+services:
+  pulseguard:
+    build: .
+    container_name: pulseguard
+    restart: unless-stopped
+    ports:
+      - "${PULSEGUARD_PUBLISH_HOST:-0.0.0.0}:${PULSEGUARD_PUBLISH_PORT:-8787}:${PULSEGUARD_PORT:-8787}"
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PULSEGUARD_HOST=${PULSEGUARD_HOST:-0.0.0.0}
+      - PULSEGUARD_PORT=${PULSEGUARD_PORT:-8787}
+      - PULSEGUARD_ALERT_DETAIL_BASE_URL=${PULSEGUARD_ALERT_DETAIL_BASE_URL:-http://localhost:8787}
+      - PULSEGUARD_DATA_DIR=/app/data
+      - PULSEGUARD_REPORTS_DIR=/app/reports
+    mem_limit: 1g
+    cpus: 1.0
