@@ -1,0 +1,15 @@
+FROM python:3.12-alpine
+
+RUN apk add --no-cache docker-cli docker-cli-compose
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+ENV PULSEGUARD_UPDATER_HOST=0.0.0.0
+ENV PULSEGUARD_UPDATER_PORT=8790
+ENV PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
+ENV PULSEGUARD_WORKER_COMPOSE_FILE=/workspace/docker-compose.worker.yml
+
+COPY backend/app/worker_updater.py /app/worker_updater.py
+
+EXPOSE 8790
+CMD ["python", "/app/worker_updater.py"]

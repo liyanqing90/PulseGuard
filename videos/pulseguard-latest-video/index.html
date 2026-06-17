@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>PulseGuard Latest Version</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #f4f6f8;
+        color: #1f2328;
+        font-family: sans-serif;
+        letter-spacing: 0;
+      }
+
+      #root {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #f4f6f8;
+      }
+
+      .scene {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+      }
+
+      .scene.active {
+        opacity: 1;
+      }
+
+      .scene-content {
+        width: 100%;
+        height: 100%;
+        padding: 72px 96px;
+        display: flex;
+        flex-direction: column;
+        gap: 28px;
+      }
+
+      .stage {
+        flex: 1;
+        display: grid;
+        min-height: 0;
+        gap: 24px;
+      }
+
+      .topline {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 64px;
+      }
+
+      .brand-lockup {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .pulse-mark {
+        width: 54px;
+        height: 54px;
+        border: 2px solid #2563eb;
+        border-radius: 10px;
+        display: grid;
+        place-items: center;
+        color: #2563eb;
+        background: #fbfcfd;
+        box-shadow: 0 12px 30px rgba(31, 35, 40, 0.08);
+      }
+
+      .pulse-mark svg {
+        width: 34px;
+        height: 34px;
+      }
+
+      .brand-name {
+        font-size: 40px;
+        line-height: 1.15;
+        font-weight: 700;
+      }
+
+      .brand-sub {
+        margin-top: 4px;
+        color: #656d76;
+        font-size: 22px;
+        font-weight: 500;
+      }
+
+      .tag-row,
+      .chip-row {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .tag {
+        min-height: 32px;
+        padding: 5px 12px;
+        border-radius: 6px;
+        border: 1px solid #d8dee4;
+        background: #fbfcfd;
+        color: #656d76;
+        font-size: 18px;
+        font-weight: 600;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .tag.blue {
+        border-color: #b7cffb;
+        color: #1d4ed8;
+        background: #eaf2ff;
+      }
+
+      .tag.green {
+        border-color: #9ad5a7;
+        color: #16833a;
+        background: #dafbe1;
+      }
+
+      .tag.orange {
+        border-color: #d8b15a;
+        color: #9a6700;
+        background: #fff8c5;
+      }
+
+      .headline {
+        max-width: 1040px;
+        font-size: 84px;
+        line-height: 1.06;
+        font-weight: 700;
+      }
+
+      .subhead {
+        max-width: 980px;
+        color: #656d76;
+        font-size: 30px;
+        line-height: 1.45;
+        font-weight: 500;
+      }
+
+      .dashboard-shell {
+        border: 1px solid #d8dee4;
+        border-radius: 12px;
+        background: #fbfcfd;
+        box-shadow: 0 16px 34px rgba(31, 35, 40, 0.1);
+        overflow: hidden;
+      }
+
+      .dashboard-grid {
+        display: grid;
+        grid-template-columns: 236px minmax(0, 1fr);
+        height: 620px;
+      }
+
+      .sidebar {
+        border-right: 1px solid #d8dee4;
+        background: #f6f8fa;
+        padding: 28px 22px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+
+      .nav-item {
+        height: 48px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 14px;
+        color: #656d76;
+        font-size: 19px;
+        font-weight: 600;
+      }
+
+      .nav-item.active {
+        color: #1d4ed8;
+        border-color: #d8dee4;
+        background: #eaf2ff;
+      }
+
+      .main-area {
+        padding: 30px;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .metric-card,
+      .panel-card,
+      .evidence-card,
+      .endpoint-card,
+      .policy-card,
+      .runner-card {
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        background: #fbfcfd;
+      }
+
+      .metric-card {
+        min-height: 104px;
+        padding: 16px;
+      }
+
+      .metric-label,
+      .table-label,
+      .small-label {
+        color: #656d76;
+        font-size: 16px;
+        line-height: 1.4;
+        font-weight: 600;
+      }
+
+      .metric-value {
+        margin-top: 8px;
+        color: #1f2328;
+        font-size: 42px;
+        line-height: 1;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .table-card {
+        flex: 1;
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #fbfcfd;
+      }
+
+      .table-head,
+      .table-row {
+        display: grid;
+        grid-template-columns: 1.7fr 1fr 0.8fr 0.9fr 1fr;
+        align-items: center;
+        gap: 18px;
+        min-height: 58px;
+        padding: 0 18px;
+        border-bottom: 1px solid #d8dee4;
+      }
+
+      .table-head {
+        min-height: 52px;
+        background: #f1f4f7;
+      }
+
+      .table-row:last-child {
+        border-bottom: 0;
+      }
+
+      .cell-title {
+        font-size: 22px;
+        font-weight: 650;
+      }
+
+      .cell-muted {
+        color: #656d76;
+        font-size: 18px;
+      }
+
+      .status-dot {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #2563eb;
+        display: inline-block;
+      }
+
+      .layout-two {
+        grid-template-columns: 1fr 1fr;
+        align-items: stretch;
+      }
+
+      .layout-three {
+        grid-template-columns: 1fr 1fr 1fr;
+      }
+
+      .panel-card {
+        padding: 26px;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        min-height: 0;
+      }
+
+      .panel-title {
+        font-size: 32px;
+        font-weight: 700;
+      }
+
+      .panel-subtitle {
+        color: #656d76;
+        font-size: 21px;
+        line-height: 1.42;
+      }
+
+      .rule-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .rule-row {
+        min-height: 52px;
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        background: #f6f8fa;
+        padding: 0 16px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .rule-name {
+        font-size: 19px;
+        font-weight: 650;
+      }
+
+      .code-line {
+        padding: 13px 16px;
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        background: #f6f8fa;
+        font-family: monospace;
+        color: #1f2328;
+        font-size: 18px;
+        line-height: 1.45;
+      }
+
+      .evidence-grid {
+        display: grid;
+        grid-template-columns: 1.1fr 1fr;
+        gap: 24px;
+      }
+
+      .detail-panel {
+        border: 1px solid #d8dee4;
+        border-radius: 10px;
+        background: #fbfcfd;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      .evidence-list {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .evidence-card {
+        min-height: 144px;
+        padding: 18px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .evidence-icon {
+        width: 46px;
+        height: 46px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: #eaf2ff;
+        color: #1d4ed8;
+        font-size: 23px;
+        font-weight: 700;
+      }
+
+      .comparison-table {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .compare-row {
+        min-height: 58px;
+        display: grid;
+        grid-template-columns: 0.8fr 1fr 1fr;
+        align-items: center;
+        gap: 14px;
+        padding: 0 16px;
+        border-bottom: 1px solid #d8dee4;
+      }
+
+      .compare-row:last-child {
+        border-bottom: 0;
+      }
+
+      .runner-stage {
+        display: grid;
+        grid-template-columns: 1fr 1.15fr;
+        gap: 24px;
+      }
+
+      .queue-panel,
+      .runner-panel {
+        border: 1px solid #d8dee4;
+        border-radius: 10px;
+        background: #fbfcfd;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+
+      .lane {
+        min-height: 76px;
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        background: #f6f8fa;
+        padding: 12px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .job {
+        min-width: 118px;
+        height: 44px;
+        border: 1px solid #b7cffb;
+        border-radius: 8px;
+        background: #eaf2ff;
+        color: #1d4ed8;
+        display: grid;
+        place-items: center;
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      .slot-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .runner-card {
+        min-height: 132px;
+        padding: 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .policy-stack {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 18px;
+      }
+
+      .policy-card {
+        min-height: 346px;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      .policy-level {
+        font-size: 28px;
+        font-weight: 700;
+      }
+
+      .policy-line {
+        min-height: 46px;
+        border: 1px solid #d8dee4;
+        border-radius: 7px;
+        background: #f6f8fa;
+        padding: 0 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        color: #1f2328;
+        font-size: 18px;
+        font-weight: 600;
+      }
+
+      .ops-grid {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr;
+        gap: 24px;
+      }
+
+      .ledger-table {
+        border: 1px solid #d8dee4;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #fbfcfd;
+      }
+
+      .ledger-row {
+        display: grid;
+        grid-template-columns: 180px 160px 1fr 130px;
+        min-height: 62px;
+        align-items: center;
+        gap: 16px;
+        padding: 0 18px;
+        border-bottom: 1px solid #d8dee4;
+        font-size: 18px;
+      }
+
+      .ledger-row:last-child {
+        border-bottom: 0;
+      }
+
+      .version-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+
+      .version-card {
+        min-height: 92px;
+        border: 1px solid #d8dee4;
+        border-radius: 8px;
+        background: #fbfcfd;
+        padding: 16px 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .endpoint-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .endpoint-card {
+        min-height: 184px;
+        padding: 22px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .endpoint-title {
+        font-size: 27px;
+        font-weight: 700;
+      }
+
+      .endpoint-path {
+        color: #656d76;
+        font-family: monospace;
+        font-size: 17px;
+        line-height: 1.4;
+      }
+
+      .closing {
+        display: grid;
+        grid-template-columns: 1fr;
+        align-items: center;
+        justify-items: center;
+        text-align: center;
+        gap: 30px;
+      }
+
+      .closing .headline {
+        max-width: 1180px;
+      }
+
+      .wipe {
+        position: absolute;
+        inset: 0;
+        background: #2563eb;
+        transform: translateX(-102%);
+        z-index: 50;
+        pointer-events: none;
+      }
+
+      .thin-rule {
+        height: 1px;
+        background: #d8dee4;
+        width: 100%;
+      }
+
+      .mono {
+        font-family: monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .screen-note {
+        color: #656d76;
+        font-size: 20px;
+        line-height: 1.45;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="44" data-width="1920" data-height="1080">
+      <section id="scene-1" class="scene active">
+        <div class="scene-content">
+          <div class="topline">
+            <div class="brand-lockup">
+              <div class="pulse-mark" aria-hidden="true">
+                <svg viewBox="0 0 64 64" fill="none">
+                  <path d="M10 33h10l6-18 12 34 7-16h9" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </div>
+              <div>
+                <div class="brand-name">PulseGuard</div>
+                <div class="brand-sub">探测控制台</div>
+              </div>
+            </div>
+            <div class="tag-row">
+              <span class="tag">本地</span>
+              <span class="tag">局域网</span>
+              <span class="tag blue">SQLite</span>
+            </div>
+          </div>
+          <div class="stage" style="grid-template-columns: 1fr 1.12fr; align-items: center">
+            <div>
+              <div class="headline">内网 UI/API 探活工作台</div>
+              <div class="subhead" style="margin-top: 28px">把任务维护、运行历史、失败证据、告警策略和只读状态统一放在一个单实例控制台。</div>
+              <div class="chip-row" style="margin-top: 34px">
+                <span class="tag blue">FastAPI</span>
+                <span class="tag blue">React</span>
+                <span class="tag blue">uv</span>
+                <span class="tag blue">Docker Compose</span>
+              </div>
+            </div>
+            <div class="dashboard-shell">
+              <div class="dashboard-grid">
+                <aside class="sidebar">
+                  <div class="nav-item active"><span class="status-dot"></span>总览</div>
+                  <div class="nav-item">UI 监控</div>
+                  <div class="nav-item">接口监控</div>
+                  <div class="nav-item">执行历史</div>
+                  <div class="nav-item">运维</div>
+                  <div class="nav-item">系统设置</div>
+                </aside>
+                <main class="main-area">
+                  <div class="metric-grid">
+                    <div class="metric-card"><div class="metric-label">启用任务</div><div class="metric-value">24</div></div>
+                    <div class="metric-card"><div class="metric-label">今日运行</div><div class="metric-value">318</div></div>
+                    <div class="metric-card"><div class="metric-label">失败任务</div><div class="metric-value">2</div></div>
+                    <div class="metric-card"><div class="metric-label">P95</div><div class="metric-value">842</div></div>
+                  </div>
+                  <div class="table-card">
+                    <div class="table-head"><div class="table-label">任务</div><div class="table-label">类型</div><div class="table-label">状态</div><div class="table-label">Runner</div><div class="table-label">最近运行</div></div>
+                    <div class="table-row"><div><div class="cell-title">后台首页</div><div class="cell-muted">admin, web</div></div><div class="tag">UI</div><div class="tag green">正常</div><div class="cell-muted">local-cn</div><div class="cell-muted mono">08:42</div></div>
+                    <div class="table-row"><div><div class="cell-title">订单健康接口</div><div class="cell-muted">api, core</div></div><div class="tag">API</div><div class="tag orange">失败</div><div class="cell-muted">lan-edge</div><div class="cell-muted mono">08:45</div></div>
+                    <div class="table-row"><div><div class="cell-title">备份心跳</div><div class="cell-muted">cron</div></div><div class="tag">API</div><div class="tag green">正常</div><div class="cell-muted">local-cn</div><div class="cell-muted mono">08:46</div></div>
+                  </div>
+                </main>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-2" class="scene">
+        <div class="scene-content">
+          <div class="topline">
+            <div>
+              <div class="headline" style="font-size: 66px">结构化规则优先</div>
+              <div class="subhead">UI 扫描候选、API 字段预览和前置脚本共同减少手写脚本成本。</div>
+            </div>
+            <span class="tag blue">Task Authoring</span>
+          </div>
+          <div class="stage layout-two">
+            <div class="panel-card">
+              <div class="panel-title">UI 元素扫描</div>
+              <div class="panel-subtitle">前置脚本先准备页面，再从候选元素生成稳定 selector。</div>
+              <div class="rule-list">
+                <div class="rule-row"><span class="rule-name">button: 保存</span><span class="tag green">高稳定</span></div>
+                <div class="rule-row"><span class="rule-name">role=main</span><span class="tag blue">结构</span></div>
+                <div class="rule-row"><span class="rule-name">text=订单状态</span><span class="tag orange">需确认</span></div>
+              </div>
+              <div class="code-line">async def setup(ctx): page = await ctx.new_page()</div>
+            </div>
+            <div class="panel-card">
+              <div class="panel-title">API 字段规则</div>
+              <div class="panel-subtitle">响应预览直接生成存在、类型、非空、长度等基础断言。</div>
+              <div class="rule-list">
+                <div class="rule-row"><span class="rule-name">$.data.items</span><span class="tag blue">长度 ≥ 1</span></div>
+                <div class="rule-row"><span class="rule-name">$.status</span><span class="tag green">等于 ok</span></div>
+                <div class="rule-row"><span class="rule-name">HTTP</span><span class="tag green">200</span></div>
+              </div>
+              <div class="code-line">结构化规则存在时，不强制编写高级脚本</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-3" class="scene">
+        <div class="scene-content">
+          <div class="topline">
+            <div>
+              <div class="headline" style="font-size: 66px">失败不是一条错误</div>
+              <div class="subhead">截图、Trace、Response Body、最近成功对比和失败摘要都在同一个运行详情里。</div>
+            </div>
+            <span class="tag orange">Failure Evidence</span>
+          </div>
+          <div class="stage evidence-grid">
+            <div class="detail-panel">
+              <div class="panel-title">运行记录 #1842</div>
+              <div class="chip-row">
+                <span class="tag orange">失败</span>
+                <span class="tag">目标失败</span>
+                <span class="tag">842 ms</span>
+              </div>
+              <div class="evidence-list">
+                <div class="evidence-card"><div class="evidence-icon">S</div><div><div class="cell-title">截图</div><div class="cell-muted">失败现场</div></div></div>
+                <div class="evidence-card"><div class="evidence-icon">T</div><div><div class="cell-title">Trace</div><div class="cell-muted">操作链路</div></div></div>
+                <div class="evidence-card"><div class="evidence-icon">R</div><div><div class="cell-title">Response</div><div class="cell-muted">响应归档</div></div></div>
+              </div>
+              <div class="screen-note">失败摘要会脱敏处理，不默认外传截图、Trace 或响应体。</div>
+            </div>
+            <div class="detail-panel">
+              <div class="panel-title">对比最近成功运行</div>
+              <div class="comparison-table">
+                <div class="compare-row"><div class="table-label">字段</div><div class="table-label">当前失败</div><div class="table-label">最近成功</div></div>
+                <div class="compare-row"><div>状态码</div><div class="tag orange">502</div><div class="tag green">200</div></div>
+                <div class="compare-row"><div>标题</div><div>错误网关</div><div>订单后台</div></div>
+                <div class="compare-row"><div>断言</div><div>2 条失败</div><div>全部通过</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-4" class="scene">
+        <div class="scene-content">
+          <div class="topline">
+            <div>
+              <div class="headline" style="font-size: 66px">执行面有边界</div>
+              <div class="subhead">全局并发、UI 浏览器并发和队列容量共同保护 Runner，不让 Chrome 进程无限扩张。</div>
+            </div>
+            <span class="tag blue">Runner Plane</span>
+          </div>
+          <div class="stage runner-stage">
+            <div class="queue-panel">
+              <div class="panel-title">队列与并发</div>
+              <div class="lane"><div class="job">UI-101</div><div class="job">API-64</div><div class="job">UI-102</div><div class="job">API-65</div></div>
+              <div class="slot-grid">
+                <div class="runner-card"><div class="small-label">全局并发</div><div class="metric-value">5</div><span class="tag green">running</span></div>
+                <div class="runner-card"><div class="small-label">UI 浏览器并发</div><div class="metric-value">2</div><span class="tag blue">capped</span></div>
+                <div class="runner-card"><div class="small-label">队列容量</div><div class="metric-value">50</div><span class="tag">bounded</span></div>
+                <div class="runner-card"><div class="small-label">超额提交</div><div class="metric-value">0</div><span class="tag orange">skipped</span></div>
+              </div>
+            </div>
+            <div class="runner-panel">
+              <div class="panel-title">Runner 可追溯</div>
+              <div class="table-card" style="flex: 0 0 auto">
+                <div class="table-head" style="grid-template-columns: 1.1fr 1fr 1fr 1fr"><div class="table-label">名称</div><div class="table-label">地址</div><div class="table-label">区域</div><div class="table-label">浏览器</div></div>
+                <div class="table-row" style="grid-template-columns: 1.1fr 1fr 1fr 1fr"><div>local-runner</div><div class="mono">127.0.0.1</div><div>办公室</div><div>Chromium</div></div>
+                <div class="table-row" style="grid-template-columns: 1.1fr 1fr 1fr 1fr"><div>lan-edge</div><div class="mono">10.8.0.12</div><div>内网边缘</div><div>Chromium</div></div>
+              </div>
+              <div class="screen-note">失败会区分目标失败与 Runner 环境失败，减少误判。</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-5" class="scene">
+        <div class="scene-content">
+          <div class="topline">
+            <div>
+              <div class="headline" style="font-size: 66px">告警按边界收敛</div>
+              <div class="subhead">全局、标签、任务三级覆盖，支持冷却、恢复通知和多通知渠道。</div>
+            </div>
+            <span class="tag blue">Alert Policy</span>
+          </div>
+          <div class="stage">
+            <div class="policy-stack">
+              <div class="policy-card">
+                <div class="policy-level">全局策略</div>
+                <div class="policy-line"><span>冷却</span><span class="mono">30m</span></div>
+                <div class="policy-line"><span>恢复通知</span><span>开启</span></div>
+                <div class="policy-line"><span>默认渠道</span><span>钉钉</span></div>
+              </div>
+              <div class="policy-card">
+                <div class="policy-level">标签策略</div>
+                <div class="policy-line"><span>core</span><span>10m</span></div>
+                <div class="policy-line"><span>admin</span><span>恢复通知</span></div>
+                <div class="policy-line"><span>nightly</span><span>静默</span></div>
+              </div>
+              <div class="policy-card">
+                <div class="policy-level">任务策略</div>
+                <div class="policy-line"><span>订单接口</span><span>优先级最高</span></div>
+                <div class="policy-line"><span>Webhook</span><span>已脱敏</span></div>
+                <div class="policy-line"><span>Secret</span><span>********</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-6" class="scene">
+        <div class="scene-content">
+          <div class="topline">
+            <div>
+              <div class="headline" style="font-size: 66px">运维面板集中治理</div>
+              <div class="subhead">审计事件、任务版本、归档摘要和配置迁移都进入可追踪的 ledger。</div>
+            </div>
+            <span class="tag blue">Operations</span>
+          </div>
+          <div class="stage ops-grid">
+            <div class="ledger-table">
+              <div class="ledger-row" style="background:#f1f4f7"><div class="table-label">时间</div><div class="table-label">动作</div><div class="table-label">对象</div><div class="table-label">状态</div></div>
+              <div class="ledger-row"><div class="mono">09:02</div><div><span class="tag blue">update</span></div><div>后台首页任务</div><div>已审计</div></div>
+              <div class="ledger-row"><div class="mono">09:08</div><div><span class="tag orange">restore</span></div><div>任务版本 #42</div><div>可恢复</div></div>
+              <div class="ledger-row"><div class="mono">09:20</div><div><span class="tag">archive</span></div><div>7d 失败摘要</div><div>已归档</div></div>
+              <div class="ledger-row"><div class="mono">09:31</div><div><span class="tag green">import</span></div><div>配置预检</div><div>通过</div></div>
+            </div>
+            <div class="version-stack">
+              <div class="version-card"><div><div class="cell-title">配置导出</div><div class="cell-muted">默认脱敏，可提交到 Git</div></div><span class="tag green">JSON</span></div>
+              <div class="version-card"><div><div class="cell-title">导入预检</div><div class="cell-muted">重名、缺失、覆盖先确认</div></div><span class="tag blue">preview</span></div>
+              <div class="version-card"><div><div class="cell-title">版本恢复</div><div class="cell-muted">任务更新前保留快照</div></div><span class="tag orange">restore</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-7" class="scene">
+        <div class="scene-content closing">
+          <div class="brand-lockup">
+            <div class="pulse-mark" aria-hidden="true">
+              <svg viewBox="0 0 64 64" fill="none">
+                <path d="M10 33h10l6-18 12 34 7-16h9" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </div>
+            <div>
+              <div class="brand-name">PulseGuard</div>
+              <div class="brand-sub">稳定、可复盘、可迁移</div>
+            </div>
+          </div>
+          <div class="headline">面向内网，也面向流水线</div>
+          <div class="endpoint-grid">
+            <div class="endpoint-card"><div class="endpoint-title">内网状态页</div><div class="endpoint-path">/api/status-page</div><span class="tag blue">脱敏展示</span></div>
+            <div class="endpoint-card"><div class="endpoint-title">JSON 指标</div><div class="endpoint-path">/api/metrics.json</div><span class="tag green">Grafana</span></div>
+            <div class="endpoint-card"><div class="endpoint-title">Prometheus</div><div class="endpoint-path">/api/metrics</div><span class="tag green">scrape</span></div>
+            <div class="endpoint-card"><div class="endpoint-title">CLI / CI</div><div class="endpoint-path">uv run python -m app.cli</div><span class="tag blue">exit code</span></div>
+          </div>
+        </div>
+      </section>
+
+      <div id="wipe" class="wipe"></div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+
+      const tl = gsap.timeline({ paused: true });
+      const scenes = ["#scene-1", "#scene-2", "#scene-3", "#scene-4", "#scene-5", "#scene-6", "#scene-7"];
+
+      function enterScene(selector, at) {
+        addFrom(selector + " .topline", { y: -28, opacity: 0, duration: 0.55, ease: "power3.out", overwrite: "auto" }, at + 0.2);
+        addFrom(selector + " .headline", { x: -42, opacity: 0, duration: 0.7, ease: "expo.out", overwrite: "auto" }, at + 0.35);
+        addFrom(selector + " .subhead", { y: 34, opacity: 0, duration: 0.55, ease: "power2.out", overwrite: "auto" }, at + 0.58);
+        addFrom(selector + " .tag", { y: 18, opacity: 0, duration: 0.38, ease: "sine.out", stagger: 0.035, overwrite: "auto" }, at + 0.72);
+        addFrom(selector + " .metric-card, " + selector + " .panel-card, " + selector + " .detail-panel, " + selector + " .queue-panel, " + selector + " .runner-panel, " + selector + " .policy-card, " + selector + " .ledger-table, " + selector + " .version-card, " + selector + " .endpoint-card, " + selector + " .dashboard-shell", { y: 42, opacity: 0, scale: 0.985, duration: 0.62, ease: "power4.out", stagger: 0.06, overwrite: "auto" }, at + 0.78);
+        addFrom(selector + " .table-row, " + selector + " .rule-row, " + selector + " .evidence-card, " + selector + " .compare-row, " + selector + " .runner-card, " + selector + " .policy-line, " + selector + " .ledger-row", { y: 22, opacity: 0, duration: 0.42, ease: "circ.out", stagger: 0.035, overwrite: "auto" }, at + 1.0);
+      }
+
+      function addFrom(selector, vars, at) {
+        if (document.querySelector(selector)) {
+          tl.from(selector, vars, at);
+        }
+      }
+
+      function transitionTo(nextSelector, at) {
+        tl.to("#wipe", { x: "0%", duration: 0.32, ease: "power2.inOut", overwrite: "auto" }, at);
+        tl.set(scenes, { opacity: 0 }, at + 0.33);
+        tl.set(nextSelector, { opacity: 1 }, at + 0.33);
+        tl.to("#wipe", { x: "102%", duration: 0.38, ease: "power3.inOut", overwrite: "auto" }, at + 0.34);
+        tl.set("#wipe", { x: "-102%" }, at + 0.74);
+      }
+
+      tl.set(["#scene-2", "#scene-3", "#scene-4", "#scene-5", "#scene-6", "#scene-7"], { opacity: 0 }, 0);
+      tl.set("#wipe", { x: "-102%" }, 0);
+
+      enterScene("#scene-1", 0);
+      transitionTo("#scene-2", 4.75);
+      enterScene("#scene-2", 5.05);
+      transitionTo("#scene-3", 10.75);
+      enterScene("#scene-3", 11.05);
+      transitionTo("#scene-4", 17.75);
+      enterScene("#scene-4", 18.05);
+      transitionTo("#scene-5", 24.75);
+      enterScene("#scene-5", 25.05);
+      transitionTo("#scene-6", 31.75);
+      enterScene("#scene-6", 32.05);
+      transitionTo("#scene-7", 37.75);
+      enterScene("#scene-7", 38.05);
+      tl.to("#scene-7 .closing", { opacity: 0, y: -24, duration: 0.7, ease: "power2.in" }, 43.1);
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>
