@@ -1359,6 +1359,15 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertIsNone(pending_verified)
         self.assertEqual(pending_after_expiry["status"], "expired")
 
+    def test_relay_token_verification_rejects_invalid_runner_id(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            verified = storage.verify_probe_runner_relay_token("../bad", "pgrl_secret", 1)
+
+        self.assertIsNone(verified)
+
     def test_runner_unavailable_notification_is_deduped_until_recovery(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
