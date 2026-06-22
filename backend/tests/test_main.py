@@ -644,7 +644,9 @@ class RunnerRouteTests(unittest.TestCase):
             "backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"
         ), patch(
             "backend.app.main.storage.regenerate_probe_runner_provision", return_value=runner
-        ), patch("backend.app.main.storage.record_audit_event"), patch(
+        ), patch("backend.app.main._revoke_relay_session") as revoke_relay_session, patch(
+            "backend.app.main.storage.record_audit_event"
+        ), patch(
             "backend.app.main.storage.get_settings", return_value={}
         ):
             response = TestClient(app).post(
@@ -663,6 +665,65 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(payload["deployment"]["compose_url"], "https://deploy.example.com/custom-relay-worker.yml")
         self.assertIn("https://deploy.example.com/custom-relay-worker.yml", payload["deployment"]["command"])
         self.assertNotIn("codex/github-publish", payload["deployment"]["command"])
+        revoke_relay_session.assert_called_once_with("edge-1", "deployment command regenerated")
+
+    def test_regenerate_runner_provision_succeeds_when_relay_control_is_unreachable(self) -> None:
+        runner = {
+            "runner_id": "edge-1",
+            "name": "Edge Runner",
+            "address": "http://pulseguard-relay:18001",
+            "network_region": "edge",
+            "status": "pending_deployment",
+            "enabled": True,
+            "role": "child",
+            "connection_mode": "relay",
+            "available": False,
+            "token_set": True,
+            "token_hint": "abc123",
+            "relay_token": "pgrl_rotated-token",
+            "worker_token": "pgrn_worker-token",
+            "relay_token_version": 2,
+            "deploy_command_expires_at": "2026-06-19T00:00:00+08:00",
+        }
+
+        class FailingClient:
+            def __enter__(self) -> "FailingClient":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def post(self, *args: object, **kwargs: object) -> object:
+                raise main_module.httpx.ConnectError("relay control down")
+
+        with patch("backend.app.main.RELAY_ENABLED", True), patch(
+            "backend.app.main.RELAY_CONTROL_URL", "http://pulseguard-relay:18000"
+        ), patch("backend.app.main.RELAY_PUBLIC_HOST", "203.0.113.10"), patch(
+            "backend.app.main.RELAY_PUBLIC_PORT", 9443
+        ), patch("backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"), patch(
+            "backend.app.main.relay_control_token", return_value="pgrc_secret"
+        ), patch(
+            "backend.app.main.httpx.Client", return_value=FailingClient()
+        ), patch(
+            "backend.app.main.storage.regenerate_probe_runner_provision", return_value=runner
+        ), patch(
+            "backend.app.main.storage.record_audit_event"
+        ) as record_audit_event, patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).post(
+                "/api/runners/edge-1/provision/regenerate",
+                json={
+                    "name": "Edge Runner",
+                    "network_region": "edge",
+                    "target_platform": "linux",
+                    "compose_url": "https://deploy.example.com/custom-relay-worker.yml",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["relay_token_version"], 2)
+        self.assertEqual(record_audit_event.call_args.args[5], {"relay_control_revoked": False})
 
     def test_update_child_runner_normalizes_bare_address(self) -> None:
         current = {"runner_id": "office-1", "name": "Office Runner", "role": "child"}
@@ -709,6 +770,59 @@ class RunnerRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(update_probe_runner.call_args.args[1]["address"], "127.0.0.1")
+
+    def test_disabling_relay_runner_revokes_session(self) -> None:
+        current = {"runner_id": "edge-1", "name": "Edge Runner", "role": "child", "connection_mode": "relay"}
+        updated = {
+            "runner_id": "edge-1",
+            "name": "Edge Runner",
+            "address": "http://pulseguard-relay:18001",
+            "network_region": "edge",
+            "role": "child",
+            "connection_mode": "relay",
+            "enabled": False,
+        }
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=current), patch(
+            "backend.app.main.storage.update_probe_runner", return_value=updated
+        ), patch("backend.app.main._revoke_relay_session") as revoke_relay_session, patch(
+            "backend.app.main.storage.record_audit_event"
+        ), patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).put(
+                "/api/runners/edge-1",
+                json={"name": "Edge Runner", "address": "http://pulseguard-relay:18001", "network_region": "edge", "enabled": False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        revoke_relay_session.assert_called_once_with("edge-1", "runner disabled")
+
+    def test_delete_relay_runner_deletes_before_best_effort_revoke(self) -> None:
+        current = {"runner_id": "edge-1", "name": "Edge Runner", "role": "child", "connection_mode": "relay"}
+        calls: list[str] = []
+
+        def delete_probe_runner_side_effect(runner_id: str) -> bool:
+            calls.append(f"delete:{runner_id}")
+            return True
+
+        def revoke_relay_session_side_effect(runner_id: str, reason: str) -> bool:
+            calls.append(f"revoke:{runner_id}:{reason}")
+            return False
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=current), patch(
+            "backend.app.main._revoke_relay_session", side_effect=revoke_relay_session_side_effect
+        ) as revoke_relay_session, patch(
+            "backend.app.main.storage.delete_probe_runner", side_effect=delete_probe_runner_side_effect
+        ) as delete_probe_runner, patch(
+            "backend.app.main.storage.record_audit_event"
+        ):
+            response = TestClient(app).delete("/api/runners/edge-1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, ["delete:edge-1", "revoke:edge-1:runner deleted"])
+        revoke_relay_session.assert_called_once_with("edge-1", "runner deleted")
+        delete_probe_runner.assert_called_once_with("edge-1")
 
     def test_rotate_runner_token_returns_new_one_time_token_response(self) -> None:
         runner = {

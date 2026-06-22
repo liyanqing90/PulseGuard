@@ -35,11 +35,18 @@ async def pump_reader_to_sender(
     reader: asyncio.StreamReader,
     send_json: JsonSender,
     max_bytes: int | None = None,
+    idle_timeout_seconds: float | None = None,
 ) -> None:
     sent_bytes = 0
     try:
         while True:
-            chunk = await reader.read(65536)
+            if idle_timeout_seconds is None:
+                chunk = await reader.read(65536)
+            else:
+                try:
+                    chunk = await asyncio.wait_for(reader.read(65536), timeout=idle_timeout_seconds)
+                except TimeoutError:
+                    break
             if not chunk:
                 break
             sent_bytes += len(chunk)

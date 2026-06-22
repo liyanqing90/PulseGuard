@@ -18,6 +18,12 @@ class FakeReader:
         return self.chunks.pop(0)
 
 
+class SlowReader:
+    async def read(self, _size: int) -> bytes:
+        await asyncio.sleep(1)
+        return b"late"
+
+
 class FakeWriter:
     def close(self) -> None:
         pass
@@ -37,6 +43,16 @@ class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([message["type"] for message in sent], ["data", "close"])
         self.assertEqual(base64.b64decode(str(sent[0]["data"])), b"abc")
+
+    async def test_pump_reader_to_sender_closes_idle_stream(self) -> None:
+        sent: list[dict[str, object]] = []
+
+        async def send_json(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        await pump_reader_to_sender("stream-1", SlowReader(), send_json, idle_timeout_seconds=0.01)  # type: ignore[arg-type]
+
+        self.assertEqual(sent, [{"type": "close", "stream_id": "stream-1"}])
 
     async def test_tunnel_stream_caps_cumulative_received_bytes(self) -> None:
         stream = TunnelStream(reader=FakeReader([]), writer=FakeWriter())  # type: ignore[arg-type]

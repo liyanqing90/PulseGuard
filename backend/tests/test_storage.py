@@ -1053,8 +1053,18 @@ class RunnerStorageTests(unittest.TestCase):
             )
             public = storage.get_probe_runner("edge-1")
             listed = next(runner for runner in storage.list_probe_runners() if runner["runner_id"] == "edge-1")
+            with storage._connect() as conn:
+                raw_token_value = conn.execute(
+                    "SELECT token_value FROM probe_runners WHERE runner_id = ?",
+                    ("edge-1",),
+                ).fetchone()["token_value"]
             verified = storage.verify_probe_runner_token("edge-1", "runner-secret-1")
             rotated = storage.rotate_probe_runner_token("edge-1")
+            with storage._connect() as conn:
+                rotated_token_value = conn.execute(
+                    "SELECT token_value FROM probe_runners WHERE runner_id = ?",
+                    ("edge-1",),
+                ).fetchone()["token_value"]
             old_verified = storage.verify_probe_runner_token("edge-1", "runner-secret-1")
             new_verified = storage.verify_probe_runner_token("edge-1", str(rotated["token"]))
 
@@ -1064,11 +1074,64 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertNotIn("token_value", public)
         self.assertTrue(public["token_set"])
         self.assertEqual(public["token_hint"], "cret-1")
+        self.assertTrue(str(raw_token_value).startswith(storage.ENCRYPTED_RUNNER_TOKEN_PREFIX))
+        self.assertNotIn("runner-secret-1", str(raw_token_value))
+        self.assertTrue(str(rotated_token_value).startswith(storage.ENCRYPTED_RUNNER_TOKEN_PREFIX))
+        self.assertNotIn(str(rotated["token"]), str(rotated_token_value))
         self.assertNotIn("token", listed)
         self.assertIsNotNone(verified)
         self.assertIsNone(old_verified)
         self.assertIsNotNone(new_verified)
         self.assertNotEqual(rotated["token"], "runner-secret-1")
+
+    def test_init_db_migrates_legacy_plaintext_runner_token(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            with storage._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO probe_runners (
+                        runner_id, name, address, network_region, status,
+                        metadata_json, enabled, role, token_value, token_hash, token_hint,
+                        connection_mode, created_at, last_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-1",
+                        "Legacy Runner",
+                        "http://10.0.0.10:8788",
+                        "edge",
+                        "ok",
+                        "{}",
+                        1,
+                        "child",
+                        "pgrn_legacy-token-1234567890",
+                        "",
+                        "",
+                        "manual",
+                        storage.now_iso(),
+                        storage.now_iso(),
+                        storage.now_iso(),
+                    ),
+                )
+
+            storage.init_db()
+            with storage._connect() as conn:
+                raw_token_value = conn.execute(
+                    "SELECT token_value, token_hash, token_hint FROM probe_runners WHERE runner_id = ?",
+                    ("legacy-1",),
+                ).fetchone()
+            token = storage.get_probe_runner_token("legacy-1")
+            verified = storage.verify_probe_runner_token("legacy-1", "pgrn_legacy-token-1234567890")
+
+        self.assertEqual(token, "pgrn_legacy-token-1234567890")
+        self.assertTrue(str(raw_token_value["token_value"]).startswith(storage.ENCRYPTED_RUNNER_TOKEN_PREFIX))
+        self.assertNotIn("pgrn_legacy-token-1234567890", str(raw_token_value["token_value"]))
+        self.assertEqual(raw_token_value["token_hash"], storage.runner_token_hash("pgrn_legacy-token-1234567890"))
+        self.assertEqual(raw_token_value["token_hint"], "567890")
+        self.assertIsNotNone(verified)
 
     def test_relay_provisioning_requires_session_and_worker_health_before_scheduling(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -1094,6 +1157,48 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertTrue(storage.can_schedule_runner(healthy))
         self.assertEqual(healthy["address"], "http://pulseguard-relay:19001")
 
+    def test_relay_available_status_is_derived_from_fresh_heartbeat_and_health(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            first = storage.provision_probe_runner({"name": "Relay One", "network_region": "edge"})
+            first_id = str(first["runner_id"])
+            storage.mark_probe_runner_relay_connected(first_id)
+            storage.mark_probe_runner_available(first_id, {"status": "ok"})
+            stale_relay_seen_at = (
+                datetime.now().astimezone() - timedelta(seconds=storage.RELAY_HEARTBEAT_TIMEOUT_SECONDS + 1)
+            ).isoformat(timespec="seconds")
+            with storage._connect() as conn:
+                conn.execute(
+                    "UPDATE probe_runners SET relay_last_seen_at = ? WHERE runner_id = ?",
+                    (stale_relay_seen_at, first_id),
+                )
+            relay_stale = storage.get_probe_runner(first_id)
+
+            second = storage.provision_probe_runner({"name": "Relay Two", "network_region": "edge"})
+            second_id = str(second["runner_id"])
+            storage.mark_probe_runner_relay_connected(second_id)
+            storage.mark_probe_runner_available(second_id, {"status": "ok"})
+            stale_worker_health_at = (
+                datetime.now().astimezone() - timedelta(seconds=storage.RUNNER_HEARTBEAT_TIMEOUT_SECONDS + 1)
+            ).isoformat(timespec="seconds")
+            with storage._connect() as conn:
+                conn.execute(
+                    "UPDATE probe_runners SET worker_health_last_success_at = ? WHERE runner_id = ?",
+                    (stale_worker_health_at, second_id),
+                )
+            health_stale = storage.get_probe_runner(second_id)
+
+        self.assertEqual(relay_stale["status"], "unavailable")
+        self.assertFalse(relay_stale["available"])
+        self.assertFalse(storage.can_schedule_runner(relay_stale))
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(relay_stale))
+        self.assertEqual(health_stale["status"], "unhealthy")
+        self.assertFalse(health_stale["available"])
+        self.assertFalse(storage.can_schedule_runner(health_stale))
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(health_stale))
+
     def test_relay_regenerate_invalidates_old_relay_token_without_rotating_worker_token(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -1104,6 +1209,11 @@ class RunnerStorageTests(unittest.TestCase):
             old_relay_token = provisioned["relay_token"]
             old_worker_token = provisioned["worker_token"]
             old_version = int(provisioned["relay_token_version"])
+            with storage._connect() as conn:
+                raw_worker_token_value = conn.execute(
+                    "SELECT token_value FROM probe_runners WHERE runner_id = ?",
+                    (runner_id,),
+                ).fetchone()["token_value"]
             regenerated = storage.regenerate_probe_runner_provision(runner_id)
             old_verified = storage.verify_probe_runner_relay_token(runner_id, old_relay_token, old_version)
             new_verified = storage.verify_probe_runner_relay_token(
@@ -1114,8 +1224,71 @@ class RunnerStorageTests(unittest.TestCase):
 
         self.assertIsNone(old_verified)
         self.assertIsNotNone(new_verified)
+        self.assertTrue(str(raw_worker_token_value).startswith(storage.ENCRYPTED_RUNNER_TOKEN_PREFIX))
+        self.assertNotIn(old_worker_token, str(raw_worker_token_value))
         self.assertEqual(regenerated["worker_token"], old_worker_token)
         self.assertEqual(int(regenerated["relay_token_version"]), old_version + 1)
+
+    def test_deleted_relay_runner_port_is_quarantined_until_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "RELAY_INTERNAL_PORT_START", 19001), patch.object(
+            storage, "RELAY_INTERNAL_PORT_END", 19002
+        ), patch.object(storage, "RELAY_PORT_QUARANTINE_SECONDS", 960):
+            storage.init_db()
+            first = storage.provision_probe_runner({"name": "Relay One", "network_region": "edge"})
+            self.assertTrue(storage.delete_probe_runner(str(first["runner_id"])))
+            second = storage.provision_probe_runner({"name": "Relay Two", "network_region": "edge"})
+
+            with storage._connect() as conn:
+                quarantined = conn.execute("SELECT port FROM relay_port_quarantine ORDER BY port").fetchall()
+                old_released_at = (datetime.now().astimezone() - timedelta(seconds=961)).isoformat(timespec="seconds")
+                conn.execute(
+                    "UPDATE relay_port_quarantine SET released_at = ? WHERE port = ?",
+                    (old_released_at, int(first["allocated_internal_port"])),
+                )
+
+            third = storage.provision_probe_runner({"name": "Relay Three", "network_region": "edge"})
+
+        self.assertEqual(int(first["allocated_internal_port"]), 19001)
+        self.assertEqual([int(row["port"]) for row in quarantined], [19001])
+        self.assertEqual(int(second["allocated_internal_port"]), 19002)
+        self.assertEqual(int(third["allocated_internal_port"]), 19001)
+
+    def test_disabled_relay_runner_cannot_authenticate_relay_session(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            relay_token = str(provisioned["relay_token"])
+            version = int(provisioned["relay_token_version"])
+            before_disable = storage.verify_probe_runner_relay_token(runner_id, relay_token, version)
+            storage.update_probe_runner(runner_id, {"enabled": False})
+            after_disable = storage.verify_probe_runner_relay_token(runner_id, relay_token, version)
+
+        self.assertIsNotNone(before_disable)
+        self.assertIsNone(after_disable)
+
+    def test_relay_restart_invalidates_available_runner_for_scheduling(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            storage.mark_probe_runner_relay_connected(runner_id)
+            healthy = storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+            changed = storage.mark_relay_runners_restarted()
+            restarted = storage.get_probe_runner(runner_id)
+
+        self.assertTrue(storage.can_schedule_runner(healthy))
+        self.assertGreaterEqual(changed, 1)
+        self.assertEqual(restarted["status"], "unavailable")
+        self.assertIsNone(restarted["relay_last_seen_at"])
+        self.assertEqual(restarted["last_disconnect_reason"], "relay server restarted")
+        self.assertFalse(storage.can_schedule_runner(restarted))
 
     def test_relay_regeneration_keeps_old_session_failures_pre_activation(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -1135,6 +1308,21 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(auth_failed["status"], "pending_deployment")
         self.assertFalse(storage.should_notify_probe_runner_unavailable(disconnected or {}))
         self.assertFalse(storage.should_notify_probe_runner_unavailable(auth_failed or {}))
+
+    def test_relay_auth_failed_after_availability_is_alertable(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = str(provisioned["runner_id"])
+            storage.mark_probe_runner_relay_connected(runner_id)
+            storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+            auth_failed = storage.mark_probe_runner_relay_auth_failed(runner_id)
+
+        self.assertEqual(auth_failed["status"], "auth_failed")
+        self.assertFalse(auth_failed["available"])
+        self.assertTrue(storage.should_notify_probe_runner_unavailable(auth_failed or {}))
 
     def test_relay_deploy_command_expiry_only_blocks_pre_activation_sessions(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(

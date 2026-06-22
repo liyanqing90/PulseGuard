@@ -56,6 +56,64 @@ print(json.dumps({"first": first, "source": source, "stored": stored}))
         self.assertEqual(first_payload["source"], second_payload["source"])
         self.assertEqual(first_payload["first"], second_payload["first"])
 
+    def test_relay_control_token_file_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            script = """
+import json
+import os
+from pathlib import Path
+os.environ.pop("PULSEGUARD_RELAY_CONTROL_TOKEN", None)
+os.environ["PULSEGUARD_RELAY_CONTROL_TOKEN_FILE"] = r"%s"
+from backend.app import config
+first = config.relay_control_token()
+second = config.relay_control_token()
+stored = Path(os.environ["PULSEGUARD_RELAY_CONTROL_TOKEN_FILE"]).read_text(encoding="utf-8").strip()
+print(json.dumps({"first": first, "second": second, "stored": stored}))
+""" % ((temp_dir + "/relay-control-token").replace("\\", "\\\\"))
+            output = subprocess.check_output([sys.executable, "-c", script], text=True)
+
+        payload = json.loads(output)
+        self.assertTrue(payload["first"].startswith("pgrc_"))
+        self.assertEqual(payload["first"], payload["second"])
+        self.assertEqual(payload["first"], payload["stored"])
+
+    def test_relay_port_quarantine_default_exceeds_stream_idle_timeout(self) -> None:
+        script = """
+import json
+import os
+os.environ["PULSEGUARD_RELAY_STREAM_IDLE_TIMEOUT_SECONDS"] = "900"
+os.environ.pop("PULSEGUARD_RELAY_PORT_QUARANTINE_SECONDS", None)
+from backend.app import config
+print(json.dumps({
+    "stream_idle": config.RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
+    "port_quarantine": config.RELAY_PORT_QUARANTINE_SECONDS,
+}))
+"""
+        output = subprocess.check_output([sys.executable, "-c", script], text=True)
+        payload = json.loads(output)
+
+        self.assertEqual(payload["stream_idle"], 900)
+        self.assertEqual(payload["port_quarantine"], 960)
+        self.assertGreater(payload["port_quarantine"], payload["stream_idle"])
+
+    def test_relay_port_quarantine_env_can_extend_default(self) -> None:
+        script = """
+import json
+import os
+os.environ["PULSEGUARD_RELAY_STREAM_IDLE_TIMEOUT_SECONDS"] = "900"
+os.environ["PULSEGUARD_RELAY_PORT_QUARANTINE_SECONDS"] = "1200"
+from backend.app import config
+print(json.dumps({
+    "stream_idle": config.RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
+    "port_quarantine": config.RELAY_PORT_QUARANTINE_SECONDS,
+}))
+"""
+        output = subprocess.check_output([sys.executable, "-c", script], text=True)
+        payload = json.loads(output)
+
+        self.assertEqual(payload["stream_idle"], 900)
+        self.assertEqual(payload["port_quarantine"], 1200)
+
     def test_worker_cli_can_show_and_rotate_persisted_token_file(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             token_file = f"{temp_dir}/worker-token"

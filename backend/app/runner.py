@@ -841,9 +841,9 @@ class CheckRunner:
             index = storage.next_runner_cursor(f"check:{int(check.get('id') or 0)}", len(candidates))
             return [candidates[index]]
         runners = storage.list_probe_runners_by_ids(check.get("runner_ids") or [storage.LOCAL_RUNNER_ID])
-        enabled = [runner for runner in runners if runner.get("enabled")]
-        if enabled:
-            return enabled
+        schedulable = [runner for runner in runners if storage.can_schedule_runner(runner)]
+        if schedulable:
+            return schedulable
         if runners:
             return runners
         local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())

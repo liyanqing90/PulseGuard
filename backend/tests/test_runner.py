@@ -637,6 +637,27 @@ class RunnerQueueTests(unittest.TestCase):
 
 
 class DistributedRunnerTests(unittest.TestCase):
+    def test_selected_parallel_uses_only_schedulable_runners_when_any_exist(self) -> None:
+        check = {
+            "id": 40,
+            "name": "Selected relay runners",
+            "type": "api",
+            "runner_selection_mode": "selected_parallel",
+            "runner_ids": ["edge-pending", "edge-ready"],
+        }
+        runners = [
+            {"runner_id": "edge-pending", "enabled": True, "available": False, "status": "connecting"},
+            {"runner_id": "edge-ready", "enabled": True, "available": True, "status": "available"},
+        ]
+
+        with patch("backend.app.runner.storage.list_probe_runners_by_ids", return_value=runners), patch(
+            "backend.app.runner.storage.can_schedule_runner",
+            side_effect=lambda runner: bool(runner.get("available")),
+        ):
+            selected = CheckRunner()._resolve_check_runners(check)
+
+        self.assertEqual([runner["runner_id"] for runner in selected], ["edge-ready"])
+
     def test_ui_browser_targets_expand_per_runner_and_browser_type(self) -> None:
         check = {
             "id": 41,

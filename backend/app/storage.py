@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import secrets
 import hashlib
 import sqlite3
 import threading
+import time as time_module
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Any
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from .artifacts import cleanup_old_artifacts
 from .browser_types import (
@@ -28,6 +33,7 @@ from .config import (
     RELAY_INTERNAL_HOST,
     RELAY_INTERNAL_PORT_END,
     RELAY_INTERNAL_PORT_START,
+    RELAY_PORT_QUARANTINE_SECONDS,
     TREND_BACKFILL_ON_STARTUP,
     ensure_runtime_dirs,
 )
@@ -47,7 +53,7 @@ DEPLOYMENT_STATE_KEY = "deployment_window"
 RUNNER_CONNECTION_MODES = {"manual", "relay"}
 RELAY_PRE_ACTIVATION_STATUSES = {"pending_deployment", "expired", "connecting"}
 RELAY_HEARTBEAT_TIMEOUT_SECONDS = 60
-RELAY_PORT_QUARANTINE_SECONDS = 10 * 60
+ENCRYPTED_RUNNER_TOKEN_PREFIX = "fernet:"
 RUN_SUMMARY_COLUMNS = (
     "id",
     "check_id",
@@ -1069,7 +1075,7 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
                 json.dumps(metadata, ensure_ascii=False),
                 1 if data.get("enabled", True) else 0,
                 _normalize_runner_role(data.get("role") or "child"),
-                token,
+                _store_runner_token(token),
                 runner_token_hash(token) if token else "",
                 _token_hint(token),
                 timestamp,
@@ -1116,7 +1122,7 @@ def provision_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
                 json.dumps(metadata, ensure_ascii=False),
                 1 if data.get("enabled", True) else 0,
                 "child",
-                worker_token,
+                _store_runner_token(worker_token),
                 runner_token_hash(worker_token),
                 _token_hint(worker_token),
                 "relay",
@@ -1186,7 +1192,7 @@ def update_probe_runner(runner_id: str, data: dict[str, Any]) -> dict[str, Any] 
         token = str(data.get("token") or "").strip()
         if token:
             assignments.extend(["token_value = ?", "token_hash = ?", "token_hint = ?"])
-            params.extend([token, runner_token_hash(token), _token_hint(token)])
+            params.extend([_store_runner_token(token), runner_token_hash(token), _token_hint(token)])
         params.append(runner_id)
         cursor = conn.execute(
             f"""
@@ -1287,7 +1293,7 @@ def rotate_probe_runner_token(runner_id: str) -> dict[str, Any] | None:
             SET token_value = ?, token_hash = ?, token_hint = ?, updated_at = ?
             WHERE runner_id = ?
             """,
-            (token, runner_token_hash(token), _token_hint(token), timestamp, runner_id),
+            (_store_runner_token(token), runner_token_hash(token), _token_hint(token), timestamp, runner_id),
         )
         if cursor.rowcount == 0:
             return None
@@ -1381,6 +1387,66 @@ def relay_token_hash(token: str) -> str:
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
+def _runner_token_key_file() -> Path:
+    return Path(os.getenv("PULSEGUARD_RUNNER_TOKEN_KEY_FILE", Path(DB_PATH).parent / "runner-token.key")).resolve()
+
+
+def _runner_token_key() -> bytes:
+    env_key = os.getenv("PULSEGUARD_RUNNER_TOKEN_ENCRYPTION_KEY", "").strip()
+    if env_key:
+        key = env_key.encode("utf-8")
+        Fernet(key)
+        return key
+
+    key_file = _runner_token_key_file()
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    if key_file.exists():
+        key = key_file.read_text(encoding="utf-8").strip().encode("utf-8")
+        Fernet(key)
+        return key
+
+    key = Fernet.generate_key()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(key_file, flags, 0o600)
+    except FileExistsError:
+        for _ in range(50):
+            stored = key_file.read_text(encoding="utf-8").strip()
+            if stored:
+                key = stored.encode("utf-8")
+                Fernet(key)
+                return key
+            time_module.sleep(0.02)
+        raise RuntimeError("runner token encryption key file is empty")
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(key.decode("utf-8") + "\n")
+    return key
+
+
+def _runner_token_cipher() -> Fernet:
+    return Fernet(_runner_token_key())
+
+
+def _store_runner_token(token: str) -> str:
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    return ENCRYPTED_RUNNER_TOKEN_PREFIX + _runner_token_cipher().encrypt(token.encode("utf-8")).decode("utf-8")
+
+
+def _load_runner_token(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if not value.startswith(ENCRYPTED_RUNNER_TOKEN_PREFIX):
+        return value
+    encrypted = value[len(ENCRYPTED_RUNNER_TOKEN_PREFIX) :].encode("utf-8")
+    try:
+        return _runner_token_cipher().decrypt(encrypted).decode("utf-8")
+    except InvalidToken as exc:
+        raise RuntimeError("runner token encryption key cannot decrypt stored token") from exc
+
+
 def verify_probe_runner_token(runner_id: str, token: str) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     token = str(token or "").strip()
@@ -1403,7 +1469,7 @@ def get_probe_runner_token(runner_id: str) -> str:
     runner_id = _normalize_runner_id(runner_id)
     with _LOCK, _connect() as conn:
         row = conn.execute("SELECT token_value FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
-    return str(row["token_value"] or "") if row else ""
+    return _load_runner_token(str(row["token_value"] or "")) if row else ""
 
 
 def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) -> dict[str, Any] | None:
@@ -1419,6 +1485,8 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
     expected_hash = str(row["relay_token_hash"] or "")
     expected_version = int(row["relay_token_version"] or 0)
     if str(row["connection_mode"] or "") != "relay":
+        return None
+    if not int(row["enabled"] or 0):
         return None
     if int(version or 0) != expected_version:
         return None
@@ -1499,6 +1567,33 @@ def mark_probe_runner_relay_disconnected(runner_id: str, reason: str = "") -> di
         if cursor.rowcount == 0:
             return None
     return get_probe_runner(runner_id)
+
+
+def mark_relay_runners_restarted(reason: str = "relay server restarted") -> int:
+    timestamp = now_iso()
+    pre_activation = tuple(RELAY_PRE_ACTIVATION_STATUSES)
+    placeholders = ", ".join("?" for _ in pre_activation)
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            f"""
+            UPDATE probe_runners
+            SET status = CASE
+                    WHEN status IN ({placeholders}) THEN status
+                    WHEN was_available = 1 THEN 'unavailable'
+                    ELSE 'connecting'
+                END,
+                relay_last_seen_at = NULL,
+                last_disconnect_reason = ?,
+                unavailable_since = CASE
+                    WHEN status NOT IN ({placeholders}) AND was_available = 1 THEN COALESCE(unavailable_since, ?)
+                    ELSE unavailable_since
+                END,
+                updated_at = ?
+            WHERE connection_mode = 'relay'
+            """,
+            (*pre_activation, str(reason or "")[:500], *pre_activation, timestamp, timestamp),
+        )
+        return cursor.rowcount
 
 
 def mark_probe_runner_relay_auth_failed(runner_id: str) -> dict[str, Any] | None:
@@ -3047,6 +3142,7 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
         "UPDATE probe_runners SET created_at = COALESCE(NULLIF(created_at, ''), updated_at, last_seen_at, ?) WHERE created_at = ''",
         (timestamp,),
     )
+    _migrate_plaintext_runner_tokens(conn)
 
 
 def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
@@ -3137,6 +3233,31 @@ def _migrate_read_only_tokens(conn: sqlite3.Connection) -> None:
             ("read_only_token", json.dumps("", ensure_ascii=False), timestamp),
         )
     conn.execute("DELETE FROM settings WHERE key = 'read_only_token_name'")
+
+
+def _migrate_plaintext_runner_tokens(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT runner_id, token_value, token_hash
+        FROM probe_runners
+        WHERE token_value != ''
+        """
+    ).fetchall()
+    for row in rows:
+        token = str(row["token_value"] or "").strip()
+        if not token or token.startswith(ENCRYPTED_RUNNER_TOKEN_PREFIX):
+            continue
+        token_hash = str(row["token_hash"] or "").strip() or runner_token_hash(token)
+        conn.execute(
+            """
+            UPDATE probe_runners
+            SET token_value = ?,
+                token_hash = ?,
+                token_hint = ?
+            WHERE runner_id = ?
+            """,
+            (_store_runner_token(token), token_hash, _token_hint(token), row["runner_id"]),
+        )
 
 
 def _read_setting_value(conn: sqlite3.Connection, key: str) -> Any:
@@ -3370,17 +3491,31 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     data["was_available"] = bool(data.get("was_available"))
     data["token_set"] = bool(data.get("token_hash"))
     data["relay_token_set"] = bool(data.get("relay_token_hash"))
-    data["available"] = _runner_available(data)
     if not data["enabled"]:
         data["status"] = "disabled"
-    elif data["connection_mode"] == "relay" and data["status"] in RELAY_PRE_ACTIVATION_STATUSES:
-        data["available"] = False
+    elif data["connection_mode"] == "relay":
+        data["status"] = _derive_relay_runner_status(data)
+    data["available"] = _runner_available(data)
     data.pop("token_value", None)
     data.pop("token_hash", None)
     data.pop("installed_browser_types_json", None)
     data.pop("available_browser_types_json", None)
     data.pop("relay_token_hash", None)
     return data
+
+
+def _derive_relay_runner_status(data: dict[str, Any]) -> str:
+    status = str(data.get("status") or "")
+    if status in RELAY_PRE_ACTIVATION_STATUSES:
+        return status
+    if status == "available":
+        relay_fresh = _timestamp_is_fresh(data.get("relay_last_seen_at"), RELAY_HEARTBEAT_TIMEOUT_SECONDS)
+        health_fresh = _timestamp_is_fresh(data.get("worker_health_last_success_at"), RUNNER_HEARTBEAT_TIMEOUT_SECONDS)
+        if not relay_fresh:
+            return "unavailable" if data.get("was_available") else "connecting"
+        if not health_fresh:
+            return "unhealthy" if data.get("was_available") else "connecting"
+    return status
 
 
 def _normalize_runner_id(value: Any) -> str:

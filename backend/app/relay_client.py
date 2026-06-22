@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 import websockets
 
-from .config import RELAY_MAX_BODY_BYTES
+from .config import RELAY_MAX_BODY_BYTES, RELAY_MAX_FRAME_BYTES
 from .relay_tunnel import TunnelStream, decode_data_message, insecure_fingerprint_context, json_dumps, json_loads, pump_reader_to_sender
 
 
@@ -77,7 +77,12 @@ async def run_once() -> None:
         raise RuntimeError("PULSEGUARD_RELAY_URL, PULSEGUARD_RUNNER_ID, and PULSEGUARD_RELAY_TOKEN are required")
     send_lock = asyncio.Lock()
     streams: dict[str, TunnelStream] = {}
-    async with websockets.connect(relay_url, ssl=insecure_fingerprint_context(), max_size=None) as websocket:
+    async with websockets.connect(
+        relay_url,
+        ssl=insecure_fingerprint_context(),
+        max_size=RELAY_MAX_FRAME_BYTES,
+        compression=None,
+    ) as websocket:
         _assert_fingerprint(websocket, fingerprint)
         await _send_json(
             websocket,

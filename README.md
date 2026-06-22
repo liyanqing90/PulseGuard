@@ -141,7 +141,17 @@ export PULSEGUARD_RELAY_PUBLIC_PORT=443
 docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
 ```
 
-主节点会在 `data/relay/` 下生成自签 TLS 证书，页面和 API 会显示 server fingerprint。worker 侧 relay-client 会校验 fingerprint 后才发送 relay token。
+主节点会在 `data/relay/` 下生成自签 TLS 证书，页面和 API 会显示 server fingerprint。worker 侧 relay-client 会校验 fingerprint 后才发送 relay token。已有 relay runner 时如果证书或私钥丢失，服务会拒绝静默重建证书；需要从备份恢复 `data/relay/`，否则已部署 worker 的 fingerprint pinning 会失效。
+
+主节点数据库只保存 relay token hash；relay token 是完整隧道接入凭据，部署命令必须按敏感信息处理。worker token 因主节点调用 worker API 时必须使用，会用 `cryptography` Fernet 加密后保存到数据库。默认加密 key 文件是主节点数据目录下的 `runner-token.key`，可用 `PULSEGUARD_RUNNER_TOKEN_KEY_FILE` 指定路径，或用 `PULSEGUARD_RUNNER_TOKEN_ENCRYPTION_KEY` 注入 Fernet key。备份或迁移主节点时必须同时保管该 key，否则已有 worker token 无法解密。
+
+Relay 控制面默认使用 Docker 内部地址 `http://pulseguard-relay-internal:18000`，只用于主节点通知 relay server 踢掉旧 session。控制 token 保存在 `data/relay/control-token`，不会写入部署命令；`18000` 只在 Docker 网络内 `expose`，不要映射到公网。重新生成命令、停用或删除 runner 时，数据库中的 token/runner 状态先立即失效；控制面 revoke 是加速旧 session 断开的内部通知，短暂不可达不会阻止数据库失效和端口 quarantine。
+
+Docker relay overlay 会额外创建 internal-only 网络。主节点默认通过 `pulseguard-relay-internal` 访问 relay 内部端口，relay server 也默认只把 per-runner 内部 listener 绑定到这个 internal alias；如需改动，成对设置 `PULSEGUARD_RELAY_INTERNAL_HOST` 和 `PULSEGUARD_RELAY_INTERNAL_LISTEN_HOST`。
+
+Relay v1 默认每个 worker session 只转发 1 条并发内部 TCP stream，避免在完整 backpressure 协议前放开无界多路复用。可用 `PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS` 调整；空闲 stream 默认 900 秒关闭，可用 `PULSEGUARD_RELAY_STREAM_IDLE_TIMEOUT_SECONDS` 调整。已删除 runner 的内部端口默认至少 quarantine 到 `stream idle timeout + 60s`，并且不少于 10 分钟；可用 `PULSEGUARD_RELAY_PORT_QUARANTINE_SECONDS` 延长。
+
+公网 relay 入口默认限制 256 条 WebSocket 连接，worker 必须在 10 秒内发送 hello；单条 WebSocket message 默认上限 1 MiB，server 侧禁用 WebSocket 压缩，并对重复无效认证做短退避。建立 session 后如果超过 relay heartbeat 窗口没有任何消息，server 会主动关闭 session。可用 `PULSEGUARD_RELAY_MAX_PUBLIC_CONNECTIONS`、`PULSEGUARD_RELAY_HELLO_TIMEOUT_SECONDS`、`PULSEGUARD_RELAY_MAX_FRAME_BYTES`、`PULSEGUARD_RELAY_AUTH_BACKOFF_BASE_SECONDS`、`PULSEGUARD_RELAY_AUTH_BACKOFF_MAX_SECONDS` 调整。
 
 在主节点打开“系统设置 > 执行配置 > 新增子节点”，选择“生成部署命令”，填写节点名称、网络区域、目标平台和 worker 宿主机可访问的 `docker-compose.relay-worker.yml` 下载地址。生成后把命令复制到 worker 宿主机执行。自动模式使用 `docker-compose.relay-worker.yml`，worker 只在 compose 网络内 `expose: 8788`，不会把 `8788` 映射到宿主机。
 

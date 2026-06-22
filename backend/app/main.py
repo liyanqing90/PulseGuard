@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from .api_assertions import inspect_api_response
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
-from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs
+from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
 from .relay_cert import relay_fingerprint
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
@@ -367,7 +367,15 @@ def regenerate_runner_provision(runner_id: str, payload: RunnerProvisionRequest,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not runner:
         raise HTTPException(status_code=404, detail="Runner 不存在")
-    storage.record_audit_event("updated", "runner", runner.get("runner_id"), runner.get("name", ""), "重新生成 relay 子节点部署命令")
+    revoked = _revoke_relay_session(runner_id, "deployment command regenerated")
+    storage.record_audit_event(
+        "updated",
+        "runner",
+        runner.get("runner_id"),
+        runner.get("name", ""),
+        "重新生成 relay 子节点部署命令",
+        {"relay_control_revoked": revoked},
+    )
     return _runner_provision_response(runner, status, payload.target_platform, payload.compose_url)
 
 
@@ -394,19 +402,27 @@ def update_runner(runner_id: str, payload: ProbeRunnerUpdate) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not runner:
         raise HTTPException(status_code=404, detail="Runner 不存在")
+    if str(runner.get("connection_mode") or "") == "relay" and not runner.get("enabled"):
+        _revoke_relay_session(runner_id, "runner disabled")
     storage.record_audit_event("updated", "runner", runner.get("runner_id"), runner.get("name", ""), "更新执行节点")
     return mask_data(runner, storage.get_settings())
 
 
 @app.delete("/api/runners/{runner_id}")
 def delete_runner(runner_id: str) -> dict[str, bool]:
+    current = storage.get_probe_runner(runner_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
     try:
         removed = storage.delete_probe_runner(runner_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail="Runner 不存在")
-    storage.record_audit_event("deleted", "runner", runner_id, runner_id, "删除执行节点")
+    revoked = False
+    if str(current.get("connection_mode") or "") == "relay":
+        revoked = _revoke_relay_session(runner_id, "runner deleted")
+    storage.record_audit_event("deleted", "runner", runner_id, runner_id, "删除执行节点", {"relay_control_revoked": revoked})
     return {"ok": True}
 
 
@@ -1198,6 +1214,23 @@ def _relay_status_payload(request: Request) -> dict[str, Any]:
         "server_fingerprint": fingerprint,
         "error": error,
     }
+
+
+def _revoke_relay_session(runner_id: str, reason: str) -> bool:
+    if not RELAY_ENABLED or not RELAY_CONTROL_URL:
+        return False
+    try:
+        with httpx.Client(timeout=3) as client:
+            response = client.post(
+                f"{RELAY_CONTROL_URL}/relay/control/revoke",
+                json={"runner_id": runner_id, "reason": reason},
+                headers={"Authorization": f"Bearer {relay_control_token()}"},
+            )
+        response.raise_for_status()
+        payload = response.json()
+        return bool(isinstance(payload, dict) and payload.get("revoked"))
+    except (httpx.HTTPError, ValueError):
+        return False
 
 
 def _runner_provision_response(runner: dict[str, Any], relay_status: dict[str, Any], target_platform: str, compose_url: str) -> dict[str, Any]:
