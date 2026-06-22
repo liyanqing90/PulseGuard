@@ -192,6 +192,8 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
         await session.websocket.close(code=4403, reason="relay token rotated")
         return False
     stream_id = str(message.get("stream_id") or "")
+    if not stream_id:
+        raise ValueError("relay data frame is missing stream_id")
     data = decode_data_message(message)
     stream = session.streams.get(stream_id)
     if stream:

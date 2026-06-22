@@ -392,6 +392,22 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
                     {"type": "data", "stream_id": "missing-stream", "data": "not-base64!"},
                 )
 
+    async def test_data_frame_requires_stream_id(self) -> None:
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+            with self.assertRaisesRegex(ValueError, "missing stream_id"):
+                await relay_server._handle_data_message(
+                    session,
+                    {"type": "data", "data": "cGF5bG9hZA=="},
+                )
+
     async def test_data_frame_drain_timeout_removes_closed_stream(self) -> None:
         writer = SlowDrainWriter()
         session = relay_server.RelaySession(
