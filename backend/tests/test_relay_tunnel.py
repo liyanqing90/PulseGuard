@@ -32,6 +32,16 @@ class FakeWriter:
         pass
 
 
+class FailingWriter(FakeWriter):
+    async def wait_closed(self) -> None:
+        raise RuntimeError("writer close failed")
+
+
+class FailingCloseWriter(FakeWriter):
+    def close(self) -> None:
+        raise RuntimeError("writer close failed")
+
+
 class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
     async def test_pump_reader_to_sender_caps_cumulative_bytes(self) -> None:
         sent: list[dict[str, object]] = []
@@ -79,6 +89,48 @@ class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         await stream.close()
+
+        self.assertTrue(task.done())
+        self.assertTrue(task_cancelled.is_set())
+        self.assertNotIn(task, stream.tasks)
+
+    async def test_tunnel_stream_close_waits_for_tasks_after_close_failure(self) -> None:
+        task_cancelled = asyncio.Event()
+
+        async def wait_forever() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                task_cancelled.set()
+
+        task = asyncio.create_task(wait_forever())
+        stream = TunnelStream(reader=FakeReader([]), writer=FailingCloseWriter())  # type: ignore[arg-type]
+        stream.tasks.add(task)
+        await asyncio.sleep(0)
+
+        with self.assertRaisesRegex(RuntimeError, "writer close failed"):
+            await stream.close()
+
+        self.assertTrue(task.done())
+        self.assertTrue(task_cancelled.is_set())
+        self.assertNotIn(task, stream.tasks)
+
+    async def test_tunnel_stream_close_waits_for_tasks_after_writer_failure(self) -> None:
+        task_cancelled = asyncio.Event()
+
+        async def wait_forever() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                task_cancelled.set()
+
+        task = asyncio.create_task(wait_forever())
+        stream = TunnelStream(reader=FakeReader([]), writer=FailingWriter())  # type: ignore[arg-type]
+        stream.tasks.add(task)
+        await asyncio.sleep(0)
+
+        with self.assertRaisesRegex(RuntimeError, "writer close failed"):
+            await stream.close()
 
         self.assertTrue(task.done())
         self.assertTrue(task_cancelled.is_set())

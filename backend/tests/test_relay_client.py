@@ -37,6 +37,17 @@ class SlowDrainWriter(FakeWriter):
         await asyncio.Event().wait()
 
 
+class FailingWriteWriter(FakeWriter):
+    def write(self, data: bytes) -> None:
+        super().write(data)
+        raise RuntimeError("worker stream write failed")
+
+
+class FailingCloseWriter(FakeWriter):
+    async def wait_closed(self) -> None:
+        raise RuntimeError("worker stream close failed")
+
+
 class FakeSslObject:
     def __init__(self, cert: bytes | None) -> None:
         self.cert = cert
@@ -56,6 +67,11 @@ class FakeTransport:
 class FakeWebsocket:
     def __init__(self, cert: bytes | None) -> None:
         self.transport = FakeTransport(cert)
+
+
+class FailingSendWebsocket:
+    async def send(self, _message: str) -> None:
+        raise RuntimeError("websocket send failed")
 
 
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +102,28 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
 
         connect.assert_not_called()
 
+    async def test_relay_token_version_must_be_integer_before_connecting(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PULSEGUARD_RELAY_URL": "wss://127.0.0.1:9443/relay/connect",
+                "PULSEGUARD_RUNNER_ID": "edge-1",
+                "PULSEGUARD_RELAY_TOKEN": "pgrl_secret",
+                "PULSEGUARD_RELAY_FINGERPRINT": "00",
+                "PULSEGUARD_RELAY_TOKEN_VERSION": "bad",
+            },
+            clear=False,
+        ), patch("backend.app.relay_client.websockets.connect") as connect:
+            with self.assertRaisesRegex(RuntimeError, "must be an integer"):
+                await relay_client.run_once()
+
+        connect.assert_not_called()
+
+    async def test_worker_endpoint_rejects_invalid_port(self) -> None:
+        with patch.dict("os.environ", {"PULSEGUARD_WORKER_URL": "http://pulseguard-worker:bad"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "port is invalid"):
+                relay_client._worker_endpoint()
+
     async def test_worker_pump_uses_idle_timeout_and_removes_closed_stream(self) -> None:
         writer = FakeWriter()
         streams: dict[str, TunnelStream] = {
@@ -109,6 +147,28 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(writer.closed)
         self.assertNotIn("stream-1", streams)
 
+    async def test_worker_pump_failure_removes_stream_without_bubbling(self) -> None:
+        writer = FakeWriter()
+        streams: dict[str, TunnelStream] = {
+            "stream-1": TunnelStream(reader=FakeReader(), writer=writer)  # type: ignore[arg-type]
+        }
+
+        with patch(
+            "backend.app.relay_client.pump_reader_to_sender",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("relay send failed"),
+        ):
+            await relay_client._pump_worker_to_relay(  # type: ignore[arg-type]
+                "stream-1",
+                FakeReader(),
+                object(),
+                asyncio.Lock(),
+                streams,
+            )
+
+        self.assertTrue(writer.closed)
+        self.assertNotIn("stream-1", streams)
+
     async def test_duplicate_open_frame_fails_before_worker_connection(self) -> None:
         writer = FakeWriter()
         streams: dict[str, TunnelStream] = {
@@ -127,6 +187,33 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
         open_connection.assert_not_called()
         self.assertIs(streams["stream-1"].writer, writer)
 
+    async def test_worker_open_error_report_is_best_effort(self) -> None:
+        streams: dict[str, TunnelStream] = {}
+
+        with patch("backend.app.relay_client._worker_endpoint", return_value=("pulseguard-worker", 8788)), patch(
+            "backend.app.relay_client.asyncio.open_connection",
+            new=AsyncMock(side_effect=OSError("connection refused")),
+        ):
+            await relay_client._open_worker_stream("stream-1", FailingSendWebsocket(), asyncio.Lock(), streams)
+
+        self.assertEqual(streams, {})
+
+    async def test_close_frame_removes_stream_after_close_failure(self) -> None:
+        writer = FailingCloseWriter()
+        streams: dict[str, TunnelStream] = {
+            "stream-1": TunnelStream(reader=FakeReader(), writer=writer)  # type: ignore[arg-type]
+        }
+
+        await relay_client._handle_relay_message(
+            {"type": "close", "stream_id": "stream-1"},
+            object(),
+            asyncio.Lock(),
+            streams,
+        )
+
+        self.assertTrue(writer.closed)
+        self.assertEqual(streams, {})
+
     async def test_relay_data_closes_worker_stream_when_drain_times_out(self) -> None:
         writer = SlowDrainWriter()
         streams: dict[str, TunnelStream] = {
@@ -139,6 +226,22 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "data", "stream_id": "stream-1", "data": "cGF5bG9hZA=="},
                 streams,
             )
+
+        self.assertEqual(writer.writes, [b"payload"])
+        self.assertTrue(writer.closed)
+        self.assertNotIn("stream-1", streams)
+
+    async def test_relay_data_closes_worker_stream_when_write_fails(self) -> None:
+        writer = FailingWriteWriter()
+        streams: dict[str, TunnelStream] = {
+            "stream-1": TunnelStream(reader=FakeReader(), writer=writer)  # type: ignore[arg-type]
+        }
+
+        await relay_client._handle_relay_data_message(
+            "stream-1",
+            {"type": "data", "stream_id": "stream-1", "data": "cGF5bG9hZA=="},
+            streams,
+        )
 
         self.assertEqual(writer.writes, [b"payload"])
         self.assertTrue(writer.closed)
