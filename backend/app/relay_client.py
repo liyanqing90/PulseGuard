@@ -84,10 +84,10 @@ async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio
 
 
 async def _handle_relay_data_message(stream_id: str, message: dict[str, Any], streams: dict[str, TunnelStream]) -> None:
+    data = decode_data_message(message)
     stream = streams.get(stream_id)
     if not stream:
         return
-    data = decode_data_message(message)
     if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
         streams.pop(stream_id, None)
         await stream.close()

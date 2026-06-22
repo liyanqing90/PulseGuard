@@ -192,9 +192,9 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
         await session.websocket.close(code=4403, reason="relay token rotated")
         return False
     stream_id = str(message.get("stream_id") or "")
+    data = decode_data_message(message)
     stream = session.streams.get(stream_id)
     if stream:
-        data = decode_data_message(message)
         close_stream = False
         if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
             close_stream = True

@@ -376,6 +376,22 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket.close_kwargs, {"code": 4403, "reason": "relay token rotated"})
         self.assertEqual(writer.writes, [])
 
+    async def test_data_frame_rejects_invalid_payload_even_for_unknown_stream(self) -> None:
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+            with self.assertRaisesRegex(ValueError, "not valid base64"):
+                await relay_server._handle_data_message(
+                    session,
+                    {"type": "data", "stream_id": "missing-stream", "data": "not-base64!"},
+                )
+
     async def test_data_frame_drain_timeout_removes_closed_stream(self) -> None:
         writer = SlowDrainWriter()
         session = relay_server.RelaySession(
