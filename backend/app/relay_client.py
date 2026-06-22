@@ -100,6 +100,28 @@ async def _handle_relay_data_message(stream_id: str, message: dict[str, Any], st
         await stream.close()
 
 
+async def _handle_relay_message(
+    message: dict[str, Any],
+    websocket: Any,
+    send_lock: asyncio.Lock,
+    streams: dict[str, TunnelStream],
+) -> None:
+    message_type = str(message.get("type") or "")
+    stream_id = str(message.get("stream_id") or "")
+    if message_type == "heartbeat_ack":
+        return
+    if message_type == "open" and stream_id:
+        await _open_worker_stream(stream_id, websocket, send_lock, streams)
+    elif message_type == "data" and stream_id:
+        await _handle_relay_data_message(stream_id, message, streams)
+    elif message_type in {"close", "error"} and stream_id:
+        stream = streams.pop(stream_id, None)
+        if stream:
+            await stream.close()
+    else:
+        raise RuntimeError("invalid relay message")
+
+
 async def run_once() -> None:
     relay_url = _env("PULSEGUARD_RELAY_URL")
     runner_id = _env("PULSEGUARD_RUNNER_ID")
@@ -131,16 +153,7 @@ async def run_once() -> None:
         try:
             async for raw in websocket:
                 message = json_loads(raw)
-                message_type = str(message.get("type") or "")
-                stream_id = str(message.get("stream_id") or "")
-                if message_type == "open" and stream_id:
-                    await _open_worker_stream(stream_id, websocket, send_lock, streams)
-                elif message_type == "data" and stream_id:
-                    await _handle_relay_data_message(stream_id, message, streams)
-                elif message_type in {"close", "error"} and stream_id:
-                    stream = streams.pop(stream_id, None)
-                    if stream:
-                        await stream.close()
+                await _handle_relay_message(message, websocket, send_lock, streams)
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)

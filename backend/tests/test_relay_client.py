@@ -125,3 +125,10 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.writes, [b"payload"])
         self.assertTrue(writer.closed)
         self.assertNotIn("stream-1", streams)
+
+    async def test_heartbeat_ack_is_valid_noop(self) -> None:
+        await relay_client._handle_relay_message({"type": "heartbeat_ack"}, object(), asyncio.Lock(), {})
+
+    async def test_unknown_relay_message_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "invalid relay message"):
+            await relay_client._handle_relay_message({"type": "bogus"}, object(), asyncio.Lock(), {})
