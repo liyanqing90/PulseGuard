@@ -60,10 +60,17 @@ class RelaySession:
             await self.websocket.send_text(json_dumps(message))
 
     async def close(self) -> None:
-        self.server.close()
-        await self.server.wait_closed()
+        try:
+            self.server.close()
+            await self.server.wait_closed()
+        except Exception:
+            pass
         for stream in list(self.streams.values()):
-            await stream.close()
+            try:
+                await stream.close()
+            except Exception:
+                pass
+        self.streams.clear()
         try:
             await self.websocket.close()
         except Exception:

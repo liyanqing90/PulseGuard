@@ -130,6 +130,17 @@ class FakeSession:
         self.closed = True
 
 
+class FakeStream:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.fail:
+            raise RuntimeError("stream close failed")
+
+
 class RelayServerControlTests(unittest.TestCase):
     def tearDown(self) -> None:
         relay_server.ACTIVE_SESSIONS.clear()
@@ -300,6 +311,26 @@ class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
 class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         relay_server.ACTIVE_SESSIONS.clear()
+
+    async def test_session_close_continues_after_stream_close_failure(self) -> None:
+        websocket = FakeWebSocket()
+        failed_stream = FakeStream(fail=True)
+        next_stream = FakeStream()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams = {"failed": failed_stream, "next": next_stream}  # type: ignore[assignment]
+
+        await session.close()
+
+        self.assertTrue(failed_stream.closed)
+        self.assertTrue(next_stream.closed)
+        self.assertEqual(session.streams, {})
+        self.assertEqual(websocket.close_kwargs, {})
 
     async def test_duplicate_session_replaces_old_session(self) -> None:
         old_server = FakeServer()
