@@ -544,17 +544,27 @@ function snapshotSubtitle(snapshot: Record<string, unknown>): string {
 function runnerStatusLabel(value: string): string {
   return (
     {
+      pending_deployment: "待部署",
+      expired: "已过期",
+      connecting: "连接中",
+      available: "可用",
+      unhealthy: "异常",
+      unavailable: "异常",
+      auth_failed: "认证失败",
       ok: "正常",
       warning: "告警",
-      offline: "离线"
+      offline: "离线",
+      disabled: "已停用"
     }[value] || "未知"
   );
 }
 
 function runnerStatusColor(value: string): string {
-  if (value === "ok") return "success";
-  if (value === "warning") return "warning";
-  if (value === "offline") return "default";
+  if (value === "ok" || value === "available") return "success";
+  if (value === "warning" || value === "expired" || value === "auth_failed") return "warning";
+  if (value === "pending_deployment" || value === "connecting") return "processing";
+  if (value === "unhealthy" || value === "unavailable") return "error";
+  if (value === "offline" || value === "disabled") return "default";
   return "default";
 }
 
