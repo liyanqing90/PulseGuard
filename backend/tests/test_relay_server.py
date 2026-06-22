@@ -201,7 +201,7 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         relay_server.ACTIVE_SESSIONS.clear()
 
-    async def test_duplicate_fresh_session_is_rejected_without_replacing_old_session(self) -> None:
+    async def test_duplicate_session_replaces_old_session(self) -> None:
         old_server = FakeServer()
         old_websocket = FakeWebSocket()
         old_session = relay_server.RelaySession(
@@ -218,8 +218,10 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_disconnected"
+        ) as mark_disconnected, patch(
             "backend.app.relay_server._start_internal_server",
-            new=AsyncMock(),
+            new=AsyncMock(return_value=FakeServer()),
         ) as start_server:
             result = await relay_server._open_relay_session(  # type: ignore[arg-type]
                 "edge-1",
@@ -230,11 +232,12 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
                 handler,
             )
 
-        self.assertIsNone(result)
-        self.assertIs(relay_server.ACTIVE_SESSIONS["edge-1"], old_session)
-        self.assertFalse(old_server.closed)
-        self.assertEqual(new_websocket.close_kwargs, {"code": 4409, "reason": "runner already connected"})
-        start_server.assert_not_called()
+        self.assertIsNotNone(result)
+        self.assertIs(relay_server.ACTIVE_SESSIONS["edge-1"], result)
+        self.assertTrue(old_server.closed)
+        self.assertIsNone(new_websocket.close_kwargs)
+        mark_disconnected.assert_called_once_with("edge-1", "relay session replaced")
+        start_server.assert_awaited_once()
 
     async def test_duplicate_stale_session_is_replaced(self) -> None:
         old_server = FakeServer()
@@ -270,7 +273,7 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(relay_server.ACTIVE_SESSIONS["edge-1"], result)
         self.assertTrue(old_server.closed)
         self.assertIs(result.server, new_server)
-        mark_disconnected.assert_called_once_with("edge-1", "stale relay session replaced")
+        mark_disconnected.assert_called_once_with("edge-1", "relay session replaced")
 
     async def test_data_frame_revalidates_relay_token_before_writing_stream(self) -> None:
         websocket = FakeWebSocket()

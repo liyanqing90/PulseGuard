@@ -187,13 +187,6 @@ async def _start_internal_server(handler: Any, port: int) -> asyncio.AbstractSer
     return await asyncio.start_server(handler, host=RELAY_INTERNAL_LISTEN_HOST, port=port)
 
 
-def _relay_session_is_fresh(session: RelaySession) -> bool:
-    age_seconds = time.monotonic() - session.last_seen_monotonic
-    if age_seconds > storage.RELAY_HEARTBEAT_TIMEOUT_SECONDS:
-        return False
-    return _relay_session_credentials_valid(session)
-
-
 async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -> bool:
     if not _relay_session_credentials_valid(session):
         await session.websocket.close(code=4403, reason="relay token rotated")
@@ -234,12 +227,9 @@ async def _open_relay_session(
 ) -> RelaySession | None:
     async with SESSION_LOCK:
         old_session = ACTIVE_SESSIONS.get(runner_id)
-        if old_session and _relay_session_is_fresh(old_session):
-            await websocket.close(code=4409, reason="runner already connected")
-            return None
         if old_session:
             ACTIVE_SESSIONS.pop(runner_id, None)
-            storage.mark_probe_runner_relay_disconnected(runner_id, "stale relay session replaced")
+            storage.mark_probe_runner_relay_disconnected(runner_id, "relay session replaced")
             await old_session.close()
         server = await _start_internal_server(handler, port)
         session = RelaySession(runner_id=runner_id, token=token, token_version=token_version, websocket=websocket, server=server)
