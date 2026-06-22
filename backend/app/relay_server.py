@@ -261,7 +261,11 @@ async def relay_connect(websocket: WebSocket) -> None:
             return
         runner_id = str(hello.get("runner_id") or "").strip()
         token = str(hello.get("relay_token") or "").strip()
-        token_version = int(hello.get("relay_token_version") or 0)
+        token_version_text = str(hello.get("relay_token_version") or "").strip()
+        if not token_version_text.isdigit():
+            await websocket.close(code=4400, reason="invalid hello")
+            return
+        token_version = int(token_version_text)
         runner = storage.verify_probe_runner_relay_token(runner_id, token, token_version)
         auth_key = _auth_failure_key(websocket, runner_id)
         if not runner:

@@ -48,6 +48,19 @@ class WaitingWebSocket:
         return "{}"
 
 
+class ConnectWebSocket(TextWebSocket):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.accepted = False
+        self.close_kwargs: dict[str, object] | None = None
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def close(self, *args: object, **kwargs: object) -> None:
+        self.close_kwargs = kwargs
+
+
 class BlockingReader:
     def __init__(self) -> None:
         self.done = asyncio.Event()
@@ -195,6 +208,19 @@ class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([call.args[0] for call in sleep.await_args_list], [0.25, 0.5])
         self.assertNotIn("edge-1", relay_server.AUTH_FAILURES)
+
+    async def test_connect_rejects_invalid_token_version_without_auth_lookup(self) -> None:
+        websocket = ConnectWebSocket(
+            '{"type":"hello","runner_id":"edge-1","relay_token":"pgrl_secret","relay_token_version":"abc"}'
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token") as verify_token:
+            await relay_server.relay_connect(websocket)  # type: ignore[arg-type]
+
+        self.assertTrue(websocket.accepted)
+        self.assertEqual(websocket.close_kwargs, {"code": 4400, "reason": "invalid hello"})
+        self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
+        verify_token.assert_not_called()
 
 
 class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):

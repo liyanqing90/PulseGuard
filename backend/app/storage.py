@@ -1473,7 +1473,10 @@ def get_probe_runner_token(runner_id: str) -> str:
 
 
 def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) -> dict[str, Any] | None:
-    runner_id = _normalize_runner_id(runner_id)
+    try:
+        runner_id = _normalize_runner_id(runner_id)
+    except ValueError:
+        return None
     token = str(token or "").strip()
     if not token:
         return None
