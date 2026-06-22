@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -36,7 +37,55 @@ class SlowDrainWriter(FakeWriter):
         await asyncio.Event().wait()
 
 
+class FakeSslObject:
+    def __init__(self, cert: bytes | None) -> None:
+        self.cert = cert
+
+    def getpeercert(self, *, binary_form: bool = False) -> bytes | None:
+        return self.cert if binary_form else None
+
+
+class FakeTransport:
+    def __init__(self, cert: bytes | None) -> None:
+        self.ssl_object = FakeSslObject(cert) if cert is not None else None
+
+    def get_extra_info(self, name: str) -> object | None:
+        return self.ssl_object if name == "ssl_object" else None
+
+
+class FakeWebsocket:
+    def __init__(self, cert: bytes | None) -> None:
+        self.transport = FakeTransport(cert)
+
+
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fingerprint_requires_peer_certificate(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "TLS certificate is unavailable"):
+            relay_client._assert_fingerprint(FakeWebsocket(None), "00")  # type: ignore[arg-type]
+
+    async def test_fingerprint_accepts_matching_certificate(self) -> None:
+        cert = b"relay-cert"
+        relay_client._assert_fingerprint(  # type: ignore[arg-type]
+            FakeWebsocket(cert),
+            hashlib.sha256(cert).hexdigest(),
+        )
+
+    async def test_relay_url_must_use_wss_before_sending_token(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PULSEGUARD_RELAY_URL": "ws://127.0.0.1:9443/relay/connect",
+                "PULSEGUARD_RUNNER_ID": "edge-1",
+                "PULSEGUARD_RELAY_TOKEN": "pgrl_secret",
+                "PULSEGUARD_RELAY_FINGERPRINT": "00",
+            },
+            clear=False,
+        ), patch("backend.app.relay_client.websockets.connect") as connect:
+            with self.assertRaisesRegex(RuntimeError, "must use wss://"):
+                await relay_client.run_once()
+
+        connect.assert_not_called()
+
     async def test_worker_pump_uses_idle_timeout_and_removes_closed_stream(self) -> None:
         writer = FakeWriter()
         streams: dict[str, TunnelStream] = {
