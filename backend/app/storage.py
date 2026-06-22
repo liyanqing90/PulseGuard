@@ -21,7 +21,16 @@ from .browser_types import (
     normalize_browser_types,
     normalized_browser_settings,
 )
-from .config import BACKUPS_DIR, DB_PATH, RELAY_DEPLOY_COMMAND_TTL_HOURS, RELAY_INTERNAL_HOST, RELAY_INTERNAL_PORT_END, RELAY_INTERNAL_PORT_START, ensure_runtime_dirs
+from .config import (
+    BACKUPS_DIR,
+    DB_PATH,
+    RELAY_DEPLOY_COMMAND_TTL_HOURS,
+    RELAY_INTERNAL_HOST,
+    RELAY_INTERNAL_PORT_END,
+    RELAY_INTERNAL_PORT_START,
+    TREND_BACKFILL_ON_STARTUP,
+    ensure_runtime_dirs,
+)
 from .defaults import DEFAULT_SETTINGS, DEMO_CHECKS
 from .monitoring import HEALTH_STATES, next_health_state, run_metadata
 from .schemas import normalize_settings_values
@@ -329,7 +338,6 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_trend_rollups_bucket ON trend_rollups(bucket_granularity, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_trend_rollups_type_bucket ON trend_rollups(check_type, bucket_granularity, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_probe_runners_region ON probe_runners(network_region, status);
-            CREATE INDEX IF NOT EXISTS idx_probe_runners_relay_port ON probe_runners(allocated_internal_port);
             CREATE INDEX IF NOT EXISTS idx_anomaly_cycles_check_status ON anomaly_cycles(check_id, status, opened_at DESC);
             """
         )
@@ -337,6 +345,7 @@ def init_db() -> None:
         _ensure_run_columns(conn)
         _ensure_check_status_columns(conn)
         _ensure_probe_runner_columns(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_probe_runners_relay_port ON probe_runners(allocated_internal_port)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation ON runs(affects_health, started_at DESC)")
         conn.execute("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", (now_iso(),))
         _ensure_default_settings(conn)
@@ -367,7 +376,8 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_page_filter_started ON runs(observation_kind, check_type, status, started_at DESC, id DESC)"
         )
-        _backfill_trend_rollups(conn)
+        if TREND_BACKFILL_ON_STARTUP:
+            _backfill_trend_rollups(conn)
 
 
 def list_checks(check_type: str | None = None, enabled_only: bool = False, refresh_stale: bool = True) -> list[dict[str, Any]]:

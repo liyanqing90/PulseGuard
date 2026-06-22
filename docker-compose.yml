@@ -15,5 +15,6 @@ services:
       - PULSEGUARD_ALERT_DETAIL_BASE_URL=${PULSEGUARD_ALERT_DETAIL_BASE_URL:-http://localhost:8787}
       - PULSEGUARD_DATA_DIR=/app/data
       - PULSEGUARD_REPORTS_DIR=/app/reports
+      - PULSEGUARD_TREND_BACKFILL_ON_STARTUP=${PULSEGUARD_TREND_BACKFILL_ON_STARTUP:-false}
     mem_limit: 1g
     cpus: 1.0

@@ -19,6 +19,7 @@ PulseGuard is not a SaaS product, public status page, full E2E test management p
 - Rule maintenance: UI selector stability hints, rule invalidation checks, API response field preview, and one-click basic assertion generation.
 - Batch operations: run, enable, disable, and reschedule tasks by type, tag, and enabled state, with matched counts to prevent accidental bulk actions.
 - Run history: status, duration, error summary, screenshots, Trace, Response Body, recent-success comparison, and failure summary.
+- Monitoring trends: a dedicated trends page for overall UI/API and paginated task cards, with 24-hour, 7-day, 30-day, custom range, average latency, P95, P99, and failure counts.
 - Runner tracking: local Runner name, address, network zone, browser version, Runner heartbeat, and Runner status list.
 - Failure attribution: separates target failures from Runner execution environment failures.
 - Alert policies: global, tag-level, and task-level alert policies with cooldown, recovery notification, and notification channel controls.
@@ -29,6 +30,14 @@ PulseGuard is not a SaaS product, public status page, full E2E test management p
 - Config transfer: export, sanitized export, import preview, and import apply. Config JSON can be managed in Git.
 - CLI/CI: run probes by task ID, type, or tag, and report pipeline results with exit codes.
 - Extended probes: templates and `ctx` helpers support passive heartbeat, TLS expiration, HTTP keyword/redirect/asset checks, TCP, and DNS.
+
+## Recent Additions And Behavior Changes
+
+- The UI brand area and health check keep the PulseGuard name and also expose the team marker `新零售测试团队`.
+- The monitoring trends page supports overall UI/API cards, paginated task cards, a detail drawer, per-card dimensions, and 24-hour, 7-day, 30-day, custom range, and daily-hour filters.
+- Trend rollups are written incrementally from new runs into `trend_rollups`; historical trend backfill is not required on startup and is disabled by default.
+- Relay onboarding can generate and regenerate child-runner deployment commands. Workers connect outbound to the main relay and do not need to expose inbound `8788`.
+- Child runners report version, build SHA, current image, and browser-type installation status. With the updater profile enabled, the main node can request controlled worker updates.
 
 ## Tech Stack
 
@@ -174,6 +183,7 @@ Structured UI/API assertions do not require an advanced script. Complex login, m
 ## Data And Security Boundaries
 
 - SQLite is the default persistence layer. The database file lives in `data/`.
+- Trend data is stored in the SQLite `trend_rollups` table with latency histograms and summary metrics. New runs write trends automatically. Historical trend backfill is disabled by default; if old data must be backfilled, start once with `PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true`.
 - Screenshots, Trace files, Response Body artifacts, and archived summaries live in `reports/`.
 - Environment variables, webhooks, DingTalk secrets, read-only tokens, common auth headers, and cookies are redacted in public settings, run records, read-only outputs, and the status page.
 - User-defined Python probe scripts are a trusted local tool capability, not a security sandbox.

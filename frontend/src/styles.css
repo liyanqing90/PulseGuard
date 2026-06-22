@@ -1178,8 +1178,9 @@ button svg {
 
 .monitoring-task-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
   gap: 10px;
+  align-items: start;
 }
 
 .monitoring-task-row {
@@ -1215,8 +1216,11 @@ button svg {
 }
 
 .monitoring-task-row-main {
+  height: auto;
+  min-height: 0;
   min-width: 0;
   width: 100%;
+  flex-shrink: 1;
   border: 0;
   border-radius: var(--radius);
   background: transparent;
@@ -1225,6 +1229,7 @@ button svg {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
+  justify-content: stretch;
   gap: 6px;
   text-align: left;
   white-space: normal;

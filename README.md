@@ -32,6 +32,14 @@ PulseGuard 不是 SaaS、公开状态页、完整 E2E 测试管理平台或 inci
 - CLI/CI：支持按任务 ID、类型或标签运行探活，并用 exit code 表达流水线结果。
 - 扩展探活：通过模板和 `ctx` helper 支持被动心跳、TLS 到期、HTTP keyword/redirect/asset、TCP、DNS 等检查。
 
+## 近期新增与行为变更
+
+- 品牌和健康检查会保留 PulseGuard 原名，同时展示团队标识 `新零售测试团队`。
+- 监控趋势页支持整体 UI/API 卡片、分页任务卡片、详情抽屉、卡片独立观察维度，以及 24 小时、7 天、30 天、自定义时间段和每日时段筛选。
+- 趋势聚合由新运行增量写入 `trend_rollups`；历史趋势回填不是启动必选项，默认不会回填旧运行。
+- Relay 自动接入支持生成和重新生成子节点部署命令，worker 只需出站连接主节点 relay，不需要开放 `8788` 入站端口。
+- 子节点支持上报版本、构建 SHA、当前镜像和 browser type 安装状态；启用 updater profile 后，主节点可以发起受控更新。
+
 ## 技术栈
 
 - Backend: FastAPI, SQLite, Playwright Python, `uv`
@@ -340,7 +348,7 @@ async def setup(ctx):
 
 - 默认使用 SQLite，数据库文件位于 `data/`。
 - SQLite 支持在线备份和恢复，备份位于 `data/backups/`。
-- 趋势数据写入 SQLite `trend_rollups` 轻量聚合表，长期保存响应时间 histogram 和汇总指标，不永久保存完整运行证据。
+- 趋势数据写入 SQLite `trend_rollups` 轻量聚合表，长期保存响应时间 histogram 和汇总指标，不永久保存完整运行证据。新运行会自动写入趋势；旧运行的历史趋势回填默认关闭，如确需补齐旧数据，可临时设置 `PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true` 后启动一次。
 - 截图、Trace、Response Body 和归档摘要位于 `reports/`。
 - 环境变量、Webhook、钉钉密钥、只读令牌、常见认证 Header 和 Cookie 会在公开设置、运行记录和只读出口中脱敏。
 - 用户自定义 Python 探活脚本是可信本地工具能力，不是安全沙箱。

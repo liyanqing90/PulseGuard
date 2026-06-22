@@ -12,6 +12,14 @@ REPORTS_DIR = Path(os.getenv("PULSEGUARD_REPORTS_DIR", PROJECT_ROOT / "reports")
 DB_PATH = Path(os.getenv("PULSEGUARD_DB_PATH", DATA_DIR / "pulseguard.db")).resolve()
 BACKUPS_DIR = Path(os.getenv("PULSEGUARD_BACKUPS_DIR", DATA_DIR / "backups")).resolve()
 STATIC_DIR = Path(os.getenv("PULSEGUARD_STATIC_DIR", PROJECT_ROOT / "frontend" / "dist")).resolve()
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in _TRUE_ENV_VALUES
 
 HOST = os.getenv("PULSEGUARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("PULSEGUARD_PORT", "8787"))
@@ -22,7 +30,7 @@ BUILD_SHA = os.getenv("PULSEGUARD_BUILD_SHA", "unknown").strip() or "unknown"
 NODE_ROLE = os.getenv("PULSEGUARD_NODE_ROLE", "main").strip().lower() or "main"
 WORKER_TOKEN_FILE = Path(os.getenv("PULSEGUARD_WORKER_TOKEN_FILE", DATA_DIR / "worker-token")).resolve()
 RUNNER_HEALTH_POLL_SECONDS = max(10, int(os.getenv("PULSEGUARD_RUNNER_HEALTH_POLL_SECONDS", "30")))
-RELAY_ENABLED = os.getenv("PULSEGUARD_RELAY_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+RELAY_ENABLED = _env_flag("PULSEGUARD_RELAY_ENABLED")
 RELAY_PUBLIC_HOST = os.getenv("PULSEGUARD_RELAY_PUBLIC_HOST", "").strip()
 RELAY_PUBLIC_PORT = int(os.getenv("PULSEGUARD_RELAY_PUBLIC_PORT", "9443"))
 RELAY_INTERNAL_HOST = os.getenv("PULSEGUARD_RELAY_INTERNAL_HOST", "pulseguard-relay").strip() or "pulseguard-relay"
@@ -33,6 +41,7 @@ RELAY_DIR = Path(os.getenv("PULSEGUARD_RELAY_DIR", DATA_DIR / "relay")).resolve(
 RELAY_CERT_FILE = Path(os.getenv("PULSEGUARD_RELAY_CERT_FILE", RELAY_DIR / "relay.crt")).resolve()
 RELAY_KEY_FILE = Path(os.getenv("PULSEGUARD_RELAY_KEY_FILE", RELAY_DIR / "relay.key")).resolve()
 RELAY_MAX_BODY_BYTES = max(1024 * 1024, int(os.getenv("PULSEGUARD_RELAY_MAX_BODY_BYTES", str(20 * 1024 * 1024))))
+TREND_BACKFILL_ON_STARTUP = _env_flag("PULSEGUARD_TREND_BACKFILL_ON_STARTUP")
 
 
 def _new_worker_token() -> str:

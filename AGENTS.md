@@ -63,5 +63,16 @@ Before handing off changes that touch code, run the smallest relevant set:
 - Backend changes: `uv run python -m unittest discover -s backend/tests -p 'test_*.py' -v`
 - Frontend changes: `cd frontend && npm run build`
 - Docker/dependency changes: verify `uv lock` is current and Dockerfile consumes `uv.lock`
+- Backend tests must not read `data/pulseguard.db`. Point `PULSEGUARD_DB_PATH` to an initialized temporary database when the production database may contain deployment or runtime state.
 
 State any skipped gate and the reason.
+
+## Docker Deployment
+
+- Treat `data/` and `reports/` as user-owned persistent data. Record database fingerprints and create an application-consistent backup before recreating the container.
+- Run host-side SQLite fingerprint checks and container API checks sequentially. Concurrent access to the bind-mounted database can cause transient lock-related API failures.
+- Before deploying a schema change, copy the active SQLite database to a temporary path and run `storage.init_db()` against that copy. Fresh-database tests do not prove that an existing database can migrate.
+- Add columns before creating indexes or queries that reference them. Cover each migration with a legacy-schema regression test.
+- Run the standard `docker compose build` first. A quiet BuildKit interval can be an image download; wait for the command's final result before declaring it blocked.
+- External base images are required only for a cold full build or a missing dependency layer. Check local application/base images and BuildKit cache before designing a fallback, but do not reuse a stale dependency layer when `pyproject.toml`, `uv.lock`, or frontend lock files changed.
+- Do not recreate the running container until the new image has built successfully and the database-copy migration preflight has passed.

@@ -530,6 +530,75 @@ class RunArchiveStorageTests(unittest.TestCase):
 
 
 class MonitoringTrendStorageTests(unittest.TestCase):
+    def test_init_db_skips_historical_trend_backfill_by_default(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "TREND_BACKFILL_ON_STARTUP", False):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("No Startup Backfill API"))
+            check_id = int(check["id"])
+            started_at = datetime.now().astimezone().replace(microsecond=0) - timedelta(hours=1)
+            insert_trend_run(check_id, "api", "ok", started_at, 180)
+
+            storage.init_db()
+            trend = storage.get_check_trend(
+                check_id,
+                period="custom",
+                start=(started_at - timedelta(minutes=5)).isoformat(timespec="seconds"),
+                end=(started_at + timedelta(minutes=5)).isoformat(timespec="seconds"),
+            )
+            with storage._connect() as conn:
+                rollup_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM trend_rollups WHERE check_id = ?",
+                    (check_id,),
+                ).fetchone()["count"]
+                recorded_at = conn.execute(
+                    "SELECT trend_recorded_at FROM runs WHERE check_id = ?",
+                    (check_id,),
+                ).fetchone()["trend_recorded_at"]
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 0)
+        self.assertEqual(rollup_count, 0)
+        self.assertIsNone(recorded_at)
+
+    def test_init_db_backfills_historical_trends_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "TREND_BACKFILL_ON_STARTUP", False):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Startup Backfill API"))
+            check_id = int(check["id"])
+            started_at = datetime.now().astimezone().replace(microsecond=0) - timedelta(hours=1)
+            insert_trend_run(check_id, "api", "ok", started_at, 180)
+
+            with patch.object(storage, "TREND_BACKFILL_ON_STARTUP", True):
+                storage.init_db()
+            trend = storage.get_check_trend(
+                check_id,
+                period="custom",
+                start=(started_at - timedelta(minutes=5)).isoformat(timespec="seconds"),
+                end=(started_at + timedelta(minutes=5)).isoformat(timespec="seconds"),
+            )
+            with storage._connect() as conn:
+                rollup_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM trend_rollups WHERE check_id = ?",
+                    (check_id,),
+                ).fetchone()["count"]
+                recorded_at = conn.execute(
+                    "SELECT trend_recorded_at FROM runs WHERE check_id = ?",
+                    (check_id,),
+                ).fetchone()["trend_recorded_at"]
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 1)
+        self.assertGreater(rollup_count, 0)
+        self.assertIsNotNone(recorded_at)
+
     def test_custom_window_includes_overlapping_first_source_bucket(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -713,6 +782,46 @@ class AuditAndVersionStorageTests(unittest.TestCase):
 
 
 class RunnerStorageTests(unittest.TestCase):
+    def test_init_db_adds_relay_port_column_before_creating_its_index(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            db_path = Path(temp_dir) / "pulseguard.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE probe_runners (
+                        runner_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        address TEXT NOT NULL DEFAULT '',
+                        network_region TEXT NOT NULL DEFAULT 'local',
+                        browser_version TEXT NOT NULL DEFAULT '',
+                        installed_browser_types_json TEXT NOT NULL DEFAULT '[]',
+                        available_browser_types_json TEXT NOT NULL DEFAULT '[]',
+                        status TEXT NOT NULL DEFAULT 'ok',
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        role TEXT NOT NULL DEFAULT 'child',
+                        token_value TEXT NOT NULL DEFAULT '',
+                        token_hash TEXT NOT NULL DEFAULT '',
+                        token_hint TEXT NOT NULL DEFAULT '',
+                        unavailable_since TEXT,
+                        unavailable_notified_at TEXT,
+                        created_at TEXT NOT NULL DEFAULT '',
+                        last_seen_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+
+            storage.init_db()
+            with sqlite3.connect(db_path) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(probe_runners)")}
+                indexes = {row[1] for row in conn.execute("PRAGMA index_list(probe_runners)")}
+
+        self.assertIn("allocated_internal_port", columns)
+        self.assertIn("idx_probe_runners_relay_port", indexes)
+
     def test_run_metadata_is_persisted_from_create_and_finish(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
