@@ -4,7 +4,7 @@ import asyncio
 import base64
 import unittest
 
-from backend.app.relay_tunnel import TunnelStream, pump_reader_to_sender
+from backend.app.relay_tunnel import TunnelStream, decode_data_message, pump_reader_to_sender
 
 
 class FakeReader:
@@ -59,6 +59,10 @@ class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(stream.record_received(3, max_bytes=5))
         self.assertFalse(stream.record_received(3, max_bytes=5))
+
+    async def test_decode_data_message_rejects_invalid_base64(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not valid base64"):
+            decode_data_message({"data": "not-base64!"})
 
     async def test_tunnel_stream_close_waits_for_cancelled_tasks(self) -> None:
         task_cancelled = asyncio.Event()
