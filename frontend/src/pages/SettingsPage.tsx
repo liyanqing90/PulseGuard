@@ -1755,6 +1755,12 @@ function RunnerNodePanel() {
             {provisionResult?.deployment.compose_url && <Tag>{provisionResult.deployment.compose_url}</Tag>}
             <span>过期时间 {provisionResult?.deployment.expires_at ? formatDate(provisionResult.deployment.expires_at) : "-"}</span>
           </Space>
+          {provisionResult?.deployment.server_fingerprint && (
+            <div className="runner-provision-fingerprint">
+              <span>Server fingerprint</span>
+              <code>{provisionResult.deployment.server_fingerprint}</code>
+            </div>
+          )}
           <pre>{provisionResult?.deployment.command || ""}</pre>
           <span>命令只显示一次。重新生成会轮换 relay token，旧命令立即失效。</span>
         </Space>

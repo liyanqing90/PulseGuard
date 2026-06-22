@@ -24,10 +24,15 @@ class TunnelStream:
         return max_bytes is None or self.received_bytes <= max_bytes
 
     async def close(self) -> None:
-        for task in list(self.tasks):
+        current_task = asyncio.current_task()
+        wait_tasks = [task for task in list(self.tasks) if task is not current_task]
+        for task in wait_tasks:
             task.cancel()
         self.writer.close()
         await self.writer.wait_closed()
+        if wait_tasks:
+            await asyncio.gather(*wait_tasks, return_exceptions=True)
+            self.tasks.difference_update(wait_tasks)
 
 
 async def pump_reader_to_sender(

@@ -4344,6 +4344,27 @@ tr:last-child td {
   min-width: 64px;
 }
 
+.runner-provision-fingerprint {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.runner-provision-fingerprint span {
+  color: var(--muted);
+  font-size: var(--type-caption);
+  line-height: var(--lh-caption);
+}
+
+.runner-provision-fingerprint code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-family: var(--font-code);
+  font-size: var(--type-caption);
+  line-height: var(--lh-caption);
+}
+
 .worker-help-block {
   display: grid;
   gap: 6px;

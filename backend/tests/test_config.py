@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 
 class ConfigEnvTests(unittest.TestCase):
@@ -138,6 +140,26 @@ print(json.dumps({
         self.assertNotEqual(first_token, rotated_token)
         self.assertEqual(rotated_token, shown_token)
         self.assertIn("Add this child node manually", rotated_output)
+
+    def test_worker_startup_info_can_hide_token_for_relay_deployment(self) -> None:
+        from backend.app.worker import _print_startup_info
+
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            _print_startup_info(
+                "http://pulseguard-worker:8788",
+                "relay-worker",
+                "edge",
+                "pgrn_secret-token",
+                "env",
+                print_token=False,
+            )
+        output = buffer.getvalue()
+
+        self.assertNotIn("pgrn_secret-token", output)
+        self.assertIn("token: <hidden>", output)
+        self.assertIn("token logging is disabled", output)
+        self.assertNotIn("Add this child node manually", output)
 
     def _extract_worker_token(self, output: str) -> str:
         match = re.search(r"token: (pgrn_[A-Za-z0-9_-]+)", output)

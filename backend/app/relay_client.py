@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 import websockets
 
-from .config import RELAY_MAX_BODY_BYTES, RELAY_MAX_FRAME_BYTES
+from .config import RELAY_MAX_BODY_BYTES, RELAY_MAX_FRAME_BYTES, RELAY_STREAM_IDLE_TIMEOUT_SECONDS
 from .relay_tunnel import TunnelStream, decode_data_message, insecure_fingerprint_context, json_dumps, json_loads, pump_reader_to_sender
 
 
@@ -47,6 +47,25 @@ async def _heartbeat(websocket: Any, send_lock: asyncio.Lock) -> None:
         await _send_json(websocket, send_lock, {"type": "heartbeat"})
 
 
+async def _pump_worker_to_relay(
+    stream_id: str,
+    reader: asyncio.StreamReader,
+    websocket: Any,
+    send_lock: asyncio.Lock,
+    streams: dict[str, TunnelStream],
+) -> None:
+    try:
+        await pump_reader_to_sender(
+            stream_id,
+            reader,
+            lambda message: _send_json(websocket, send_lock, message),
+            max_bytes=RELAY_MAX_BODY_BYTES,
+            idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
+        )
+    finally:
+        streams.pop(stream_id, None)
+
+
 async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio.Lock, streams: dict[str, TunnelStream]) -> None:
     host, port = _worker_endpoint()
     try:
@@ -56,15 +75,25 @@ async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio
         return
     stream = TunnelStream(reader=reader, writer=writer)
     streams[stream_id] = stream
-    task = asyncio.create_task(
-        pump_reader_to_sender(
-            stream_id,
-            reader,
-            lambda message: _send_json(websocket, send_lock, message),
-            max_bytes=RELAY_MAX_BODY_BYTES,
-        )
-    )
+    task = asyncio.create_task(_pump_worker_to_relay(stream_id, reader, websocket, send_lock, streams))
     stream.tasks.add(task)
+
+
+async def _handle_relay_data_message(stream_id: str, message: dict[str, Any], streams: dict[str, TunnelStream]) -> None:
+    stream = streams.get(stream_id)
+    if not stream:
+        return
+    data = decode_data_message(message)
+    if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
+        streams.pop(stream_id, None)
+        await stream.close()
+        return
+    stream.writer.write(data)
+    try:
+        await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        streams.pop(stream_id, None)
+        await stream.close()
 
 
 async def run_once() -> None:
@@ -101,14 +130,7 @@ async def run_once() -> None:
                 if message_type == "open" and stream_id:
                     await _open_worker_stream(stream_id, websocket, send_lock, streams)
                 elif message_type == "data" and stream_id:
-                    stream = streams.get(stream_id)
-                    if stream:
-                        data = decode_data_message(message)
-                        if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
-                            await stream.close()
-                        else:
-                            stream.writer.write(data)
-                            await stream.writer.drain()
+                    await _handle_relay_data_message(stream_id, message, streams)
                 elif message_type in {"close", "error"} and stream_id:
                     stream = streams.pop(stream_id, None)
                     if stream:

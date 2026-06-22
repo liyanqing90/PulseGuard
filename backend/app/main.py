@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from .api_assertions import inspect_api_response
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
-from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
+from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_CONTROL_URL, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_PRINT_TOKEN, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs, relay_control_token
 from .relay_cert import relay_fingerprint
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
@@ -1436,9 +1436,12 @@ def _log_worker_startup_info() -> None:
     print(f"  name: {WORKER_NAME}", flush=True)
     print(f"  address: {WORKER_ADDRESS}", flush=True)
     print(f"  region: {WORKER_REGION}", flush=True)
-    print(f"  token: {WORKER_TOKEN}", flush=True)
+    print(f"  token: {WORKER_TOKEN if WORKER_PRINT_TOKEN else '<hidden>'}", flush=True)
     print(f"  token_source: {WORKER_TOKEN_SOURCE}", flush=True)
-    print("Add this child node manually in the main console with the address and token above.", flush=True)
+    if WORKER_PRINT_TOKEN:
+        print("Add this child node manually in the main console with the address and token above.", flush=True)
+    else:
+        print("Worker token is configured; token logging is disabled for this deployment.", flush=True)
     print("", flush=True)
 
 

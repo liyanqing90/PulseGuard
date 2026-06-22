@@ -59,3 +59,23 @@ class RelayTunnelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(stream.record_received(3, max_bytes=5))
         self.assertFalse(stream.record_received(3, max_bytes=5))
+
+    async def test_tunnel_stream_close_waits_for_cancelled_tasks(self) -> None:
+        task_cancelled = asyncio.Event()
+
+        async def wait_forever() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                task_cancelled.set()
+
+        task = asyncio.create_task(wait_forever())
+        stream = TunnelStream(reader=FakeReader([]), writer=FakeWriter())  # type: ignore[arg-type]
+        stream.tasks.add(task)
+        await asyncio.sleep(0)
+
+        await stream.close()
+
+        self.assertTrue(task.done())
+        self.assertTrue(task_cancelled.is_set())
+        self.assertNotIn(task, stream.tasks)

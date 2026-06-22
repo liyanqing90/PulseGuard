@@ -45,7 +45,14 @@ def main() -> None:
         _print_startup_info(config.WORKER_ADDRESS, config.WORKER_NAME, config.WORKER_REGION, config.WORKER_TOKEN, config.WORKER_TOKEN_SOURCE)
         return
 
-    _print_startup_info(config.WORKER_ADDRESS, config.WORKER_NAME, config.WORKER_REGION, config.WORKER_TOKEN, config.WORKER_TOKEN_SOURCE)
+    _print_startup_info(
+        config.WORKER_ADDRESS,
+        config.WORKER_NAME,
+        config.WORKER_REGION,
+        config.WORKER_TOKEN,
+        config.WORKER_TOKEN_SOURCE,
+        print_token=config.WORKER_PRINT_TOKEN,
+    )
     os.environ["PULSEGUARD_WORKER_INFO_PRINTED"] = "1"
 
     import uvicorn
@@ -64,16 +71,19 @@ def _rotate_token_file(token_file: Path) -> str:
     return token
 
 
-def _print_startup_info(address: str, name: str, region: str, token: str, token_source: str) -> None:
+def _print_startup_info(address: str, name: str, region: str, token: str, token_source: str, *, print_token: bool = True) -> None:
     display_address = address or "set this in the main console, for example http://<child-node-ip>:8788"
     print("", flush=True)
     print("PulseGuard worker node is ready.", flush=True)
     print(f"  name: {name}", flush=True)
     print(f"  address: {display_address}", flush=True)
     print(f"  region: {region}", flush=True)
-    print(f"  token: {token}", flush=True)
+    print(f"  token: {token if print_token else '<hidden>'}", flush=True)
     print(f"  token_source: {token_source}", flush=True)
-    print("Add this child node manually in the main console with the address and token above.", flush=True)
+    if print_token:
+        print("Add this child node manually in the main console with the address and token above.", flush=True)
+    else:
+        print("Worker token is configured; token logging is disabled for this deployment.", flush=True)
     print("", flush=True)
 
 
