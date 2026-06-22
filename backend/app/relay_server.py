@@ -327,8 +327,13 @@ async def relay_connect(websocket: WebSocket) -> None:
                     disconnect_reason = "relay token rotated"
                     return
             elif message_type in {"close", "error"}:
+                stream_id = str(message.get("stream_id") or "")
+                if not stream_id:
+                    disconnect_reason = "invalid relay message"
+                    await websocket.close(code=4400, reason="invalid relay message")
+                    return
                 async with session.stream_lock:
-                    stream = session.streams.pop(str(message.get("stream_id") or ""), None)
+                    stream = session.streams.pop(stream_id, None)
                 if stream:
                     await stream.close()
             else:
