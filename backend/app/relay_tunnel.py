@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import ssl
 from collections.abc import Awaitable, Callable
@@ -63,7 +64,10 @@ async def pump_reader_to_sender(
 
 
 def decode_data_message(message: dict[str, Any]) -> bytes:
-    return base64.b64decode(str(message.get("data") or ""))
+    try:
+        return base64.b64decode(str(message.get("data") or ""), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("relay data frame is not valid base64") from exc
 
 
 def json_dumps(message: dict[str, Any]) -> str:

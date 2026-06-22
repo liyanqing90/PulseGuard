@@ -311,7 +311,13 @@ async def relay_connect(websocket: WebSocket) -> None:
                 storage.mark_probe_runner_relay_seen(runner_id)
                 await session.send_json({"type": "heartbeat_ack"})
             elif message_type == "data":
-                if not await _handle_data_message(session, message):
+                try:
+                    keep_running = await _handle_data_message(session, message)
+                except ValueError:
+                    disconnect_reason = "invalid relay message"
+                    await websocket.close(code=4400, reason="invalid relay message")
+                    return
+                if not keep_running:
                     disconnect_reason = "relay token rotated"
                     return
             elif message_type in {"close", "error"}:
