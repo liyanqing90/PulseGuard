@@ -34,6 +34,12 @@ class FakeWebSocket:
         self.close_kwargs = kwargs
 
 
+class FailingCloseWebSocket(FakeWebSocket):
+    async def close(self, *args: object, **kwargs: object) -> None:
+        await super().close(*args, **kwargs)
+        raise RuntimeError("websocket close failed")
+
+
 class TextWebSocket:
     def __init__(self, text: str) -> None:
         self.text = text
@@ -62,6 +68,11 @@ class ConnectWebSocket(TextWebSocket):
             self.close_kwargs = kwargs
 
 
+class AcceptFailWebSocket:
+    async def accept(self) -> None:
+        raise RuntimeError("accept failed")
+
+
 class SessionWebSocket:
     def __init__(self, texts: list[str]) -> None:
         self.texts = list(texts)
@@ -83,6 +94,12 @@ class SessionWebSocket:
     async def close(self, *args: object, **kwargs: object) -> None:
         if self.close_kwargs is None:
             self.close_kwargs = kwargs
+
+
+class FailingCloseSessionWebSocket(SessionWebSocket):
+    async def close(self, *args: object, **kwargs: object) -> None:
+        await super().close(*args, **kwargs)
+        raise RuntimeError("websocket close failed")
 
 
 class BlockingReader:
@@ -120,6 +137,17 @@ class FakeWriter:
 class SlowDrainWriter(FakeWriter):
     async def drain(self) -> None:
         await asyncio.Event().wait()
+
+
+class FailingCloseWriter(FakeWriter):
+    async def wait_closed(self) -> None:
+        raise RuntimeError("writer close failed")
+
+
+class FailingWriteWriter(FakeWriter):
+    def write(self, data: bytes) -> None:
+        super().write(data)
+        raise RuntimeError("stream write failed")
 
 
 class FakeSession:
@@ -212,6 +240,12 @@ class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
 
+    async def test_public_connection_count_released_when_accept_fails(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "accept failed"):
+            await relay_server.relay_connect(AcceptFailWebSocket())  # type: ignore[arg-type]
+
+        self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
+
     async def test_receive_json_times_out_waiting_for_hello(self) -> None:
         with self.assertRaises(TimeoutError):
             await relay_server._receive_json(WaitingWebSocket(), timeout_seconds=0.01)  # type: ignore[arg-type]
@@ -282,6 +316,51 @@ class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
         self.assertNotIn("edge-1", relay_server.ACTIVE_SESSIONS)
         mark_disconnected.assert_called_once_with("edge-1", "invalid relay message")
+
+    async def test_connect_preserves_disconnect_reason_when_close_fails(self) -> None:
+        websocket = FailingCloseSessionWebSocket(
+            [
+                '{"type":"hello","runner_id":"edge-1","relay_token":"pgrl_secret","relay_token_version":1}',
+                '{"type":"bogus"}',
+            ]
+        )
+
+        with patch(
+            "backend.app.relay_server.storage.verify_probe_runner_relay_token",
+            return_value={"allocated_internal_port": 18001},
+        ), patch("backend.app.relay_server._start_internal_server", new=AsyncMock(return_value=FakeServer())), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_connected"
+        ), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_disconnected"
+        ) as mark_disconnected:
+            await relay_server.relay_connect(websocket)  # type: ignore[arg-type]
+
+        self.assertEqual(websocket.close_kwargs, {"code": 4400, "reason": "invalid relay message"})
+        mark_disconnected.assert_called_once_with("edge-1", "invalid relay message")
+
+    async def test_connect_records_unexpected_error_without_default_reason_overwrite(self) -> None:
+        websocket = SessionWebSocket(
+            [
+                '{"type":"hello","runner_id":"edge-1","relay_token":"pgrl_secret","relay_token_version":1}',
+            ]
+        )
+
+        with patch(
+            "backend.app.relay_server.storage.verify_probe_runner_relay_token",
+            return_value={"allocated_internal_port": 18001},
+        ), patch("backend.app.relay_server._start_internal_server", new=AsyncMock(return_value=FakeServer())), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_connected"
+        ), patch.object(
+            relay_server.RelaySession,
+            "send_json",
+            new=AsyncMock(side_effect=RuntimeError("ready send failed")),
+        ), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_disconnected"
+        ) as mark_disconnected:
+            with self.assertRaisesRegex(RuntimeError, "ready send failed"):
+                await relay_server.relay_connect(websocket)  # type: ignore[arg-type]
+
+        mark_disconnected.assert_called_once_with("edge-1", "ready send failed")
 
     async def test_connect_rejects_close_without_stream_id(self) -> None:
         websocket = SessionWebSocket(
@@ -447,6 +526,77 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket.close_kwargs, {"code": 4403, "reason": "relay token rotated"})
         self.assertEqual(writer.writes, [])
 
+    async def test_data_frame_token_rotation_close_failure_does_not_bubble(self) -> None:
+        websocket = FailingCloseWebSocket()
+        writer = FakeWriter()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams["stream-1"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=EmptyReader(),
+            writer=writer,
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value=None):
+            keep_running = await relay_server._handle_data_message(
+                session,
+                {"type": "data", "stream_id": "stream-1", "data": "c2hvdWxkLW5vdC13cml0ZQ=="},
+            )
+
+        self.assertFalse(keep_running)
+        self.assertEqual(websocket.close_kwargs, {"code": 4403, "reason": "relay token rotated"})
+        self.assertEqual(writer.writes, [])
+
+    async def test_tcp_client_token_rotation_sets_session_disconnect_reason(self) -> None:
+        websocket = FailingCloseWebSocket()
+        writer = FailingCloseWriter()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value=None):
+            await relay_server._tcp_client_connected(  # type: ignore[arg-type]
+                session,
+                EmptyReader(),
+                writer,
+            )
+
+        self.assertEqual(session.disconnect_reason, "relay token rotated")
+        self.assertTrue(writer.closed)
+        self.assertEqual(websocket.close_kwargs, {"code": 4403, "reason": "relay token rotated"})
+
+    async def test_tcp_client_send_failure_removes_stream_without_bubbling(self) -> None:
+        writer = FakeWriter()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch.object(
+            session,
+            "send_json",
+            new=AsyncMock(side_effect=RuntimeError("relay send failed")),
+        ):
+            await relay_server._tcp_client_connected(  # type: ignore[arg-type]
+                session,
+                EmptyReader(),
+                writer,
+            )
+
+        self.assertTrue(writer.closed)
+        self.assertEqual(session.streams, {})
+
     async def test_data_frame_rejects_invalid_payload_even_for_unknown_stream(self) -> None:
         session = relay_server.RelaySession(
             runner_id="edge-1",
@@ -507,6 +657,31 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(writer.closed)
         self.assertNotIn("stream-1", session.streams)
 
+    async def test_data_frame_write_failure_removes_closed_stream(self) -> None:
+        writer = FailingWriteWriter()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams["stream-1"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=EmptyReader(),
+            writer=writer,
+        )
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+            keep_running = await relay_server._handle_data_message(
+                session,
+                {"type": "data", "stream_id": "stream-1", "data": "cGF5bG9hZA=="},
+            )
+
+        self.assertTrue(keep_running)
+        self.assertEqual(writer.writes, [b"payload"])
+        self.assertTrue(writer.closed)
+        self.assertNotIn("stream-1", session.streams)
+
     async def test_internal_server_binds_configured_internal_host(self) -> None:
         async def handler(_reader: object, _writer: object) -> None:
             return None
@@ -557,3 +732,27 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(second_writer.closed)
         self.assertEqual(sum('"type":"open"' in message for message in websocket.messages), 1)
+
+    async def test_tcp_client_connection_rejects_extra_stream_close_failure(self) -> None:
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams["existing"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=EmptyReader(),
+            writer=FakeWriter(),
+        )
+        rejected_writer = FailingCloseWriter()
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+            await relay_server._tcp_client_connected(  # type: ignore[arg-type]
+                session,
+                EmptyReader(),
+                rejected_writer,
+            )
+
+        self.assertTrue(rejected_writer.closed)
+        self.assertIn("existing", session.streams)

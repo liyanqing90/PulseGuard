@@ -21,13 +21,35 @@ async def _send_json(websocket: Any, lock: asyncio.Lock, message: dict[str, Any]
         await websocket.send(json_dumps(message))
 
 
+async def _send_json_best_effort(websocket: Any, lock: asyncio.Lock, message: dict[str, Any]) -> None:
+    try:
+        await _send_json(websocket, lock, message)
+    except Exception:
+        pass
+
+
 def _worker_endpoint() -> tuple[str, int]:
     url = _env("PULSEGUARD_WORKER_URL", "http://pulseguard-worker:8788")
     parts = urlsplit(url)
     if parts.scheme not in {"http", ""}:
         raise RuntimeError("PULSEGUARD_WORKER_URL only supports http in relay mode")
     host = parts.hostname or "pulseguard-worker"
-    return host, int(parts.port or 8788)
+    try:
+        port = parts.port or 8788
+    except ValueError as exc:
+        raise RuntimeError("PULSEGUARD_WORKER_URL port is invalid") from exc
+    return host, port
+
+
+def _relay_token_version() -> int:
+    value = _env("PULSEGUARD_RELAY_TOKEN_VERSION", "1")
+    try:
+        token_version = int(value)
+    except ValueError as exc:
+        raise RuntimeError("PULSEGUARD_RELAY_TOKEN_VERSION must be an integer") from exc
+    if token_version < 1:
+        raise RuntimeError("PULSEGUARD_RELAY_TOKEN_VERSION must be positive")
+    return token_version
 
 
 def _assert_fingerprint(websocket: Any, expected: str) -> None:
@@ -57,17 +79,18 @@ async def _pump_worker_to_relay(
     streams: dict[str, TunnelStream],
 ) -> None:
     try:
-        await pump_reader_to_sender(
-            stream_id,
-            reader,
-            lambda message: _send_json(websocket, send_lock, message),
-            max_bytes=RELAY_MAX_BODY_BYTES,
-            idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
-        )
+        try:
+            await pump_reader_to_sender(
+                stream_id,
+                reader,
+                lambda message: _send_json(websocket, send_lock, message),
+                max_bytes=RELAY_MAX_BODY_BYTES,
+                idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            pass
     finally:
-        stream = streams.pop(stream_id, None)
-        if stream:
-            await stream.close()
+        await _close_stream_best_effort(streams, stream_id)
 
 
 async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio.Lock, streams: dict[str, TunnelStream]) -> None:
@@ -77,7 +100,7 @@ async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio
     try:
         reader, writer = await asyncio.open_connection(host, port)
     except Exception as exc:
-        await _send_json(websocket, send_lock, {"type": "error", "stream_id": stream_id, "message": str(exc)[:500]})
+        await _send_json_best_effort(websocket, send_lock, {"type": "error", "stream_id": stream_id, "message": str(exc)[:500]})
         return
     stream = TunnelStream(reader=reader, writer=writer)
     streams[stream_id] = stream
@@ -91,15 +114,28 @@ async def _handle_relay_data_message(stream_id: str, message: dict[str, Any], st
     if not stream:
         return
     if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
-        streams.pop(stream_id, None)
-        await stream.close()
+        await _close_stream_best_effort(streams, stream_id)
         return
-    stream.writer.write(data)
     try:
+        stream.writer.write(data)
         await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
-    except TimeoutError:
-        streams.pop(stream_id, None)
+    except Exception:
+        await _close_stream_best_effort(streams, stream_id)
+
+
+async def _close_stream_best_effort(streams: dict[str, TunnelStream], stream_id: str) -> None:
+    stream = streams.pop(stream_id, None)
+    if not stream:
+        return
+    try:
         await stream.close()
+    except Exception:
+        pass
+
+
+async def _close_all_streams_best_effort(streams: dict[str, TunnelStream]) -> None:
+    for stream_id in list(streams):
+        await _close_stream_best_effort(streams, stream_id)
 
 
 async def _handle_relay_message(
@@ -117,9 +153,7 @@ async def _handle_relay_message(
     elif message_type == "data" and stream_id:
         await _handle_relay_data_message(stream_id, message, streams)
     elif message_type in {"close", "error"} and stream_id:
-        stream = streams.pop(stream_id, None)
-        if stream:
-            await stream.close()
+        await _close_stream_best_effort(streams, stream_id)
     else:
         raise RuntimeError("invalid relay message")
 
@@ -129,7 +163,7 @@ async def run_once() -> None:
     runner_id = _env("PULSEGUARD_RUNNER_ID")
     relay_token = _env("PULSEGUARD_RELAY_TOKEN")
     fingerprint = _env("PULSEGUARD_RELAY_FINGERPRINT")
-    token_version = int(_env("PULSEGUARD_RELAY_TOKEN_VERSION", "1"))
+    token_version = _relay_token_version()
     if not relay_url or not runner_id or not relay_token:
         raise RuntimeError("PULSEGUARD_RELAY_URL, PULSEGUARD_RUNNER_ID, and PULSEGUARD_RELAY_TOKEN are required")
     if urlsplit(relay_url).scheme != "wss":
@@ -159,8 +193,7 @@ async def run_once() -> None:
         finally:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-            for stream in list(streams.values()):
-                await stream.close()
+            await _close_all_streams_best_effort(streams)
 
 
 async def main_loop() -> None:

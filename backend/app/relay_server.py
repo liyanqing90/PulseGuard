@@ -54,6 +54,7 @@ class RelaySession:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stream_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     streams: dict[str, TunnelStream] = field(default_factory=dict)
+    disconnect_reason: str | None = None
 
     async def send_json(self, message: dict[str, Any]) -> None:
         async with self.send_lock:
@@ -134,6 +135,21 @@ def _relay_session_credentials_valid(session: RelaySession) -> bool:
     return bool(storage.verify_probe_runner_relay_token(session.runner_id, session.token, session.token_version))
 
 
+async def _close_writer_best_effort(writer: asyncio.StreamWriter) -> None:
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def _close_websocket_best_effort(websocket: WebSocket, **kwargs: Any) -> None:
+    try:
+        await websocket.close(**kwargs)
+    except Exception:
+        pass
+
+
 async def revoke_relay_session(runner_id: str, reason: str = "revoked") -> bool:
     async with SESSION_LOCK:
         session = ACTIVE_SESSIONS.pop(runner_id, None)
@@ -158,36 +174,35 @@ async def relay_control_revoke(payload: dict[str, Any], authorization: str = Hea
 
 async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     if not _relay_session_credentials_valid(session):
-        writer.close()
-        await writer.wait_closed()
-        await session.websocket.close(code=4403, reason="relay token rotated")
+        session.disconnect_reason = "relay token rotated"
+        await _close_writer_best_effort(writer)
+        await _close_websocket_best_effort(session.websocket, code=4403, reason="relay token rotated")
         return
     async with session.stream_lock:
         if len(session.streams) >= RELAY_MAX_CONCURRENT_STREAMS:
-            writer.close()
-            await writer.wait_closed()
+            await _close_writer_best_effort(writer)
             return
         stream_id = uuid.uuid4().hex
         stream = TunnelStream(reader=reader, writer=writer)
         session.streams[stream_id] = stream
     try:
-        await session.send_json({"type": "open", "stream_id": stream_id})
-        task = asyncio.create_task(
-            pump_reader_to_sender(
-                stream_id,
-                reader,
-                session.send_json,
-                max_bytes=RELAY_MAX_BODY_BYTES,
-                idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
+        try:
+            await session.send_json({"type": "open", "stream_id": stream_id})
+            task = asyncio.create_task(
+                pump_reader_to_sender(
+                    stream_id,
+                    reader,
+                    session.send_json,
+                    max_bytes=RELAY_MAX_BODY_BYTES,
+                    idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
+                )
             )
-        )
-        stream.tasks.add(task)
-        await task
+            stream.tasks.add(task)
+            await task
+        except Exception:
+            pass
     finally:
-        async with session.stream_lock:
-            session.streams.pop(stream_id, None)
-        writer.close()
-        await writer.wait_closed()
+        await _close_stream_best_effort(session, stream_id)
 
 
 async def _start_internal_server(handler: Any, port: int) -> asyncio.AbstractServer:
@@ -196,7 +211,7 @@ async def _start_internal_server(handler: Any, port: int) -> asyncio.AbstractSer
 
 async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -> bool:
     if not _relay_session_credentials_valid(session):
-        await session.websocket.close(code=4403, reason="relay token rotated")
+        await _close_websocket_best_effort(session.websocket, code=4403, reason="relay token rotated")
         return False
     stream_id = str(message.get("stream_id") or "")
     if not stream_id:
@@ -208,10 +223,10 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
         if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
             close_stream = True
         else:
-            stream.writer.write(data)
             try:
+                stream.writer.write(data)
                 await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
-            except TimeoutError:
+            except Exception:
                 close_stream = True
         if close_stream:
             await _close_stream_best_effort(session, stream_id)
@@ -259,29 +274,29 @@ async def _open_relay_session(
 async def relay_connect(websocket: WebSocket) -> None:
     acquired = await _acquire_public_connection()
     if not acquired:
-        await websocket.close(code=4408, reason="relay connection limit exceeded")
+        await _close_websocket_best_effort(websocket, code=4408, reason="relay connection limit exceeded")
         return
-    await websocket.accept()
     session: RelaySession | None = None
     runner_id = ""
     disconnect_reason = "client disconnected"
     try:
+        await websocket.accept()
         try:
             hello = await _receive_json(websocket, RELAY_HELLO_TIMEOUT_SECONDS)
         except TimeoutError:
-            await websocket.close(code=4408, reason="relay hello timeout")
+            await _close_websocket_best_effort(websocket, code=4408, reason="relay hello timeout")
             return
         except ValueError:
-            await websocket.close(code=4400, reason="invalid relay message")
+            await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
             return
         if hello.get("type") != "hello":
-            await websocket.close(code=4400, reason="invalid hello")
+            await _close_websocket_best_effort(websocket, code=4400, reason="invalid hello")
             return
         runner_id = str(hello.get("runner_id") or "").strip()
         token = str(hello.get("relay_token") or "").strip()
         token_version_text = str(hello.get("relay_token_version") or "").strip()
         if not token_version_text.isdigit():
-            await websocket.close(code=4400, reason="invalid hello")
+            await _close_websocket_best_effort(websocket, code=4400, reason="invalid hello")
             return
         token_version = int(token_version_text)
         runner = storage.verify_probe_runner_relay_token(runner_id, token, token_version)
@@ -289,20 +304,19 @@ async def relay_connect(websocket: WebSocket) -> None:
         if not runner:
             storage.mark_probe_runner_relay_auth_failed(runner_id)
             await _record_auth_failure(auth_key)
-            await websocket.close(code=4403, reason="relay token invalid")
+            await _close_websocket_best_effort(websocket, code=4403, reason="relay token invalid")
             return
         _clear_auth_failure(auth_key)
         port = int(runner.get("allocated_internal_port") or 0)
         if port <= 0:
-            await websocket.close(code=4400, reason="runner has no internal port")
+            await _close_websocket_best_effort(websocket, code=4400, reason="runner has no internal port")
             return
         session_holder: dict[str, RelaySession] = {}
 
         async def handle_tcp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             current = session_holder.get("session")
             if current is None:
-                writer.close()
-                await writer.wait_closed()
+                await _close_writer_best_effort(writer)
                 return
             await _tcp_client_connected(current, reader, writer)
 
@@ -317,17 +331,17 @@ async def relay_connect(websocket: WebSocket) -> None:
                 message = await _receive_session_message(session)
             except TimeoutError:
                 disconnect_reason = "relay heartbeat timeout"
-                await websocket.close(code=4408, reason="relay heartbeat timeout")
+                await _close_websocket_best_effort(websocket, code=4408, reason="relay heartbeat timeout")
                 return
             except ValueError:
                 disconnect_reason = "invalid relay message"
-                await websocket.close(code=4400, reason="invalid relay message")
+                await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
                 return
             message_type = str(message.get("type") or "")
             if message_type == "heartbeat":
                 if not _relay_session_credentials_valid(session):
                     disconnect_reason = "relay token rotated"
-                    await websocket.close(code=4403, reason="relay token rotated")
+                    await _close_websocket_best_effort(websocket, code=4403, reason="relay token rotated")
                     return
                 session.last_seen_monotonic = time.monotonic()
                 storage.mark_probe_runner_relay_seen(runner_id)
@@ -337,7 +351,7 @@ async def relay_connect(websocket: WebSocket) -> None:
                     keep_running = await _handle_data_message(session, message)
                 except ValueError:
                     disconnect_reason = "invalid relay message"
-                    await websocket.close(code=4400, reason="invalid relay message")
+                    await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
                     return
                 if not keep_running:
                     disconnect_reason = "relay token rotated"
@@ -346,18 +360,20 @@ async def relay_connect(websocket: WebSocket) -> None:
                 stream_id = str(message.get("stream_id") or "")
                 if not stream_id:
                     disconnect_reason = "invalid relay message"
-                    await websocket.close(code=4400, reason="invalid relay message")
+                    await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
                     return
                 await _close_stream_best_effort(session, stream_id)
             else:
                 disconnect_reason = "invalid relay message"
-                await websocket.close(code=4400, reason="invalid relay message")
+                await _close_websocket_best_effort(websocket, code=4400, reason="invalid relay message")
                 return
     except WebSocketDisconnect:
         pass
     except Exception as exc:
+        disconnect_reason = str(exc)[:500]
         if runner_id:
-            storage.mark_probe_runner_relay_disconnected(runner_id, str(exc)[:500])
+            if session is None:
+                storage.mark_probe_runner_relay_disconnected(runner_id, disconnect_reason)
         raise
     finally:
         if session:
@@ -367,7 +383,7 @@ async def relay_connect(websocket: WebSocket) -> None:
                     ACTIVE_SESSIONS.pop(runner_id, None)
                     active_session = True
             if active_session:
-                storage.mark_probe_runner_relay_disconnected(runner_id, disconnect_reason)
+                storage.mark_probe_runner_relay_disconnected(runner_id, session.disconnect_reason or disconnect_reason)
             await session.close()
         await _release_public_connection()
 
