@@ -38,8 +38,9 @@ class SlowDrainWriter(FakeWriter):
 
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_pump_uses_idle_timeout_and_removes_closed_stream(self) -> None:
+        writer = FakeWriter()
         streams: dict[str, TunnelStream] = {
-            "stream-1": TunnelStream(reader=FakeReader(), writer=FakeWriter())  # type: ignore[arg-type]
+            "stream-1": TunnelStream(reader=FakeReader(), writer=writer)  # type: ignore[arg-type]
         }
 
         with patch("backend.app.relay_client.RELAY_STREAM_IDLE_TIMEOUT_SECONDS", 12), patch(
@@ -56,6 +57,7 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
 
         pump_reader_to_sender.assert_awaited_once()
         self.assertEqual(pump_reader_to_sender.call_args.kwargs["idle_timeout_seconds"], 12)
+        self.assertTrue(writer.closed)
         self.assertNotIn("stream-1", streams)
 
     async def test_relay_data_closes_worker_stream_when_drain_times_out(self) -> None:

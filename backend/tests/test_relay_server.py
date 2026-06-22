@@ -80,6 +80,11 @@ class FakeWriter:
         pass
 
 
+class SlowDrainWriter(FakeWriter):
+    async def drain(self) -> None:
+        await asyncio.Event().wait()
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.closed = False
@@ -291,6 +296,34 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(keep_running)
         self.assertEqual(websocket.close_kwargs, {"code": 4403, "reason": "relay token rotated"})
         self.assertEqual(writer.writes, [])
+
+    async def test_data_frame_drain_timeout_removes_closed_stream(self) -> None:
+        writer = SlowDrainWriter()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams["stream-1"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=EmptyReader(),
+            writer=writer,
+        )
+
+        with patch("backend.app.relay_server.RELAY_STREAM_IDLE_TIMEOUT_SECONDS", 0.01), patch(
+            "backend.app.relay_server.storage.verify_probe_runner_relay_token",
+            return_value={"ok": True},
+        ):
+            keep_running = await relay_server._handle_data_message(
+                session,
+                {"type": "data", "stream_id": "stream-1", "data": "cGF5bG9hZA=="},
+            )
+
+        self.assertTrue(keep_running)
+        self.assertEqual(writer.writes, [b"payload"])
+        self.assertTrue(writer.closed)
+        self.assertNotIn("stream-1", session.streams)
 
     async def test_internal_server_binds_configured_internal_host(self) -> None:
         async def handler(_reader: object, _writer: object) -> None:

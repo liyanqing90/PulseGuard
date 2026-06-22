@@ -63,7 +63,9 @@ async def _pump_worker_to_relay(
             idle_timeout_seconds=RELAY_STREAM_IDLE_TIMEOUT_SECONDS,
         )
     finally:
-        streams.pop(stream_id, None)
+        stream = streams.pop(stream_id, None)
+        if stream:
+            await stream.close()
 
 
 async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio.Lock, streams: dict[str, TunnelStream]) -> None:

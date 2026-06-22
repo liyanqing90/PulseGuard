@@ -198,17 +198,23 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
     if not _relay_session_credentials_valid(session):
         await session.websocket.close(code=4403, reason="relay token rotated")
         return False
-    stream = session.streams.get(str(message.get("stream_id") or ""))
+    stream_id = str(message.get("stream_id") or "")
+    stream = session.streams.get(stream_id)
     if stream:
         data = decode_data_message(message)
+        close_stream = False
         if not stream.record_received(len(data), RELAY_MAX_BODY_BYTES):
-            await stream.close()
+            close_stream = True
         else:
             stream.writer.write(data)
             try:
                 await asyncio.wait_for(stream.writer.drain(), timeout=RELAY_STREAM_IDLE_TIMEOUT_SECONDS)
             except TimeoutError:
-                await stream.close()
+                close_stream = True
+        if close_stream:
+            async with session.stream_lock:
+                session.streams.pop(stream_id, None)
+            await stream.close()
     return True
 
 
