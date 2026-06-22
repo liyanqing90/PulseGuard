@@ -109,6 +109,24 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(writer.closed)
         self.assertNotIn("stream-1", streams)
 
+    async def test_duplicate_open_frame_fails_before_worker_connection(self) -> None:
+        writer = FakeWriter()
+        streams: dict[str, TunnelStream] = {
+            "stream-1": TunnelStream(reader=FakeReader(), writer=writer)  # type: ignore[arg-type]
+        }
+
+        with patch("backend.app.relay_client.asyncio.open_connection", new_callable=AsyncMock) as open_connection:
+            with self.assertRaisesRegex(RuntimeError, "invalid relay message"):
+                await relay_client._handle_relay_message(
+                    {"type": "open", "stream_id": "stream-1"},
+                    object(),
+                    asyncio.Lock(),
+                    streams,
+                )
+
+        open_connection.assert_not_called()
+        self.assertIs(streams["stream-1"].writer, writer)
+
     async def test_relay_data_closes_worker_stream_when_drain_times_out(self) -> None:
         writer = SlowDrainWriter()
         streams: dict[str, TunnelStream] = {
