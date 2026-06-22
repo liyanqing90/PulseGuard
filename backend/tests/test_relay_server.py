@@ -58,7 +58,31 @@ class ConnectWebSocket(TextWebSocket):
         self.accepted = True
 
     async def close(self, *args: object, **kwargs: object) -> None:
-        self.close_kwargs = kwargs
+        if self.close_kwargs is None:
+            self.close_kwargs = kwargs
+
+
+class SessionWebSocket:
+    def __init__(self, texts: list[str]) -> None:
+        self.texts = list(texts)
+        self.accepted = False
+        self.messages: list[str] = []
+        self.close_kwargs: dict[str, object] | None = None
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def receive_text(self) -> str:
+        if not self.texts:
+            raise AssertionError("unexpected websocket receive")
+        return self.texts.pop(0)
+
+    async def send_text(self, message: str) -> None:
+        self.messages.append(message)
+
+    async def close(self, *args: object, **kwargs: object) -> None:
+        if self.close_kwargs is None:
+            self.close_kwargs = kwargs
 
 
 class BlockingReader:
@@ -165,6 +189,7 @@ class RelayServerControlTests(unittest.TestCase):
 
 class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
+        relay_server.ACTIVE_SESSIONS.clear()
         relay_server.PUBLIC_CONNECTIONS = 0
         relay_server.AUTH_FAILURES.clear()
 
@@ -221,6 +246,31 @@ class RelayServerEntryGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket.close_kwargs, {"code": 4400, "reason": "invalid hello"})
         self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
         verify_token.assert_not_called()
+
+    async def test_connect_rejects_unknown_session_message(self) -> None:
+        websocket = SessionWebSocket(
+            [
+                '{"type":"hello","runner_id":"edge-1","relay_token":"pgrl_secret","relay_token_version":1}',
+                '{"type":"bogus"}',
+            ]
+        )
+
+        with patch(
+            "backend.app.relay_server.storage.verify_probe_runner_relay_token",
+            return_value={"allocated_internal_port": 18001},
+        ), patch("backend.app.relay_server._start_internal_server", new=AsyncMock(return_value=FakeServer())), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_connected"
+        ), patch(
+            "backend.app.relay_server.storage.mark_probe_runner_relay_disconnected"
+        ) as mark_disconnected:
+            await relay_server.relay_connect(websocket)  # type: ignore[arg-type]
+
+        self.assertTrue(websocket.accepted)
+        self.assertEqual(websocket.messages, ['{"type":"ready"}'])
+        self.assertEqual(websocket.close_kwargs, {"code": 4400, "reason": "invalid relay message"})
+        self.assertEqual(relay_server.PUBLIC_CONNECTIONS, 0)
+        self.assertNotIn("edge-1", relay_server.ACTIVE_SESSIONS)
+        mark_disconnected.assert_called_once_with("edge-1", "invalid relay message")
 
 
 class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):

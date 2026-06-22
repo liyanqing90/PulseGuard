@@ -329,6 +329,10 @@ async def relay_connect(websocket: WebSocket) -> None:
                     stream = session.streams.pop(str(message.get("stream_id") or ""), None)
                 if stream:
                     await stream.close()
+            else:
+                disconnect_reason = "invalid relay message"
+                await websocket.close(code=4400, reason="invalid relay message")
+                return
     except WebSocketDisconnect:
         pass
     except Exception as exc:
