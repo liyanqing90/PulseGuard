@@ -71,6 +71,8 @@ async def _pump_worker_to_relay(
 
 
 async def _open_worker_stream(stream_id: str, websocket: Any, send_lock: asyncio.Lock, streams: dict[str, TunnelStream]) -> None:
+    if stream_id in streams:
+        raise RuntimeError("invalid relay message")
     host, port = _worker_endpoint()
     try:
         reader, writer = await asyncio.open_connection(host, port)
