@@ -36,7 +36,9 @@ def _assert_fingerprint(websocket: Any, expected: str) -> None:
         raise RuntimeError("PULSEGUARD_RELAY_FINGERPRINT is required")
     ssl_object = websocket.transport.get_extra_info("ssl_object")
     cert = ssl_object.getpeercert(binary_form=True) if ssl_object else None
-    actual = hashlib.sha256(cert or b"").hexdigest()
+    if not cert:
+        raise RuntimeError("relay server TLS certificate is unavailable")
+    actual = hashlib.sha256(cert).hexdigest()
     if actual != normalized:
         raise RuntimeError("relay server fingerprint mismatch")
 
@@ -106,6 +108,8 @@ async def run_once() -> None:
     token_version = int(_env("PULSEGUARD_RELAY_TOKEN_VERSION", "1"))
     if not relay_url or not runner_id or not relay_token:
         raise RuntimeError("PULSEGUARD_RELAY_URL, PULSEGUARD_RUNNER_ID, and PULSEGUARD_RELAY_TOKEN are required")
+    if urlsplit(relay_url).scheme != "wss":
+        raise RuntimeError("PULSEGUARD_RELAY_URL must use wss:// in relay mode")
     send_lock = asyncio.Lock()
     streams: dict[str, TunnelStream] = {}
     async with websockets.connect(
