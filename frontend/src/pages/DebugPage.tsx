@@ -163,7 +163,7 @@ export function DebugPage() {
         </div>
       </Card>
 
-      {error && <Alert type="error" message={error} showIcon />}
+      {error && <Alert type="error" title={error} showIcon />}
 
       <div className="debug-layout">
         <Card className="debug-form" title="任务配置">

@@ -529,6 +529,159 @@ class RunArchiveStorageTests(unittest.TestCase):
         self.assertEqual([run["status"] for run in remaining], ["ok"])
 
 
+class MonitoringTrendStorageTests(unittest.TestCase):
+    def test_custom_window_includes_overlapping_first_source_bucket(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Partial Bucket API"))
+            base = datetime.now().astimezone().replace(second=0, microsecond=0)
+            base = base - timedelta(minutes=base.minute % 5)
+            run_at = base + timedelta(minutes=2)
+            run = storage.create_run(check)
+            set_run_started_at(int(run["id"]), run_at)
+            storage.finish_run(int(run["id"]), run_payload("ok", duration_ms=180))
+
+            trend = storage.get_check_trend(
+                int(check["id"]),
+                period="custom",
+                start=(base + timedelta(minutes=1)).isoformat(timespec="seconds"),
+                end=(base + timedelta(minutes=4)).isoformat(timespec="seconds"),
+            )
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 1)
+
+    def test_long_custom_window_keeps_task_points_under_limit(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Long Range API"))
+            start = datetime.now().astimezone().replace(microsecond=0) - timedelta(days=3650)
+            for index in range(30):
+                run = storage.create_run(check)
+                set_run_started_at(int(run["id"]), start + timedelta(days=index * 100))
+                storage.finish_run(int(run["id"]), run_payload("ok", duration_ms=120 + index))
+
+            page = storage.list_monitoring_trends(
+                period="custom",
+                start=start.isoformat(timespec="seconds"),
+                end=(start + timedelta(days=3650)).isoformat(timespec="seconds"),
+                page=1,
+                page_size=12,
+            )
+
+        self.assertLessEqual(len(page["tasks"]["items"][0]["points"]), 20)
+
+    def test_finish_run_records_rollups_and_merges_percentiles_from_histograms(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Latency API"))
+            now = datetime.now().astimezone().replace(microsecond=0)
+
+            for index in range(20):
+                run = storage.create_run(check)
+                set_run_started_at(int(run["id"]), now - timedelta(hours=2, minutes=index))
+                storage.finish_run(int(run["id"]), run_payload("ok", duration_ms=100))
+            for index in range(20):
+                run = storage.create_run(check)
+                set_run_started_at(int(run["id"]), now - timedelta(hours=1, minutes=index))
+                storage.finish_run(int(run["id"]), run_payload("ok", duration_ms=3000))
+
+            trend = storage.get_check_trend(
+                int(check["id"]),
+                period="custom",
+                start=(now - timedelta(hours=3)).isoformat(timespec="seconds"),
+                end=(now + timedelta(minutes=1)).isoformat(timespec="seconds"),
+            )
+            page = storage.list_monitoring_trends(
+                period="custom",
+                start=(now - timedelta(hours=3)).isoformat(timespec="seconds"),
+                end=(now + timedelta(minutes=1)).isoformat(timespec="seconds"),
+                page=1,
+                page_size=12,
+            )
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 40)
+        self.assertEqual(trend["avg_duration_ms"], 1550)
+        self.assertEqual(trend["p95_duration_ms"], 3000)
+        self.assertIsNone(trend["p99_duration_ms"])
+        summary = next(item for item in page["summaries"] if item["check_type"] == "api")
+        self.assertEqual(summary["success_count"], 40)
+        self.assertEqual(summary["p95_duration_ms"], 3000)
+
+    def test_failed_runs_count_failures_without_latency_and_runner_failures_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Failures API"))
+            target = storage.create_run(check)
+            storage.finish_run(int(target["id"]), {**run_payload("failed", "target down", duration_ms=900), "failure_kind": "target"})
+            runner = storage.create_run(check)
+            storage.finish_run(int(runner["id"]), {**run_payload("failed", "runner down", duration_ms=1200), "failure_kind": "runner"})
+
+            trend = storage.get_check_trend(int(check["id"]))
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 0)
+        self.assertEqual(trend["failure_count"], 1)
+        self.assertIsNone(trend["avg_duration_ms"])
+
+    def test_draft_and_non_health_runs_do_not_enter_trends(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Formal API"))
+            draft = storage.create_run({"id": 0, "name": "Draft", "type": "api"})
+            storage.finish_run(int(draft["id"]), run_payload("ok", duration_ms=100))
+            verification = storage.create_run(
+                {
+                    **check,
+                    "_run": {"trigger": "manual-verify", "observation_kind": "verification", "affects_health": False},
+                }
+            )
+            storage.finish_run(int(verification["id"]), run_payload("ok", duration_ms=100))
+
+            trend = storage.get_check_trend(int(check["id"]))
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 0)
+        self.assertEqual(trend["failure_count"], 0)
+        self.assertEqual(trend["points"], [])
+
+    def test_monitoring_trends_paginates_tasks(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            for index in range(13):
+                storage.create_check(api_check_data(f"Paged API {index:02d}"))
+
+            page = storage.list_monitoring_trends(page=2, page_size=12, check_type="api")
+
+        self.assertEqual(page["tasks"]["total"], 13)
+        self.assertEqual(page["tasks"]["page"], 2)
+        self.assertEqual(len(page["tasks"]["items"]), 1)
+        self.assertEqual(page["tasks"]["items"][0]["check_type"], "api")
+
+
 class AuditAndVersionStorageTests(unittest.TestCase):
     def test_record_audit_event_lists_payload(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -808,6 +961,107 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertIsNotNone(new_verified)
         self.assertNotEqual(rotated["token"], "runner-secret-1")
 
+    def test_relay_provisioning_requires_session_and_worker_health_before_scheduling(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "RELAY_INTERNAL_PORT_START", 19001), patch.object(storage, "RELAY_INTERNAL_PORT_END", 19002):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            relay_token = provisioned["relay_token"]
+            version = int(provisioned["relay_token_version"])
+            pending = storage.get_probe_runner(runner_id)
+            verified = storage.verify_probe_runner_relay_token(runner_id, relay_token, version)
+            connecting = storage.mark_probe_runner_relay_connected(runner_id)
+            healthy = storage.mark_probe_runner_available(runner_id, {"status": "ok", "metadata": {"source": "relay"}})
+
+        self.assertEqual(pending["connection_mode"], "relay")
+        self.assertEqual(pending["status"], "pending_deployment")
+        self.assertFalse(storage.can_schedule_runner(pending))
+        self.assertIsNotNone(verified)
+        self.assertEqual(connecting["status"], "connecting")
+        self.assertFalse(storage.can_schedule_runner(connecting))
+        self.assertEqual(healthy["status"], "available")
+        self.assertTrue(storage.can_schedule_runner(healthy))
+        self.assertEqual(healthy["address"], "http://pulseguard-relay:19001")
+
+    def test_relay_regenerate_invalidates_old_relay_token_without_rotating_worker_token(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            old_relay_token = provisioned["relay_token"]
+            old_worker_token = provisioned["worker_token"]
+            old_version = int(provisioned["relay_token_version"])
+            regenerated = storage.regenerate_probe_runner_provision(runner_id)
+            old_verified = storage.verify_probe_runner_relay_token(runner_id, old_relay_token, old_version)
+            new_verified = storage.verify_probe_runner_relay_token(
+                runner_id,
+                str(regenerated["relay_token"]),
+                int(regenerated["relay_token_version"]),
+            )
+
+        self.assertIsNone(old_verified)
+        self.assertIsNotNone(new_verified)
+        self.assertEqual(regenerated["worker_token"], old_worker_token)
+        self.assertEqual(int(regenerated["relay_token_version"]), old_version + 1)
+
+    def test_relay_regeneration_keeps_old_session_failures_pre_activation(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            storage.mark_probe_runner_relay_connected(runner_id)
+            storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+            regenerated = storage.regenerate_probe_runner_provision(runner_id)
+            disconnected = storage.mark_probe_runner_relay_disconnected(runner_id, "old session closed")
+            auth_failed = storage.mark_probe_runner_relay_auth_failed(runner_id)
+
+        self.assertEqual(regenerated["status"], "pending_deployment")
+        self.assertEqual(disconnected["status"], "pending_deployment")
+        self.assertEqual(auth_failed["status"], "pending_deployment")
+        self.assertFalse(storage.should_notify_probe_runner_unavailable(disconnected or {}))
+        self.assertFalse(storage.should_notify_probe_runner_unavailable(auth_failed or {}))
+
+    def test_relay_deploy_command_expiry_only_blocks_pre_activation_sessions(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            active = storage.provision_probe_runner({"name": "Active Relay", "network_region": "edge"})
+            active_id = str(active["runner_id"])
+            storage.mark_probe_runner_relay_connected(active_id)
+            storage.mark_probe_runner_available(active_id, {"status": "ok"})
+            pending = storage.provision_probe_runner({"name": "Pending Relay", "network_region": "edge"})
+            pending_id = str(pending["runner_id"])
+            expired_at = (datetime.now().astimezone() - timedelta(hours=1)).isoformat(timespec="seconds")
+            with storage._connect() as conn:
+                conn.execute(
+                    "UPDATE probe_runners SET deploy_command_expires_at = ? WHERE runner_id IN (?, ?)",
+                    (expired_at, active_id, pending_id),
+                )
+
+            active_verified = storage.verify_probe_runner_relay_token(
+                active_id,
+                str(active["relay_token"]),
+                int(active["relay_token_version"]),
+            )
+            pending_verified = storage.verify_probe_runner_relay_token(
+                pending_id,
+                str(pending["relay_token"]),
+                int(pending["relay_token_version"]),
+            )
+            pending_after_expiry = storage.get_probe_runner(pending_id)
+
+        self.assertIsNotNone(active_verified)
+        self.assertEqual(active_verified["status"], "available")
+        self.assertIsNone(pending_verified)
+        self.assertEqual(pending_after_expiry["status"], "expired")
+
     def test_runner_unavailable_notification_is_deduped_until_recovery(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
@@ -960,11 +1214,11 @@ class SettingsVariableStorageTests(unittest.TestCase):
         self.assertFalse(public["value_set"])
 
 
-def run_payload(status: str, error_message: str | None = None) -> dict[str, object]:
+def run_payload(status: str, error_message: str | None = None, duration_ms: int = 10) -> dict[str, object]:
     return {
         "status": status,
         "finished_at": storage.now_iso(),
-        "duration_ms": 10,
+        "duration_ms": duration_ms,
         "error_message": error_message,
         "error_stack": None,
         "logs": "",
@@ -974,6 +1228,14 @@ def run_payload(status: str, error_message: str | None = None) -> dict[str, obje
         "request_snapshot": None,
         "response_snapshot": None,
     }
+
+
+def set_run_started_at(run_id: int, started_at: datetime) -> None:
+    with storage._connect() as conn:
+        conn.execute(
+            "UPDATE runs SET started_at = ?, created_at = ? WHERE id = ?",
+            (started_at.isoformat(timespec="seconds"), started_at.isoformat(timespec="seconds"), run_id),
+        )
 
 
 def insert_trend_run(

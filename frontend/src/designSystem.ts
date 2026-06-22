@@ -4,24 +4,26 @@ const uiFont =
   '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", system-ui, sans-serif';
 
 export const palette = {
-  background: "#f4f6f8",
-  surface: "#fbfcfd",
-  surfaceMuted: "#f1f4f7",
-  text: "#1f2328",
-  textMuted: "#656d76",
-  border: "#d8dee4",
-  borderStrong: "#afb8c1",
-  primary: "#2563eb",
-  primaryHover: "#1d4ed8",
-  primarySoft: "#eaf2ff",
-  success: "#16833a",
-  successSoft: "#dafbe1",
-  danger: "#d1242f",
-  dangerSoft: "#ffebe9",
-  warning: "#9a6700",
-  warningSoft: "#fff8c5",
-  info: "#0969da",
-  infoSoft: "#ddf4ff"
+  background: "#fafafa",
+  surface: "#ffffff",
+  surfaceMuted: "#f2f2f2",
+  surfaceRaised: "#ffffff",
+  text: "#171717",
+  textMuted: "#4d4d4d",
+  textTertiary: "#7d7d7d",
+  border: "#e6e6e6",
+  borderStrong: "#c9c9c9",
+  primary: "#006bff",
+  primaryHover: "#0059ec",
+  primarySoft: "#f0f7ff",
+  success: "#107d32",
+  successSoft: "#ecfdec",
+  danger: "#d8001b",
+  dangerSoft: "#ffeeef",
+  warning: "#aa4d00",
+  warningSoft: "#fff6de",
+  info: "#006bff",
+  infoSoft: "#f0f7ff"
 } as const;
 
 export const fonts = {
@@ -52,7 +54,9 @@ export const typeScale = {
 export const radii = {
   small: 4,
   tight: 6,
-  default: 8
+  default: 8,
+  overlay: 12,
+  fullscreen: 16
 } as const;
 
 export const spacing = {
@@ -60,10 +64,12 @@ export const spacing = {
   xs: 6,
   field: 12,
   sm: 10,
+  compact: 12,
   surface: 14,
   md: 16,
   lg: 24,
   xl: 32,
+  section: 40,
   xxl: 48
 } as const;
 
@@ -116,11 +122,17 @@ export const pulseGuardTheme: ThemeConfig = {
     colorInfo: palette.info,
     colorBgBase: palette.background,
     colorBgContainer: palette.surface,
+    colorBgElevated: palette.surfaceRaised,
     colorBgLayout: palette.background,
     colorBorder: palette.border,
     colorBorderSecondary: palette.border,
     colorText: palette.text,
     colorTextSecondary: palette.textMuted,
+    colorTextTertiary: palette.textTertiary,
+    colorFillQuaternary: palette.surfaceMuted,
+    colorFillTertiary: "#ebebeb",
+    controlItemBgHover: "#f2f2f2",
+    controlItemBgActive: palette.primarySoft,
     motionDurationFast: "0.12s",
     motionDurationMid: "0.16s",
     motionDurationSlow: "0.22s",
@@ -180,8 +192,10 @@ export const pulseGuardTheme: ThemeConfig = {
       itemHeight: 40,
       itemMarginBlock: 3,
       itemMarginInline: 0,
-      itemSelectedBg: palette.primarySoft,
-      itemSelectedColor: palette.primaryHover
+      itemHoverBg: palette.surfaceMuted,
+      itemHoverColor: palette.text,
+      itemSelectedBg: palette.surfaceMuted,
+      itemSelectedColor: palette.text
     },
     Modal: {
       borderRadiusLG: radii.default

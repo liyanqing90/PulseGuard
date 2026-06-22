@@ -19,6 +19,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import { api } from "../api";
+import { Button as UiButton } from "./ui/button";
 import type { CheckPayload, UiAssertion, UiAssertionType, UiElementCandidate, UiInspectResult, UiRuleInspectItem, UiRuleInspectResult } from "../types";
 import { createUiAssertion, parseUiAssertions, serializeUiAssertions, UI_ASSERTION_LABELS } from "../uiAssertions";
 import { VIEWPORT_PRESETS } from "./ViewportModeControl";
@@ -587,14 +588,11 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                           .filter(Boolean)
                           .join(" ")}
                       >
-                        <div
+                        <UiButton
                           className="ui-candidate-main"
-                          role="button"
-                          tabIndex={0}
+                          variant="ghost"
                           onClick={() => selectCandidate(candidate, "candidate")}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") selectCandidate(candidate, "candidate");
-                          }}
+                          aria-label={`选择候选元素 ${candidateDisplayName(candidate)}`}
                         >
                           <span className="ui-candidate-meta">
                             <Tag>{candidateKindLabel(candidate)}</Tag>
@@ -607,7 +605,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
                           </strong>
                           <small title={candidate.selector}>{candidate.selector}</small>
                           {candidate.text && <em title={candidate.text}>{candidate.text}</em>}
-                        </div>
+                        </UiButton>
                         <div className="ui-candidate-rule-grid">
                           {CANDIDATE_RULE_OPTIONS.map((option) => (
                             <Checkbox

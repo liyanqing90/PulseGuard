@@ -1,0 +1,69 @@
+services:
+  pulseguard-worker:
+    image: ${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+    container_name: pulseguard-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker", "--host", "0.0.0.0", "--port", "8788"]
+    expose:
+      - "8788"
+    volumes:
+      - pulseguard-worker-data:/app/data
+      - pulseguard-worker-reports:/app/reports
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PULSEGUARD_HOST=0.0.0.0
+      - PULSEGUARD_PORT=8788
+      - PULSEGUARD_WORKER_NAME=${PULSEGUARD_WORKER_NAME:-worker}
+      - PULSEGUARD_WORKER_REGION=${PULSEGUARD_WORKER_REGION:-local}
+      - PULSEGUARD_WORKER_TOKEN=${PULSEGUARD_WORKER_TOKEN:?PULSEGUARD_WORKER_TOKEN is required}
+      - PULSEGUARD_DATA_DIR=/app/data
+      - PULSEGUARD_REPORTS_DIR=/app/reports
+      - PULSEGUARD_WORKER_IMAGE=${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_UPDATE_IMAGE=${PULSEGUARD_WORKER_UPDATE_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_UPDATER_URL=${PULSEGUARD_WORKER_UPDATER_URL:-}
+    mem_limit: 1g
+    cpus: 1.0
+
+  pulseguard-relay-client:
+    image: ${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+    container_name: pulseguard-relay-client
+    restart: unless-stopped
+    command: ["python", "-m", "app.relay_client"]
+    depends_on:
+      - pulseguard-worker
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PULSEGUARD_RUNNER_ID=${PULSEGUARD_RUNNER_ID:?PULSEGUARD_RUNNER_ID is required}
+      - PULSEGUARD_RELAY_URL=${PULSEGUARD_RELAY_URL:?PULSEGUARD_RELAY_URL is required}
+      - PULSEGUARD_RELAY_TOKEN=${PULSEGUARD_RELAY_TOKEN:?PULSEGUARD_RELAY_TOKEN is required}
+      - PULSEGUARD_RELAY_TOKEN_VERSION=${PULSEGUARD_RELAY_TOKEN_VERSION:-1}
+      - PULSEGUARD_RELAY_FINGERPRINT=${PULSEGUARD_RELAY_FINGERPRINT:?PULSEGUARD_RELAY_FINGERPRINT is required}
+      - PULSEGUARD_WORKER_URL=http://pulseguard-worker:8788
+    mem_limit: 256m
+    cpus: 0.25
+
+  pulseguard-worker-updater:
+    image: ${PULSEGUARD_WORKER_UPDATER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker-updater:codex-github-publish}
+    container_name: pulseguard-worker-updater
+    restart: unless-stopped
+    profiles:
+      - updater
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-compose.relay-worker.yml:/workspace/docker-compose.relay-worker.yml:ro
+      - pulseguard-worker-data:/app/data
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-pulseguard-worker}
+      - PULSEGUARD_WORKER_TOKEN=${PULSEGUARD_WORKER_TOKEN:?PULSEGUARD_WORKER_TOKEN is required}
+      - PULSEGUARD_WORKER_COMPOSE_FILE=/workspace/docker-compose.relay-worker.yml
+      - PULSEGUARD_WORKER_SERVICE=pulseguard-worker
+      - PULSEGUARD_WORKER_CONTAINER=pulseguard-worker
+      - PULSEGUARD_WORKER_IMAGE=${PULSEGUARD_WORKER_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_UPDATE_IMAGE=${PULSEGUARD_WORKER_UPDATE_IMAGE:-ghcr.io/liyanqing90/pulseguard-worker:codex-github-publish}
+      - PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES=${PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES:-ghcr.io/liyanqing90/pulseguard-worker}
+      - PULSEGUARD_WORKER_HEALTH_URL=http://pulseguard-worker:8788/api/worker/health
+
+volumes:
+  pulseguard-worker-data:
+  pulseguard-worker-reports:

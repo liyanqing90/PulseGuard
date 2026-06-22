@@ -541,6 +541,123 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertIn("pgrn_", response.text)
 
+    def test_provision_runner_returns_relay_deployment_command(self) -> None:
+        runner = {
+            "runner_id": "edge-1",
+            "name": "Edge Runner",
+            "address": "http://pulseguard-relay:18001",
+            "network_region": "edge",
+            "status": "pending_deployment",
+            "enabled": True,
+            "role": "child",
+            "connection_mode": "relay",
+            "available": False,
+            "token_set": True,
+            "token_hint": "abc123",
+            "relay_token": "pgrl_relay-token",
+            "worker_token": "pgrn_worker-token",
+            "relay_token_version": 1,
+            "deploy_command_expires_at": "2026-06-19T00:00:00+08:00",
+        }
+
+        with patch("backend.app.main.RELAY_ENABLED", True), patch(
+            "backend.app.main.RELAY_PUBLIC_HOST", "203.0.113.10"
+        ), patch("backend.app.main.RELAY_PUBLIC_PORT", 9443), patch(
+            "backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"
+        ), patch(
+            "backend.app.main.storage.provision_probe_runner", return_value=runner
+        ) as provision_probe_runner, patch("backend.app.main.storage.record_audit_event"), patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).post(
+                "/api/runners/provision",
+                json={
+                    "name": "Edge Runner",
+                    "network_region": "edge",
+                    "target_platform": "linux",
+                    "compose_url": "https://deploy.example.com/docker-compose.relay-worker.yml",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["connection_mode"], "relay")
+        self.assertIn("deployment", payload)
+        self.assertIn("PULSEGUARD_RELAY_URL", payload["deployment"]["command"])
+        self.assertIn(
+            "https://deploy.example.com/docker-compose.relay-worker.yml",
+            payload["deployment"]["command"],
+        )
+        self.assertEqual(payload["deployment"]["compose_url"], "https://deploy.example.com/docker-compose.relay-worker.yml")
+        self.assertNotIn("codex/github-publish", payload["deployment"]["command"])
+        self.assertIn("pgrl_relay-token", payload["deployment"]["command"])
+        self.assertIn("pgrn_worker-token", payload["deployment"]["command"])
+        self.assertNotIn("relay_token", payload)
+        self.assertNotIn("worker_token", payload)
+        provision_probe_runner.assert_called_once()
+
+    def test_provision_runner_rejects_invalid_compose_url(self) -> None:
+        with patch("backend.app.main.RELAY_ENABLED", True), patch(
+            "backend.app.main.RELAY_PUBLIC_HOST", "203.0.113.10"
+        ), patch("backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"):
+            response = TestClient(app).post(
+                "/api/runners/provision",
+                json={
+                    "name": "Edge Runner",
+                    "network_region": "edge",
+                    "target_platform": "linux",
+                    "compose_url": "docker-compose.relay-worker.yml",
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("http(s)", response.text)
+
+    def test_regenerate_runner_provision_uses_supplied_compose_url(self) -> None:
+        runner = {
+            "runner_id": "edge-1",
+            "name": "Edge Runner",
+            "address": "http://pulseguard-relay:18001",
+            "network_region": "edge",
+            "status": "pending_deployment",
+            "enabled": True,
+            "role": "child",
+            "connection_mode": "relay",
+            "available": False,
+            "token_set": True,
+            "token_hint": "abc123",
+            "relay_token": "pgrl_rotated-token",
+            "worker_token": "pgrn_worker-token",
+            "relay_token_version": 2,
+            "deploy_command_expires_at": "2026-06-19T00:00:00+08:00",
+        }
+
+        with patch("backend.app.main.RELAY_ENABLED", True), patch(
+            "backend.app.main.RELAY_PUBLIC_HOST", "203.0.113.10"
+        ), patch("backend.app.main.RELAY_PUBLIC_PORT", 9443), patch(
+            "backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"
+        ), patch(
+            "backend.app.main.storage.regenerate_probe_runner_provision", return_value=runner
+        ), patch("backend.app.main.storage.record_audit_event"), patch(
+            "backend.app.main.storage.get_settings", return_value={}
+        ):
+            response = TestClient(app).post(
+                "/api/runners/edge-1/provision/regenerate",
+                json={
+                    "name": "Edge Runner",
+                    "network_region": "edge",
+                    "target_platform": "powershell",
+                    "compose_url": "https://deploy.example.com/custom-relay-worker.yml",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["deployment"]["target_platform"], "powershell")
+        self.assertEqual(payload["deployment"]["compose_url"], "https://deploy.example.com/custom-relay-worker.yml")
+        self.assertIn("https://deploy.example.com/custom-relay-worker.yml", payload["deployment"]["command"])
+        self.assertNotIn("codex/github-publish", payload["deployment"]["command"])
+
     def test_update_child_runner_normalizes_bare_address(self) -> None:
         current = {"runner_id": "office-1", "name": "Office Runner", "role": "child"}
         updated = {
@@ -826,6 +943,31 @@ class RunRouteTests(unittest.TestCase):
         self.assertEqual(json.loads(payload["request_snapshot"])["url"], "https://run.example.com/api")
         self.assertEqual(json.loads(payload["response_snapshot"])["status_code"], 200)
         get_check.assert_not_called()
+
+    def test_monitoring_trends_route_passes_filters(self) -> None:
+        payload = {"period": "7d", "start": "s", "end": "e", "summaries": [], "tasks": {"items": [], "total": 0, "page": 2, "page_size": 12}}
+        with patch("backend.app.main.storage.list_monitoring_trends", return_value=payload) as list_monitoring_trends:
+            response = TestClient(app).get("/api/monitoring-trends?period=7d&type=api&q=health&page=2&page_size=12")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        list_monitoring_trends.assert_called_once_with(
+            period="7d",
+            start=None,
+            end=None,
+            check_type="api",
+            q="health",
+            page=2,
+            page_size=12,
+            hour_start=None,
+            hour_end=None,
+        )
+
+    def test_check_trend_route_returns_404_for_missing_check(self) -> None:
+        with patch("backend.app.main.storage.get_check_trend", return_value=None):
+            response = TestClient(app).get("/api/checks/404/trend")
+
+        self.assertEqual(response.status_code, 404)
 
     def test_runs_route_accepts_run_group_filter(self) -> None:
         with patch("backend.app.main.storage.list_runs", return_value=[]) as list_runs:

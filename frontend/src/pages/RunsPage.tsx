@@ -318,7 +318,7 @@ export function RunsPage() {
 
   return (
     <div className="page-content">
-      {error && <Alert type="error" message={error} showIcon />}
+      {error && <Alert type="error" title={error} showIcon />}
 
       <section className="history-toolbar">
         <div className="history-filter-row">

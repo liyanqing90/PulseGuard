@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 import hashlib
@@ -9,7 +10,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from .artifacts import cleanup_old_artifacts
@@ -20,7 +21,7 @@ from .browser_types import (
     normalize_browser_types,
     normalized_browser_settings,
 )
-from .config import BACKUPS_DIR, DB_PATH, ensure_runtime_dirs
+from .config import BACKUPS_DIR, DB_PATH, RELAY_DEPLOY_COMMAND_TTL_HOURS, RELAY_INTERNAL_HOST, RELAY_INTERNAL_PORT_END, RELAY_INTERNAL_PORT_START, ensure_runtime_dirs
 from .defaults import DEFAULT_SETTINGS, DEMO_CHECKS
 from .monitoring import HEALTH_STATES, next_health_state, run_metadata
 from .schemas import normalize_settings_values
@@ -34,6 +35,10 @@ RUNNER_HEARTBEAT_TIMEOUT_SECONDS = 120
 RUNNER_ROLES = {"local", "child"}
 RUNNER_SELECTION_MODES = {"selected_parallel", "round_robin_all"}
 DEPLOYMENT_STATE_KEY = "deployment_window"
+RUNNER_CONNECTION_MODES = {"manual", "relay"}
+RELAY_PRE_ACTIVATION_STATUSES = {"pending_deployment", "expired", "connecting"}
+RELAY_HEARTBEAT_TIMEOUT_SECONDS = 60
+RELAY_PORT_QUARANTINE_SECONDS = 10 * 60
 RUN_SUMMARY_COLUMNS = (
     "id",
     "check_id",
@@ -64,6 +69,31 @@ RUN_SUMMARY_COLUMNS = (
     "run_group_id",
     "created_at",
 )
+TREND_GRANULARITIES: tuple[tuple[str, int], ...] = (("5m", 300), ("1h", 3600), ("1d", 86400))
+TREND_GRANULARITY_SECONDS = dict(TREND_GRANULARITIES)
+TREND_LATENCY_BUCKETS_MS = (
+    50,
+    100,
+    200,
+    300,
+    500,
+    750,
+    1000,
+    1500,
+    2000,
+    3000,
+    5000,
+    7500,
+    10000,
+    15000,
+    30000,
+    60000,
+    120000,
+    300000,
+)
+TREND_PERIOD_SECONDS = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+TREND_DISPLAY_BUCKET_SECONDS = (300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800, 604800, 1209600, 2592000)
+TREND_SUMMARY_CHECK_IDS = {"ui": -1, "api": -2}
 
 
 def now_iso() -> str:
@@ -211,6 +241,23 @@ def init_db() -> None:
                 UNIQUE(archive_date, check_type, status)
             );
 
+            CREATE TABLE IF NOT EXISTS trend_rollups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                check_id INTEGER NOT NULL,
+                check_type TEXT NOT NULL,
+                bucket_granularity TEXT NOT NULL,
+                bucket_start TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                duration_sum_ms INTEGER NOT NULL DEFAULT 0,
+                avg_duration_ms INTEGER,
+                p95_duration_ms INTEGER,
+                p99_duration_ms INTEGER,
+                latency_histogram_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(check_id, bucket_granularity, bucket_start)
+            );
+
             CREATE TABLE IF NOT EXISTS probe_runners (
                 runner_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -226,11 +273,26 @@ def init_db() -> None:
                 token_value TEXT NOT NULL DEFAULT '',
                 token_hash TEXT NOT NULL DEFAULT '',
                 token_hint TEXT NOT NULL DEFAULT '',
+                connection_mode TEXT NOT NULL DEFAULT 'manual',
+                relay_token_hash TEXT NOT NULL DEFAULT '',
+                relay_token_hint TEXT NOT NULL DEFAULT '',
+                relay_token_version INTEGER NOT NULL DEFAULT 0,
+                allocated_internal_port INTEGER,
+                deploy_command_expires_at TEXT,
+                relay_last_seen_at TEXT,
+                worker_health_last_success_at TEXT,
+                last_disconnect_reason TEXT NOT NULL DEFAULT '',
+                was_available INTEGER NOT NULL DEFAULT 0,
                 unavailable_since TEXT,
                 unavailable_notified_at TEXT,
                 created_at TEXT NOT NULL DEFAULT '',
                 last_seen_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS relay_port_quarantine (
+                port INTEGER PRIMARY KEY,
+                released_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS runner_cursors (
@@ -264,7 +326,10 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_check_versions_check_id ON check_versions(check_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_run_archives_date ON run_archives(archive_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_trend_rollups_bucket ON trend_rollups(bucket_granularity, bucket_start);
+            CREATE INDEX IF NOT EXISTS idx_trend_rollups_type_bucket ON trend_rollups(check_type, bucket_granularity, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_probe_runners_region ON probe_runners(network_region, status);
+            CREATE INDEX IF NOT EXISTS idx_probe_runners_relay_port ON probe_runners(allocated_internal_port);
             CREATE INDEX IF NOT EXISTS idx_anomaly_cycles_check_status ON anomaly_cycles(check_id, status, opened_at DESC);
             """
         )
@@ -302,6 +367,7 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_page_filter_started ON runs(observation_kind, check_type, status, started_at DESC, id DESC)"
         )
+        _backfill_trend_rollups(conn)
 
 
 def list_checks(check_type: str | None = None, enabled_only: bool = False, refresh_stale: bool = True) -> list[dict[str, Any]]:
@@ -686,6 +752,107 @@ def _run_browser_type(check: dict[str, Any], runner: dict[str, Any]) -> str:
     return str(runner.get("browser_type") or check.get("_browser_type") or check.get("browser_type") or "")
 
 
+def list_monitoring_trends(
+    period: str = "24h",
+    start: str | None = None,
+    end: str | None = None,
+    check_type: str | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 12,
+    hour_start: str | None = None,
+    hour_end: str | None = None,
+) -> dict[str, Any]:
+    range_start, range_end = _trend_window(period, start, end)
+    hour_window = _parse_hour_window(hour_start, hour_end)
+    page = max(1, int(page))
+    page_size = max(1, min(50, int(page_size)))
+    normalized_type = _normalize_trend_check_type(check_type)
+    query = (q or "").strip()
+    refresh_stale_statuses()
+    with _LOCK, _connect() as conn:
+        total, checks = _monitoring_checks_page(conn, normalized_type, query, page, page_size)
+        summary_types = [normalized_type] if normalized_type else ["ui", "api"]
+        summary_ids = [TREND_SUMMARY_CHECK_IDS[item] for item in summary_types]
+        summaries_by_id = _trend_series_by_check(
+            conn, summary_ids, range_start, range_end, 100, hour_window=hour_window
+        )
+        task_ids = [int(check["id"]) for check in checks]
+        tasks_by_id = _trend_series_by_check(
+            conn, task_ids, range_start, range_end, 20, hour_window=hour_window
+        )
+
+    return {
+        "period": period,
+        "start": range_start.isoformat(timespec="seconds"),
+        "end": range_end.isoformat(timespec="seconds"),
+        "hour_start": hour_start if hour_window else None,
+        "hour_end": hour_end if hour_window else None,
+        "summaries": [
+            {
+                "check_type": item,
+                "label": "UI" if item == "ui" else "API",
+                **summaries_by_id.get(TREND_SUMMARY_CHECK_IDS[item], _empty_trend_series()),
+            }
+            for item in summary_types
+        ],
+        "tasks": {
+            "items": [
+                {
+                    "check_id": int(check["id"]),
+                    "name": check["name"],
+                    "check_type": check["type"],
+                    "enabled": bool(check["enabled"]),
+                    "monitor_status": check.get("monitor_status") or "unknown",
+                    "last_run_at": check.get("last_run_at"),
+                    "last_duration_ms": check.get("last_duration_ms"),
+                    **tasks_by_id.get(int(check["id"]), _empty_trend_series()),
+                }
+                for check in checks
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        },
+    }
+
+
+def get_check_trend(
+    check_id: int,
+    period: str = "24h",
+    start: str | None = None,
+    end: str | None = None,
+    hour_start: str | None = None,
+    hour_end: str | None = None,
+) -> dict[str, Any] | None:
+    check = get_check(check_id)
+    if not check:
+        return None
+    range_start, range_end = _trend_window(period, start, end)
+    hour_window = _parse_hour_window(hour_start, hour_end)
+    with _LOCK, _connect() as conn:
+        series = _trend_series_by_check(
+            conn, [check_id], range_start, range_end, 100, hour_window=hour_window
+        ).get(check_id, _empty_trend_series())
+    return {
+        "period": period,
+        "start": range_start.isoformat(timespec="seconds"),
+        "end": range_end.isoformat(timespec="seconds"),
+        "hour_start": hour_start if hour_window else None,
+        "hour_end": hour_end if hour_window else None,
+        "check": {
+            "id": int(check["id"]),
+            "name": check["name"],
+            "type": check["type"],
+            "enabled": bool(check["enabled"]),
+            "monitor_status": check.get("monitor_status") or "unknown",
+            "last_run_at": check.get("last_run_at"),
+            "last_duration_ms": check.get("last_duration_ms"),
+        },
+        **series,
+    }
+
+
 def create_run(check: dict[str, Any], status: str = "running", error_message: str | None = None) -> dict[str, Any]:
     timestamp = now_iso()
     finished_at = timestamp if status == "skipped" else None
@@ -802,6 +969,11 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
         )
         if cursor.rowcount == 0:
             return None
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None and not row["trend_recorded_at"]:
+            recorded = _record_trend_rollups(conn, row)
+            if recorded:
+                conn.execute("UPDATE runs SET trend_recorded_at = ? WHERE id = ?", (now_iso(), run_id))
     return get_run(run_id)
 
 
@@ -872,8 +1044,8 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
             INSERT INTO probe_runners (
                 runner_id, name, address, network_region, browser_version, installed_browser_types_json, available_browser_types_json, status,
                 metadata_json, enabled, role, token_value, token_hash, token_hint, created_at,
-                last_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                connection_mode, last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 runner_id,
@@ -891,6 +1063,7 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
                 runner_token_hash(token) if token else "",
                 _token_hint(token),
                 timestamp,
+                "manual",
                 timestamp,
                 timestamp,
             ),
@@ -898,6 +1071,92 @@ def create_probe_runner(data: dict[str, Any], *, generate_token: bool = True) ->
     runner = get_probe_runner(runner_id) or {}
     if generated_token:
         runner["token"] = token
+    return runner
+
+
+def provision_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
+    runner_id = _normalize_runner_id(data.get("runner_id") or f"runner-{uuid.uuid4().hex[:8]}")
+    relay_token = create_relay_token()
+    worker_token = create_runner_token()
+    timestamp = now_iso()
+    expires_at = (datetime.now().astimezone() + timedelta(hours=RELAY_DEPLOY_COMMAND_TTL_HOURS)).isoformat(timespec="seconds")
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
+        if conn.execute("SELECT 1 FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone():
+            raise ValueError("Runner ID already exists")
+        port = _allocate_relay_internal_port(conn)
+        conn.execute(
+            """
+            INSERT INTO probe_runners (
+                runner_id, name, address, network_region, browser_version, status,
+                metadata_json, enabled, role, token_value, token_hash, token_hint,
+                connection_mode, relay_token_hash, relay_token_hint, relay_token_version,
+                allocated_internal_port, deploy_command_expires_at, created_at,
+                last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                runner_id,
+                str(data.get("name") or runner_id).strip(),
+                f"http://{RELAY_INTERNAL_HOST}:{port}",
+                str(data.get("network_region") or "local").strip() or "local",
+                "",
+                "pending_deployment",
+                json.dumps(metadata, ensure_ascii=False),
+                1 if data.get("enabled", True) else 0,
+                "child",
+                worker_token,
+                runner_token_hash(worker_token),
+                _token_hint(worker_token),
+                "relay",
+                relay_token_hash(relay_token),
+                _token_hint(relay_token),
+                1,
+                port,
+                expires_at,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+    runner = get_probe_runner(runner_id) or {}
+    runner["relay_token"] = relay_token
+    runner["worker_token"] = worker_token
+    return runner
+
+
+def regenerate_probe_runner_provision(runner_id: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    relay_token = create_relay_token()
+    timestamp = now_iso()
+    expires_at = (datetime.now().astimezone() + timedelta(hours=RELAY_DEPLOY_COMMAND_TTL_HOURS)).isoformat(timespec="seconds")
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        if not row:
+            return None
+        current = _normalize_probe_runner(row)
+        if current.get("connection_mode") != "relay":
+            raise ValueError("手动添加的 Runner 不能重新生成 relay 部署命令")
+        conn.execute(
+            """
+            UPDATE probe_runners
+            SET relay_token_hash = ?,
+                relay_token_hint = ?,
+                relay_token_version = COALESCE(relay_token_version, 0) + 1,
+                deploy_command_expires_at = ?,
+                status = 'pending_deployment',
+                relay_last_seen_at = NULL,
+                worker_health_last_success_at = NULL,
+                last_disconnect_reason = 'deployment command regenerated',
+                updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (relay_token_hash(relay_token), _token_hint(relay_token), expires_at, timestamp, runner_id),
+        )
+    runner = get_probe_runner(runner_id) or {}
+    runner["relay_token"] = relay_token
+    runner["worker_token"] = get_probe_runner_token(runner_id)
     return runner
 
 
@@ -957,6 +1216,8 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
     metadata = health.get("metadata") if isinstance(health.get("metadata"), dict) else {}
     timestamp = now_iso()
     with _LOCK, _connect() as conn:
+        current = conn.execute("SELECT connection_mode FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        next_status = "available" if current and str(current["connection_mode"] or "") == "relay" else status
         cursor = conn.execute(
             """
             UPDATE probe_runners
@@ -967,16 +1228,19 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
                 metadata_json = ?,
                 unavailable_since = NULL,
                 unavailable_notified_at = NULL,
+                worker_health_last_success_at = ?,
+                was_available = 1,
                 last_seen_at = ?,
                 updated_at = ?
             WHERE runner_id = ?
             """,
             (
-                status,
+                next_status,
                 browser_version,
                 json.dumps(installed_browser_types, ensure_ascii=False),
                 json.dumps(available_browser_types, ensure_ascii=False),
                 json.dumps(metadata, ensure_ascii=False),
+                timestamp,
                 timestamp,
                 timestamp,
                 runner_id,
@@ -992,7 +1256,13 @@ def delete_probe_runner(runner_id: str) -> bool:
     if runner_id == LOCAL_RUNNER_ID:
         raise ValueError("local Runner cannot be deleted")
     with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT allocated_internal_port FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         cursor = conn.execute("DELETE FROM probe_runners WHERE runner_id = ?", (runner_id,))
+        if cursor.rowcount > 0 and row and row["allocated_internal_port"]:
+            conn.execute(
+                "INSERT OR REPLACE INTO relay_port_quarantine(port, released_at) VALUES (?, ?)",
+                (int(row["allocated_internal_port"]), now_iso()),
+            )
         return cursor.rowcount > 0
 
 
@@ -1018,12 +1288,14 @@ def rotate_probe_runner_token(runner_id: str) -> dict[str, Any] | None:
 
 def get_probe_runner(runner_id: str) -> dict[str, Any] | None:
     with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     return _normalize_probe_runner(row) if row else None
 
 
 def list_probe_runners(limit: int = 100) -> list[dict[str, Any]]:
     with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
         rows = conn.execute(
             """
             SELECT *
@@ -1038,6 +1310,7 @@ def list_probe_runners(limit: int = 100) -> list[dict[str, Any]]:
 
 def list_enabled_probe_runners() -> list[dict[str, Any]]:
     with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
         rows = conn.execute(
             """
             SELECT *
@@ -1049,12 +1322,17 @@ def list_enabled_probe_runners() -> list[dict[str, Any]]:
     return [_normalize_probe_runner(row) for row in rows]
 
 
+def list_schedulable_probe_runners() -> list[dict[str, Any]]:
+    return [runner for runner in list_enabled_probe_runners() if can_schedule_runner(runner)]
+
+
 def list_probe_runners_by_ids(runner_ids: list[str]) -> list[dict[str, Any]]:
     ids = _normalize_runner_ids(runner_ids)
     if not ids:
         return []
     placeholders = ",".join("?" for _ in ids)
     with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
         rows = conn.execute(f"SELECT * FROM probe_runners WHERE runner_id IN ({placeholders})", ids).fetchall()
     by_id = {_normalize_probe_runner(row)["runner_id"]: _normalize_probe_runner(row) for row in rows}
     return [by_id[runner_id] for runner_id in ids if runner_id in by_id]
@@ -1081,7 +1359,15 @@ def create_runner_token() -> str:
     return f"pgrn_{secrets.token_urlsafe(32)}"
 
 
+def create_relay_token() -> str:
+    return f"pgrl_{secrets.token_urlsafe(32)}"
+
+
 def runner_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def relay_token_hash(token: str) -> str:
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
@@ -1110,19 +1396,167 @@ def get_probe_runner_token(runner_id: str) -> str:
     return str(row["token_value"] or "") if row else ""
 
 
-def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> dict[str, Any] | None:
+def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    token = str(token or "").strip()
+    if not token:
+        return None
+    with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
+        row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+    if not row:
+        return None
+    expected_hash = str(row["relay_token_hash"] or "")
+    expected_version = int(row["relay_token_version"] or 0)
+    if str(row["connection_mode"] or "") != "relay":
+        return None
+    if int(version or 0) != expected_version:
+        return None
+    if not secrets.compare_digest(expected_hash, relay_token_hash(token)):
+        return None
+    expires_at = str(row["deploy_command_expires_at"] or "")
+    try:
+        expired = bool(expires_at and datetime.fromisoformat(expires_at) < datetime.now().astimezone())
+    except ValueError:
+        expired = False
+    status = str(row["status"] or "")
+    if expired and status in RELAY_PRE_ACTIVATION_STATUSES:
+        return None
+    return _normalize_probe_runner(row)
+
+
+def mark_probe_runner_relay_connected(runner_id: str) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
             UPDATE probe_runners
+            SET status = 'connecting',
+                relay_last_seen_at = ?,
+                last_disconnect_reason = '',
+                last_seen_at = ?,
+                updated_at = ?
+            WHERE runner_id = ? AND connection_mode = 'relay'
+            """,
+            (timestamp, timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def mark_probe_runner_relay_seen(runner_id: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET relay_last_seen_at = ?,
+                last_seen_at = ?,
+                updated_at = ?
+            WHERE runner_id = ? AND connection_mode = 'relay'
+            """,
+            (timestamp, timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def mark_probe_runner_relay_disconnected(runner_id: str, reason: str = "") -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT status, was_available FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        current_status = str(row["status"] or "") if row else ""
+        if current_status in RELAY_PRE_ACTIVATION_STATUSES:
+            status = current_status
+        else:
+            status = "unavailable" if row and int(row["was_available"] or 0) else "connecting"
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
             SET status = ?,
-                unavailable_since = COALESCE(unavailable_since, ?),
+                last_disconnect_reason = ?,
+                unavailable_since = CASE WHEN ? = 'unavailable' THEN COALESCE(unavailable_since, ?) ELSE unavailable_since END,
+                updated_at = ?
+            WHERE runner_id = ? AND connection_mode = 'relay'
+            """,
+            (status, str(reason or "")[:500], status, timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def mark_probe_runner_relay_auth_failed(runner_id: str) -> dict[str, Any] | None:
+    try:
+        runner_id = _normalize_runner_id(runner_id)
+    except ValueError:
+        return None
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT status, was_available FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        current_status = str(row["status"] or "") if row else ""
+        if current_status in RELAY_PRE_ACTIVATION_STATUSES:
+            status = current_status
+        else:
+            status = "auth_failed" if row and int(row["was_available"] or 0) else "pending_deployment"
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = ?,
+                last_disconnect_reason = 'relay authentication failed',
+                unavailable_since = CASE WHEN ? = 'auth_failed' THEN COALESCE(unavailable_since, ?) ELSE unavailable_since END,
+                updated_at = ?
+            WHERE runner_id = ? AND connection_mode = 'relay'
+            """,
+            (status, status, timestamp, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def can_schedule_runner(runner_or_id: dict[str, Any] | str) -> bool:
+    runner = get_probe_runner(runner_or_id) if isinstance(runner_or_id, str) else runner_or_id
+    if not runner or not runner.get("enabled"):
+        return False
+    if str(runner.get("role") or "") == "local":
+        return runner.get("available", False)
+    if str(runner.get("connection_mode") or "manual") != "relay":
+        return runner.get("available", False)
+    if str(runner.get("status") or "") != "available":
+        return False
+    return _timestamp_is_fresh(runner.get("relay_last_seen_at"), RELAY_HEARTBEAT_TIMEOUT_SECONDS) and _timestamp_is_fresh(
+        runner.get("worker_health_last_success_at"),
+        RUNNER_HEARTBEAT_TIMEOUT_SECONDS,
+    )
+
+
+def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        row = conn.execute("SELECT connection_mode, was_available, status FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        next_status = status
+        if row and str(row["connection_mode"] or "") == "relay":
+            current_status = str(row["status"] or "")
+            if current_status in RELAY_PRE_ACTIVATION_STATUSES:
+                next_status = current_status
+            else:
+                next_status = "unavailable" if int(row["was_available"] or 0) else "connecting"
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = ?,
+                unavailable_since = CASE WHEN ? IN ('offline', 'unavailable', 'unhealthy', 'auth_failed') THEN COALESCE(unavailable_since, ?) ELSE unavailable_since END,
                 updated_at = ?
             WHERE runner_id = ?
             """,
-            (status, timestamp, timestamp, runner_id),
+            (next_status, next_status, timestamp, timestamp, runner_id),
         )
         if cursor.rowcount == 0:
             return None
@@ -1147,7 +1581,11 @@ def mark_probe_runner_unavailable_notified(runner_id: str) -> dict[str, Any] | N
 
 
 def should_notify_probe_runner_unavailable(runner: dict[str, Any]) -> bool:
-    return bool(runner.get("enabled")) and str(runner.get("role") or "") != "local" and not runner.get("available") and not runner.get("unavailable_notified_at")
+    if not bool(runner.get("enabled")) or str(runner.get("role") or "") == "local" or runner.get("available") or runner.get("unavailable_notified_at"):
+        return False
+    if str(runner.get("connection_mode") or "manual") == "relay":
+        return bool(runner.get("was_available")) and str(runner.get("status") or "") in {"unavailable", "unhealthy", "auth_failed"}
+    return True
 
 
 def next_runner_cursor(scope: str, count: int) -> int:
@@ -1985,6 +2423,406 @@ def _percentile(values: list[int], percentile: float) -> int | None:
     return values[index]
 
 
+def _trend_window(period: str, start: str | None, end: str | None) -> tuple[datetime, datetime]:
+    normalized = (period or "24h").strip()
+    if normalized not in {"24h", "7d", "30d", "custom"}:
+        raise ValueError("趋势周期无效")
+    now = datetime.now().astimezone().replace(microsecond=0)
+    range_end = _parse_trend_datetime(end) if end else now
+    if start:
+        range_start = _parse_trend_datetime(start)
+    elif normalized == "custom":
+        range_start = range_end - timedelta(days=1)
+    else:
+        range_start = range_end - timedelta(seconds=TREND_PERIOD_SECONDS[normalized])
+    if range_start >= range_end:
+        raise ValueError("趋势开始时间必须早于结束时间")
+    return range_start, range_end
+
+
+def _parse_trend_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("趋势时间格式无效") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone().replace(microsecond=0)
+
+
+def _normalize_trend_check_type(check_type: str | None) -> str | None:
+    if not check_type:
+        return None
+    if check_type not in {"ui", "api"}:
+        raise ValueError("任务类型无效")
+    return check_type
+
+
+def _monitoring_checks_page(
+    conn: sqlite3.Connection,
+    check_type: str | None,
+    q: str,
+    page: int,
+    page_size: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if check_type:
+        clauses.append("c.type = ?")
+        params.append(check_type)
+    if q:
+        clauses.append("c.name LIKE ?")
+        params.append(f"%{q}%")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    total = int(conn.execute(f"SELECT COUNT(*) AS count FROM checks c{where}", params).fetchone()["count"])
+    rows = conn.execute(
+        f"""
+        SELECT c.*, s.current_status, s.monitor_status, s.consecutive_failures,
+               s.consecutive_successes, s.last_success_at, s.last_failed_at,
+               s.last_run_at, s.last_run_id, s.last_error, s.last_scheduled_at,
+               s.last_scheduled_run_id, s.last_state_changed_at,
+               r.duration_ms AS last_duration_ms
+        FROM checks c
+        LEFT JOIN check_status s ON s.check_id = c.id
+        LEFT JOIN runs r ON r.id = s.last_run_id
+        {where}
+        ORDER BY c.updated_at DESC, c.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*params, page_size, (page - 1) * page_size],
+    ).fetchall()
+    return total, [_normalize_check(row) for row in rows]
+
+
+def _trend_series_by_check(
+    conn: sqlite3.Connection,
+    check_ids: list[int],
+    range_start: datetime,
+    range_end: datetime,
+    max_points: int,
+    hour_window: tuple[time, time] | None = None,
+) -> dict[int, dict[str, Any]]:
+    if not check_ids:
+        return {}
+    display_seconds = _trend_display_bucket_seconds(range_start, range_end, max_points)
+    if hour_window is not None:
+        display_seconds = max(display_seconds, 3600)
+        source_granularity = _trend_hour_window_source_granularity(hour_window)
+    else:
+        source_granularity = _trend_source_granularity(display_seconds)
+    query_start = _trend_rollup_bucket_start(range_start, TREND_GRANULARITY_SECONDS[source_granularity])
+    placeholders = ", ".join("?" for _ in check_ids)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM trend_rollups
+        WHERE check_id IN ({placeholders})
+          AND bucket_granularity = ?
+          AND bucket_start >= ?
+          AND bucket_start < ?
+        ORDER BY bucket_start ASC
+        """,
+        [
+            *check_ids,
+            source_granularity,
+            query_start.isoformat(timespec="seconds"),
+            range_end.isoformat(timespec="seconds"),
+        ],
+    ).fetchall()
+    totals = {check_id: _empty_trend_accumulator() for check_id in check_ids}
+    buckets: dict[int, dict[str, dict[str, Any]]] = {check_id: {} for check_id in check_ids}
+    for row in rows:
+        check_id = int(row["check_id"])
+        if check_id not in buckets:
+            continue
+        bucket_dt = _parse_trend_datetime(row["bucket_start"])
+        if hour_window is not None and not _hour_in_window(bucket_dt.time(), hour_window):
+            continue
+        _merge_rollup_into_accumulator(totals[check_id], row)
+        bucket_start = _display_bucket_start(bucket_dt, range_start, display_seconds)
+        bucket_key = bucket_start.isoformat(timespec="seconds")
+        bucket = buckets[check_id].setdefault(bucket_key, _empty_trend_accumulator())
+        _merge_rollup_into_accumulator(bucket, row)
+    result: dict[int, dict[str, Any]] = {}
+    for check_id in check_ids:
+        points = [
+            {"bucket_start": bucket_start, **_trend_metrics(accumulator)}
+            for bucket_start, accumulator in sorted(buckets[check_id].items())
+        ]
+        result[check_id] = {**_trend_metrics(totals[check_id]), "points": points}
+    return result
+
+
+def _parse_hour_window(hour_start: str | None, hour_end: str | None) -> tuple[time, time] | None:
+    if not hour_start and not hour_end:
+        return None
+    if not hour_start or not hour_end:
+        raise ValueError("小时段必须同时提供开始与结束")
+    start_t = _parse_clock_time(hour_start)
+    end_t = _parse_clock_time(hour_end)
+    if start_t == end_t:
+        raise ValueError("小时段开始与结束不能相同")
+    return start_t, end_t
+
+
+def _parse_clock_time(value: str) -> time:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("小时段格式无效")
+    parts = text.split(":")
+    if len(parts) < 2 or len(parts) > 3:
+        raise ValueError("小时段格式无效")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError as exc:
+        raise ValueError("小时段格式无效") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("小时段必须在 00:00 - 23:59 之间")
+    return time(hour=hour, minute=minute)
+
+
+def _hour_in_window(value: time, window: tuple[time, time]) -> bool:
+    start_t, end_t = window
+    if start_t < end_t:
+        return start_t <= value < end_t
+    # crosses midnight (e.g. 22:00 -> 02:00)
+    return value >= start_t or value < end_t
+
+
+def _trend_hour_window_source_granularity(hour_window: tuple[time, time]) -> str:
+    start_t, end_t = hour_window
+    if start_t.minute or end_t.minute:
+        return "5m"
+    return "1h"
+
+
+def _trend_display_bucket_seconds(range_start: datetime, range_end: datetime, max_points: int) -> int:
+    seconds = max(1, int((range_end - range_start).total_seconds()))
+    raw = max(1, math.ceil(seconds / max(1, max_points)))
+    for bucket in TREND_DISPLAY_BUCKET_SECONDS:
+        if bucket >= raw:
+            return bucket
+    return math.ceil(raw / 86400) * 86400
+
+
+def _trend_source_granularity(display_seconds: int) -> str:
+    if display_seconds <= 1800:
+        return "5m"
+    if display_seconds <= 43200:
+        return "1h"
+    return "1d"
+
+
+def _display_bucket_start(value: datetime, range_start: datetime, bucket_seconds: int) -> datetime:
+    offset = max(0, int((value - range_start).total_seconds()))
+    return range_start + timedelta(seconds=(offset // bucket_seconds) * bucket_seconds)
+
+
+def _empty_trend_series() -> dict[str, Any]:
+    return {**_trend_metrics(_empty_trend_accumulator()), "points": []}
+
+
+def _empty_trend_accumulator() -> dict[str, Any]:
+    return {"success_count": 0, "failure_count": 0, "duration_sum_ms": 0, "histogram": {}}
+
+
+def _merge_rollup_into_accumulator(accumulator: dict[str, Any], row: sqlite3.Row) -> None:
+    accumulator["success_count"] += int(row["success_count"] or 0)
+    accumulator["failure_count"] += int(row["failure_count"] or 0)
+    accumulator["duration_sum_ms"] += int(row["duration_sum_ms"] or 0)
+    histogram = accumulator["histogram"]
+    for bucket, count in _load_histogram(row["latency_histogram_json"]).items():
+        histogram[bucket] = int(histogram.get(bucket, 0)) + int(count)
+
+
+def _trend_metrics(accumulator: dict[str, Any]) -> dict[str, Any]:
+    success_count = int(accumulator["success_count"] or 0)
+    failure_count = int(accumulator["failure_count"] or 0)
+    duration_sum = int(accumulator["duration_sum_ms"] or 0)
+    histogram = accumulator.get("histogram") if isinstance(accumulator.get("histogram"), dict) else {}
+    return {
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "duration_sum_ms": duration_sum,
+        "avg_duration_ms": round(duration_sum / success_count) if success_count else None,
+        "p95_duration_ms": _histogram_percentile(histogram, 0.95, min_samples=20),
+        "p99_duration_ms": _histogram_percentile(histogram, 0.99, min_samples=100),
+    }
+
+
+def _record_trend_rollups(conn: sqlite3.Connection, run: sqlite3.Row) -> bool:
+    if not _run_should_record_trend(run):
+        return False
+    status = str(run["status"] or "")
+    check_type = str(run["check_type"] or "")
+    started_at = _parse_trend_datetime(str(run["started_at"]))
+    duration_ms = int(run["duration_ms"]) if status == "ok" and run["duration_ms"] is not None else None
+    failure = status in {"failed", "timeout"}
+    check_ids = [int(run["check_id"]), TREND_SUMMARY_CHECK_IDS[check_type]]
+    for check_id in check_ids:
+        for granularity, seconds in TREND_GRANULARITIES:
+            _upsert_trend_rollup(
+                conn,
+                check_id=check_id,
+                check_type=check_type,
+                granularity=granularity,
+                bucket_start=_trend_rollup_bucket_start(started_at, seconds),
+                duration_ms=duration_ms,
+                failure=failure,
+            )
+    return True
+
+
+def _run_should_record_trend(run: sqlite3.Row) -> bool:
+    status = str(run["status"] or "")
+    check_type = str(run["check_type"] or "")
+    if int(run["check_id"] or 0) <= 0 or check_type not in {"ui", "api"}:
+        return False
+    if not bool(run["affects_health"]):
+        return False
+    if str(run["observation_kind"] or "observation") != "observation":
+        return False
+    if _normalize_failure_kind(run["failure_kind"], status) == "runner":
+        return False
+    if status == "ok":
+        return run["duration_ms"] is not None
+    return status in {"failed", "timeout"}
+
+
+def _upsert_trend_rollup(
+    conn: sqlite3.Connection,
+    check_id: int,
+    check_type: str,
+    granularity: str,
+    bucket_start: datetime,
+    duration_ms: int | None,
+    failure: bool,
+) -> None:
+    bucket_iso = bucket_start.isoformat(timespec="seconds")
+    row = conn.execute(
+        """
+        SELECT *
+        FROM trend_rollups
+        WHERE check_id = ? AND bucket_granularity = ? AND bucket_start = ?
+        """,
+        (check_id, granularity, bucket_iso),
+    ).fetchone()
+    success_count = int(row["success_count"] or 0) if row else 0
+    failure_count = int(row["failure_count"] or 0) if row else 0
+    duration_sum = int(row["duration_sum_ms"] or 0) if row else 0
+    histogram = _load_histogram(row["latency_histogram_json"]) if row else {}
+    if duration_ms is not None:
+        success_count += 1
+        duration_sum += max(0, int(duration_ms))
+        bucket = str(_latency_bucket(duration_ms))
+        histogram[bucket] = int(histogram.get(bucket, 0)) + 1
+    if failure:
+        failure_count += 1
+    metrics = _trend_metrics(
+        {
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "duration_sum_ms": duration_sum,
+            "histogram": histogram,
+        }
+    )
+    payload = (
+        check_id,
+        check_type,
+        granularity,
+        bucket_iso,
+        success_count,
+        failure_count,
+        duration_sum,
+        metrics["avg_duration_ms"],
+        metrics["p95_duration_ms"],
+        metrics["p99_duration_ms"],
+        json.dumps(histogram, ensure_ascii=False, sort_keys=True),
+        now_iso(),
+    )
+    conn.execute(
+        """
+        INSERT INTO trend_rollups (
+            check_id, check_type, bucket_granularity, bucket_start, success_count,
+            failure_count, duration_sum_ms, avg_duration_ms, p95_duration_ms,
+            p99_duration_ms, latency_histogram_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(check_id, bucket_granularity, bucket_start) DO UPDATE SET
+            check_type = excluded.check_type,
+            success_count = excluded.success_count,
+            failure_count = excluded.failure_count,
+            duration_sum_ms = excluded.duration_sum_ms,
+            avg_duration_ms = excluded.avg_duration_ms,
+            p95_duration_ms = excluded.p95_duration_ms,
+            p99_duration_ms = excluded.p99_duration_ms,
+            latency_histogram_json = excluded.latency_histogram_json,
+            updated_at = excluded.updated_at
+        """,
+        payload,
+    )
+
+
+def _trend_rollup_bucket_start(value: datetime, seconds: int) -> datetime:
+    if seconds == 86400:
+        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+    if seconds == 3600:
+        return value.replace(minute=0, second=0, microsecond=0)
+    minute = (value.minute // 5) * 5
+    return value.replace(minute=minute, second=0, microsecond=0)
+
+
+def _latency_bucket(duration_ms: int) -> int:
+    value = max(0, int(duration_ms))
+    for bucket in TREND_LATENCY_BUCKETS_MS:
+        if value <= bucket:
+            return bucket
+    return TREND_LATENCY_BUCKETS_MS[-1]
+
+
+def _load_histogram(value: Any) -> dict[str, int]:
+    try:
+        raw = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): int(count) for key, count in raw.items() if int(count or 0) > 0}
+
+
+def _histogram_percentile(histogram: dict[str, int], percentile: float, min_samples: int) -> int | None:
+    total = sum(int(count) for count in histogram.values())
+    if total < min_samples:
+        return None
+    target = max(1, math.ceil(total * percentile))
+    seen = 0
+    for bucket in sorted((int(key), int(count)) for key, count in histogram.items()):
+        seen += bucket[1]
+        if seen >= target:
+            return bucket[0]
+    return None
+
+
+def _backfill_trend_rollups(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM runs
+        WHERE trend_recorded_at IS NULL
+          AND check_id > 0
+          AND affects_health = 1
+          AND status IN ('ok', 'failed', 'timeout')
+        ORDER BY started_at ASC, id ASC
+        """
+    ).fetchall()
+    if not rows:
+        return
+    timestamp = now_iso()
+    for row in rows:
+        _record_trend_rollups(conn, row)
+        conn.execute("UPDATE runs SET trend_recorded_at = ? WHERE id = ?", (timestamp, int(row["id"])))
+
+
 def cleanup_old_data(settings: dict[str, Any] | None = None) -> int:
     settings = settings or get_settings()
     retention_days = int(settings.get("run_retention_days", 30))
@@ -2125,6 +2963,7 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
         "observation_kind": "TEXT NOT NULL DEFAULT 'observation'",
         "affects_health": "INTEGER NOT NULL DEFAULT 1",
         "run_group_id": "TEXT",
+        "trend_recorded_at": "TEXT",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -2176,6 +3015,16 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
         "token_hint": "TEXT NOT NULL DEFAULT ''",
         "installed_browser_types_json": "TEXT NOT NULL DEFAULT '[]'",
         "available_browser_types_json": "TEXT NOT NULL DEFAULT '[]'",
+        "connection_mode": "TEXT NOT NULL DEFAULT 'manual'",
+        "relay_token_hash": "TEXT NOT NULL DEFAULT ''",
+        "relay_token_hint": "TEXT NOT NULL DEFAULT ''",
+        "relay_token_version": "INTEGER NOT NULL DEFAULT 0",
+        "allocated_internal_port": "INTEGER",
+        "deploy_command_expires_at": "TEXT",
+        "relay_last_seen_at": "TEXT",
+        "worker_health_last_success_at": "TEXT",
+        "last_disconnect_reason": "TEXT NOT NULL DEFAULT ''",
+        "was_available": "INTEGER NOT NULL DEFAULT 0",
         "unavailable_since": "TEXT",
         "unavailable_notified_at": "TEXT",
         "created_at": "TEXT NOT NULL DEFAULT ''",
@@ -2200,14 +3049,16 @@ def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
         INSERT INTO probe_runners (
             runner_id, name, address, network_region, browser_version, installed_browser_types_json, available_browser_types_json, status,
             metadata_json, enabled, role, token_hash, token_hint, created_at,
-            last_seen_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            connection_mode, was_available, last_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(runner_id) DO UPDATE SET
             name = excluded.name,
             address = excluded.address,
             network_region = excluded.network_region,
             status = 'ok',
             role = 'local',
+            connection_mode = 'manual',
+            was_available = 1,
             last_seen_at = excluded.last_seen_at,
             updated_at = excluded.updated_at
         """,
@@ -2226,6 +3077,8 @@ def _ensure_local_probe_runner(conn: sqlite3.Connection) -> None:
             "",
             "",
             timestamp,
+            "manual",
+            1,
             timestamp,
             timestamp,
         ),
@@ -2501,12 +3354,22 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     data["installed_browser_types"] = _normalize_runner_browser_types(data.get("installed_browser_types_json"))
     data["available_browser_types"] = _normalize_runner_browser_types(data.get("available_browser_types_json"))
     data["browser_type_status"] = browser_type_status(data["installed_browser_types"], get_settings())
+    data["connection_mode"] = _normalize_runner_connection_mode(data.get("connection_mode"))
+    data["relay_token_version"] = int(data.get("relay_token_version") or 0)
+    data["allocated_internal_port"] = data.get("allocated_internal_port")
+    data["was_available"] = bool(data.get("was_available"))
     data["token_set"] = bool(data.get("token_hash"))
+    data["relay_token_set"] = bool(data.get("relay_token_hash"))
     data["available"] = _runner_available(data)
+    if not data["enabled"]:
+        data["status"] = "disabled"
+    elif data["connection_mode"] == "relay" and data["status"] in RELAY_PRE_ACTIVATION_STATUSES:
+        data["available"] = False
     data.pop("token_value", None)
     data.pop("token_hash", None)
     data.pop("installed_browser_types_json", None)
     data.pop("available_browser_types_json", None)
+    data.pop("relay_token_hash", None)
     return data
 
 
@@ -2522,6 +3385,11 @@ def _normalize_runner_id(value: Any) -> str:
 def _normalize_runner_role(value: Any) -> str:
     role = str(value or "child").strip().lower()
     return role if role in RUNNER_ROLES else "child"
+
+
+def _normalize_runner_connection_mode(value: Any) -> str:
+    mode = str(value or "manual").strip().lower()
+    return mode if mode in RUNNER_CONNECTION_MODES else "manual"
 
 
 def _normalize_runner_selection_mode(value: Any) -> str:
@@ -2577,14 +3445,55 @@ def _runner_available(data: dict[str, Any]) -> bool:
         return False
     if str(data.get("role") or "") == "local":
         return str(data.get("status") or "ok") != "offline"
+    if str(data.get("connection_mode") or "manual") == "relay":
+        return (
+            str(data.get("status") or "") == "available"
+            and _timestamp_is_fresh(data.get("relay_last_seen_at"), RELAY_HEARTBEAT_TIMEOUT_SECONDS)
+            and _timestamp_is_fresh(data.get("worker_health_last_success_at"), RUNNER_HEARTBEAT_TIMEOUT_SECONDS)
+        )
     if str(data.get("status") or "ok") == "offline":
         return False
+    return _timestamp_is_fresh(data.get("last_seen_at"), RUNNER_HEARTBEAT_TIMEOUT_SECONDS)
+
+
+def _timestamp_is_fresh(value: Any, timeout_seconds: int) -> bool:
     try:
-        last_seen = datetime.fromisoformat(str(data.get("last_seen_at") or ""))
+        parsed = datetime.fromisoformat(str(value or ""))
     except ValueError:
         return False
-    age = datetime.now(last_seen.tzinfo) - last_seen
-    return age.total_seconds() <= RUNNER_HEARTBEAT_TIMEOUT_SECONDS
+    age = datetime.now(parsed.tzinfo) - parsed
+    return age.total_seconds() <= timeout_seconds
+
+
+def _allocate_relay_internal_port(conn: sqlite3.Connection) -> int:
+    now = datetime.now().astimezone()
+    cutoff = (now - timedelta(seconds=RELAY_PORT_QUARANTINE_SECONDS)).isoformat(timespec="seconds")
+    conn.execute("DELETE FROM relay_port_quarantine WHERE released_at < ?", (cutoff,))
+    used = {
+        int(row["allocated_internal_port"])
+        for row in conn.execute("SELECT allocated_internal_port FROM probe_runners WHERE allocated_internal_port IS NOT NULL").fetchall()
+    }
+    quarantined = {int(row["port"]) for row in conn.execute("SELECT port FROM relay_port_quarantine").fetchall()}
+    for port in range(RELAY_INTERNAL_PORT_START, RELAY_INTERNAL_PORT_END + 1):
+        if port not in used and port not in quarantined:
+            return port
+    raise ValueError("relay 内部端口池已用尽")
+
+
+def _expire_probe_runner_provisions(conn: sqlite3.Connection) -> None:
+    timestamp = now_iso()
+    conn.execute(
+        """
+        UPDATE probe_runners
+        SET status = 'expired',
+            updated_at = ?
+        WHERE connection_mode = 'relay'
+          AND status IN ('pending_deployment', 'connecting')
+          AND deploy_command_expires_at IS NOT NULL
+          AND deploy_command_expires_at < ?
+        """,
+        (timestamp, timestamp),
+    )
 
 
 def _check_snapshot(check: dict[str, Any]) -> dict[str, Any]:

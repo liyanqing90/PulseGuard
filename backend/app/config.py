@@ -22,6 +22,17 @@ BUILD_SHA = os.getenv("PULSEGUARD_BUILD_SHA", "unknown").strip() or "unknown"
 NODE_ROLE = os.getenv("PULSEGUARD_NODE_ROLE", "main").strip().lower() or "main"
 WORKER_TOKEN_FILE = Path(os.getenv("PULSEGUARD_WORKER_TOKEN_FILE", DATA_DIR / "worker-token")).resolve()
 RUNNER_HEALTH_POLL_SECONDS = max(10, int(os.getenv("PULSEGUARD_RUNNER_HEALTH_POLL_SECONDS", "30")))
+RELAY_ENABLED = os.getenv("PULSEGUARD_RELAY_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+RELAY_PUBLIC_HOST = os.getenv("PULSEGUARD_RELAY_PUBLIC_HOST", "").strip()
+RELAY_PUBLIC_PORT = int(os.getenv("PULSEGUARD_RELAY_PUBLIC_PORT", "9443"))
+RELAY_INTERNAL_HOST = os.getenv("PULSEGUARD_RELAY_INTERNAL_HOST", "pulseguard-relay").strip() or "pulseguard-relay"
+RELAY_INTERNAL_PORT_START = int(os.getenv("PULSEGUARD_RELAY_INTERNAL_PORT_START", "18001"))
+RELAY_INTERNAL_PORT_END = int(os.getenv("PULSEGUARD_RELAY_INTERNAL_PORT_END", "18100"))
+RELAY_DEPLOY_COMMAND_TTL_HOURS = max(1, int(os.getenv("PULSEGUARD_RELAY_DEPLOY_COMMAND_TTL_HOURS", "24")))
+RELAY_DIR = Path(os.getenv("PULSEGUARD_RELAY_DIR", DATA_DIR / "relay")).resolve()
+RELAY_CERT_FILE = Path(os.getenv("PULSEGUARD_RELAY_CERT_FILE", RELAY_DIR / "relay.crt")).resolve()
+RELAY_KEY_FILE = Path(os.getenv("PULSEGUARD_RELAY_KEY_FILE", RELAY_DIR / "relay.key")).resolve()
+RELAY_MAX_BODY_BYTES = max(1024 * 1024, int(os.getenv("PULSEGUARD_RELAY_MAX_BODY_BYTES", str(20 * 1024 * 1024))))
 
 
 def _new_worker_token() -> str:
@@ -63,5 +74,5 @@ RESPONSES_DIR = REPORTS_DIR / "responses"
 
 
 def ensure_runtime_dirs() -> None:
-    for directory in (DATA_DIR, BACKUPS_DIR, REPORTS_DIR, SCREENSHOTS_DIR, TRACES_DIR, RESPONSES_DIR):
+    for directory in (DATA_DIR, BACKUPS_DIR, REPORTS_DIR, SCREENSHOTS_DIR, TRACES_DIR, RESPONSES_DIR, RELAY_DIR):
         directory.mkdir(parents=True, exist_ok=True)

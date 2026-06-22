@@ -355,11 +355,12 @@ export function ChecksPage({ type }: { type: CheckType }) {
       title: "URL",
       dataIndex: "entry_url",
       ellipsis: true,
+      width: 260,
       render: (value: string) => <span title={value}>{compactUrl(value)}</span>
     },
     {
       title: "执行节点",
-      width: 150,
+      width: 130,
       render: (_, check) => <Tag>{runnerStrategyLabel(check, runners)}</Tag>
     },
     { title: "状态", className: "check-status-cell", render: (_, check) => <TaskStatusTag check={check} />, width: 105 },
@@ -445,7 +446,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
 
   return (
     <div className="page-content">
-      {error && <Alert type="error" message={error} showIcon />}
+      {error && <Alert type="error" title={error} showIcon />}
 
       <section className="check-summary">
         <Card className="summary-card">
@@ -628,7 +629,7 @@ export function ChecksPage({ type }: { type: CheckType }) {
             )
           }}
           className="checks-table"
-          scroll={{ x: type === "api" ? 1370 : 1270 }}
+          scroll={{ x: type === "api" ? 1580 : 1480 }}
         />
       )}
 

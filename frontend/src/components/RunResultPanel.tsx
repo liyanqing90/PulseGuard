@@ -361,7 +361,7 @@ function FailureSummaryPanel({
   summary: RunFailureSummary | null;
 }) {
   if (loading) return <Skeleton active paragraph={{ rows: 4 }} />;
-  if (error) return <Alert type="error" message={error} showIcon />;
+  if (error) return <Alert type="error" title={error} showIcon />;
   if (!summary) return <Empty description="暂无失败摘要" />;
   return (
     <section className="run-detail-section failure-summary-panel">
@@ -428,13 +428,13 @@ function RunComparisonPanel({
     return <Skeleton active paragraph={{ rows: 6 }} />;
   }
   if (error) {
-    return <Alert type="error" message="对比加载失败" description={error} showIcon />;
+    return <Alert type="error" title="对比加载失败" description={error} showIcon />;
   }
   if (!comparison) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无对比数据" />;
   }
   if (!comparison.available) {
-    return <Alert type="info" message="暂无成功基线" description={comparison.message || "同一任务暂无可对比的成功运行记录"} showIcon />;
+    return <Alert type="info" title="暂无成功基线" description={comparison.message || "同一任务暂无可对比的成功运行记录"} showIcon />;
   }
 
   return (
@@ -646,7 +646,7 @@ function RunGroupPanel({
   runs: Run[];
 }) {
   if (loading) return <Skeleton active paragraph={{ rows: 4 }} />;
-  if (error) return <Alert type="error" message="节点执行结果加载失败" description={error} showIcon />;
+  if (error) return <Alert type="error" title="节点执行结果加载失败" description={error} showIcon />;
   if (!runs.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无节点执行结果" />;
 
   const selectedRun = runs.find((item) => item.id === activeRunId) ?? runs.find((item) => item.id === currentRunId) ?? runs[0];

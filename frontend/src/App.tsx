@@ -5,6 +5,7 @@ import { Layout } from "./components/Layout";
 
 const OverviewPage = lazy(() => import("./pages/OverviewPage").then((module) => ({ default: module.OverviewPage })));
 const ChecksPage = lazy(() => import("./pages/ChecksPage").then((module) => ({ default: module.ChecksPage })));
+const MonitoringPage = lazy(() => import("./pages/MonitoringPage").then((module) => ({ default: module.MonitoringPage })));
 const RunsPage = lazy(() => import("./pages/RunsPage").then((module) => ({ default: module.RunsPage })));
 const RunDetailPage = lazy(() => import("./pages/RunDetailPage").then((module) => ({ default: module.RunDetailPage })));
 const SettingsPage = lazy(() => import("./pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
@@ -31,6 +32,7 @@ export default function App() {
         <Route path="/" element={page(<OverviewPage />)} />
         <Route path="/ui-checks" element={page(<ChecksPage type="ui" />)} />
         <Route path="/api-checks" element={page(<ChecksPage type="api" />)} />
+        <Route path="/monitoring" element={page(<MonitoringPage />)} />
         <Route path="/runs" element={page(<RunsPage />)} />
         <Route path="/runs/:runId" element={page(<RunDetailPage />)} />
         <Route path="/operations" element={page(<OperationsPage />)} />

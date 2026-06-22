@@ -645,7 +645,7 @@ export function CheckEditorDrawer({ open, type, check, onClose, onSaved }: Props
           />
         )}
 
-        {error && <Alert type="error" message={error} showIcon />}
+        {error && <Alert type="error" title={error} showIcon />}
         {debugRun && <RunResultPanel run={debugRun} mode="debug" />}
       </Space>
     </Drawer>

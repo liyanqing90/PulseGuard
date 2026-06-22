@@ -101,7 +101,7 @@ export function OverviewPage() {
 
   return (
     <div className="page-content">
-      {error && <Alert type="error" message={error} showIcon />}
+      {error && <Alert type="error" title={error} showIcon />}
 
       <section className={`overview-command ${hasIncident ? "overview-command-danger" : ""}`}>
         <div>

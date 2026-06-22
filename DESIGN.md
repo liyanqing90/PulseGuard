@@ -2,19 +2,20 @@
 name: PulseGuard
 description: Local UI and API probe console for operations work
 colors:
-  primary: "#2563eb"
-  primary-hover: "#1d4ed8"
-  primary-soft: "#eaf2ff"
-  background: "#f4f6f8"
-  surface: "#fbfcfd"
-  surface-muted: "#f1f4f7"
-  text: "#1f2328"
-  text-muted: "#656d76"
-  border: "#d8dee4"
-  border-strong: "#afb8c1"
-  success: "#16833a"
-  danger: "#d1242f"
-  warning: "#9a6700"
+  primary: "#006bff"
+  primary-hover: "#0059ec"
+  primary-soft: "#f0f7ff"
+  background: "#fafafa"
+  surface: "#ffffff"
+  surface-muted: "#f2f2f2"
+  text: "#171717"
+  text-muted: "#4d4d4d"
+  text-tertiary: "#7d7d7d"
+  border: "#e6e6e6"
+  border-strong: "#c9c9c9"
+  success: "#107d32"
+  danger: "#d8001b"
+  warning: "#aa4d00"
 typography:
   display:
     fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, PingFang SC, Hiragino Sans GB, Microsoft YaHei UI, system-ui, sans-serif"
@@ -75,33 +76,35 @@ components:
 
 ## 1. Overview
 
-**Creative North Star: "Operations Ledger"**
+**Creative North Star: "Geist Operations Ledger"**
 
-PulseGuard should read like a working operations ledger: calm, native, explicit, and durable. The interface serves repeated monitoring work, so density is allowed when it improves scanning and action.
+PulseGuard should read like a working operations ledger with Vercel Geist restraint: calm, explicit, high-contrast, and durable. The interface serves repeated monitoring work, so density is allowed when it improves scanning and action.
 
 The system rejects AI dashboard cliches: decorative gradients, glass cards, generic Inter-only typography, fake hero panels, elastic easing, and motion that animates layout.
 
 **Key Characteristics:**
 - Quiet surfaces with restrained accent usage.
 - Clear separation between page title, task title, metadata, and numeric status.
-- Native controls from Ant Design, constrained by project tokens.
+- Existing product controls from Ant Design, constrained by project tokens.
+- Tailwind v4 plus shadcn/ui `radix-nova` for new code-owned primitives where AntD is too heavy.
 - Data and timestamps use tabular numeric treatment.
 
 ## 2. Colors
 
-The palette is a restrained operational blue system with cool tinted neutrals.
+The palette follows Vercel Geist light-theme structure: neutral surfaces first, blue only for action, focus, and links.
 
 ### Primary
-- **Control Blue** (#2563eb): Primary actions, active navigation, and focus highlights only.
-- **Control Blue Soft** (#eaf2ff): Selected backgrounds and low-emphasis active states.
+- **Control Blue** (#006bff): Primary actions, active navigation, links, and focus highlights only.
+- **Control Blue Soft** (#f0f7ff): Selected backgrounds and low-emphasis active states.
 
 ### Neutral
-- **Workbench Background** (#f4f6f8): App canvas.
-- **Panel Surface** (#fbfcfd): Cards, drawers, toolbars, and forms.
-- **Muted Surface** (#f1f4f7): Table headers and recessed controls.
-- **Ink** (#1f2328): Primary text.
-- **Muted Ink** (#656d76): Labels and metadata.
-- **Rule Border** (#d8dee4): Dividers and panel borders.
+- **Workbench Background** (#fafafa): App canvas.
+- **Panel Surface** (#ffffff): Cards, drawers, toolbars, and forms.
+- **Muted Surface** (#f2f2f2): Table headers and recessed controls.
+- **Ink** (#171717): Primary text.
+- **Muted Ink** (#4d4d4d): Labels and metadata.
+- **Tertiary Ink** (#7d7d7d): Disabled and very low-emphasis text.
+- **Rule Border** (#e6e6e6): Dividers and panel borders.
 
 ### Named Rules
 
@@ -141,7 +144,10 @@ PulseGuard uses tonal layering and borders first. Shadows are reserved for overl
 ## 5. Components
 
 ### Implementation Boundary
-- Ant Design is the product design-system substrate.
+- Ant Design remains the product design-system substrate for existing work surfaces.
+- Tailwind v4 is available for layout and code-owned surfaces. Prefer semantic CSS variables over one-off colors.
+- shadcn/ui uses `radix-nova` and writes source components under `frontend/src/components/ui`.
+- Do not mix AntD and shadcn primitives inside the same small control cluster unless a migration step requires it.
 - Import mature AntD primitives directly: `Button`, `Menu`, `Typography`, `Tag`, `Card`, `Statistic`, `Table`, `Form`, `Drawer`, `Modal`, `Tooltip`, `message`, and `notification`.
 - Do not create local wrapper components for primitive controls such as Button, Tag, Card, Typography, or Menu.
 - Shared design code is limited to tokens, CSS constraints, and business status mapping helpers. Reusable React components should encapsulate real product workflows, not restyle AntD primitives.

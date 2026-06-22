@@ -834,7 +834,7 @@ class CheckRunner:
         if mode != "round_robin_all" and not check.get("runner_ids"):
             return [self._local_runner_from_settings(storage.get_settings())]
         if mode == "round_robin_all":
-            candidates = storage.list_enabled_probe_runners()
+            candidates = storage.list_schedulable_probe_runners()
             if not candidates:
                 local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())
                 return [local]

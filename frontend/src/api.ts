@@ -7,6 +7,7 @@ import type {
   CheckBatchPayload,
   CheckBatchResult,
   CheckVersion,
+  CheckTrend,
   CheckPayload,
   CheckType,
   ConfigBundle,
@@ -14,10 +15,14 @@ import type {
   ConfigImportPreview,
   ConfigImportResult,
   DatabaseBackup,
+  MonitoringTrends,
   NotificationStatus,
   Overview,
   ProbeRunner,
   ProbeRunnerPayload,
+  RelayStatus,
+  RunnerProvisionPayload,
+  RunnerProvisionResult,
   RunnerUpdateRequest,
   RunnerUpdateStatus,
   CreatedReadOnlyToken,
@@ -30,6 +35,7 @@ import type {
   RuntimeStatus,
   SettingsValues,
   StatusPageSnapshot,
+  TrendPeriod,
   UiInspectPayload,
   UiInspectResult,
   UiRuleInspectPayload,
@@ -205,9 +211,34 @@ export const api = {
     request<CheckBatchResult>("/api/checks/batch", { method: "POST", body: JSON.stringify(payload) }),
   auditEvents: () => request<AuditEvent[]>("/api/audit-events"),
   runArchives: () => request<RunArchive[]>("/api/run-archives"),
+  monitoringTrends: (params: {
+    period: TrendPeriod;
+    start?: string;
+    end?: string;
+    type?: CheckType | "";
+    q?: string;
+    page: number;
+    page_size: number;
+    hour_start?: string;
+    hour_end?: string;
+  }) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== "" && value !== null && value !== undefined) query.set(key, String(value));
+    });
+    return request<MonitoringTrends>(`/api/monitoring-trends?${query.toString()}`);
+  },
   runners: () => request<ProbeRunner[]>("/api/runners"),
+  relayStatus: () => request<RelayStatus>("/api/relay/status"),
   createRunner: (payload: ProbeRunnerPayload) =>
     request<ProbeRunner>("/api/runners", { method: "POST", body: JSON.stringify(payload) }),
+  provisionRunner: (payload: RunnerProvisionPayload) =>
+    request<RunnerProvisionResult>("/api/runners/provision", { method: "POST", body: JSON.stringify(payload) }),
+  regenerateRunnerProvision: (runnerId: string, payload: RunnerProvisionPayload) =>
+    request<RunnerProvisionResult>(`/api/runners/${encodeURIComponent(runnerId)}/provision/regenerate`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
   updateRunner: (runnerId: string, payload: Partial<ProbeRunnerPayload>) =>
     request<ProbeRunner>(`/api/runners/${encodeURIComponent(runnerId)}`, { method: "PUT", body: JSON.stringify(payload) }),
   deleteRunner: (runnerId: string) =>
@@ -227,6 +258,13 @@ export const api = {
   runnerUpdateStatus: (runnerId: string) =>
     request<{ ok: boolean; worker?: { update?: RunnerUpdateStatus } }>(`/api/runners/${encodeURIComponent(runnerId)}/update-status`),
   checkVersions: (id: number) => request<CheckVersion[]>(`/api/checks/${id}/versions`),
+  checkTrend: (id: number, params: { period: TrendPeriod; start?: string; end?: string; hour_start?: string; hour_end?: string }) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value) query.set(key, String(value));
+    });
+    return request<CheckTrend>(`/api/checks/${id}/trend?${query.toString()}`);
+  },
   restoreCheckVersion: (versionId: number) =>
     request<Check>(`/api/check-versions/${versionId}/restore`, { method: "POST" }),
   runs: (params: {

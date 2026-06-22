@@ -104,6 +104,28 @@ Each prewarmed browser type keeps one Playwright browser process alive and pre-c
 
 `browser_type` only applies to UI tasks. Execution resolves target nodes first, then browser types inside each node. Node multi-select plus browser type multi-select creates a node x browser-type execution matrix. A browser type runs only when it is enabled in settings and installed on the selected node; missing or disabled combinations are recorded as runner-side failures. When new browser types are enabled, the main node asks the local process and available child nodes to install the matching Playwright browsers. Child nodes report installed and available browser types in their health response.
 
+## Remote Runners
+
+PulseGuard keeps the built-in `local` Runner enabled by default. Child runners support two connection modes:
+
+- Manual mode: the main node must directly reach `http://<worker>:8788`. Add the child runner in Settings with its address and worker token.
+- Relay mode: the worker host does not expose inbound ports. `pulseguard-relay-client` connects outbound to the main node relay, verifies the self-signed server fingerprint, and forwards traffic to the local worker.
+
+Enable the relay server on the main node:
+
+```sh
+export PULSEGUARD_RELAY_PUBLIC_HOST="<main public IP>"
+docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
+```
+
+The default public relay port is `9443`. In Settings > Execution > Add child runner, choose “Generate deployment command” and enter a worker-reachable `docker-compose.relay-worker.yml` URL to create a one-time worker deployment command for Linux shell or PowerShell. Relay worker deployments use that compose file; the worker exposes `8788` only inside the compose network.
+
+Relay runner states:
+
+- `pending_deployment`, `expired`, and `connecting` are not scheduled by “round-robin all enabled runners” and do not trigger runner-unavailable alerts.
+- A relay runner becomes schedulable only after the relay session is connected and `/api/worker/health` succeeds through the internal relay port.
+- Regenerating the deployment command keeps the runner ID and internal port, rotates the relay token, and invalidates old commands.
+
 ## Verification
 
 Backend:
@@ -164,6 +186,10 @@ Structured UI/API assertions do not require an advanced script. Complex login, m
 - `GET /api/metrics`: Prometheus metrics
 - `GET /api/read-only/snapshot`: read-only snapshot, requires a configured read-only token
 - `GET /api/runs/{id}`: run detail based on execution snapshots; UI runs attach the request basics captured for that run (URL, viewport, timeout), while API runs keep request/response snapshots instead of reloading the current task definition
+- `GET /api/runners` / `POST /api/runners`: list runners and create manual child runners
+- `GET /api/relay/status`: relay enablement, public URL, and server fingerprint
+- `POST /api/runners/provision`: create a relay child runner and one-time deployment command
+- `POST /api/runners/{runner_id}/provision/regenerate`: regenerate a relay deployment command
 - `POST /api/runners/heartbeat`: Runner heartbeat
 - `GET /api/worker/health` / `POST /api/worker/run`: child worker health and execution entry points
 - `POST /api/worker/browser-types/install`: request a worker to install enabled Playwright browser types
@@ -179,6 +205,8 @@ reports/                 Screenshots, Trace files, Response Body artifacts, arch
 docs/                    Roadmap, design, and feature documents
 Dockerfile               Production image build
 docker-compose.yml       Single-instance deployment
+docker-compose.relay.yml Main-node relay server overlay
+docker-compose.relay-worker.yml Relay worker deployment
 pyproject.toml           Backend dependency definition
 uv.lock                  Backend dependency lockfile
 ```

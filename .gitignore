@@ -1,5 +1,7 @@
 .venv/
 .DS_Store
+.idea/
+videos/
 __pycache__/
 *.py[cod]
 .pytest_cache/

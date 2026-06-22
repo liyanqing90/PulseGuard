@@ -21,12 +21,13 @@ from pydantic import ValidationError
 from .api_assertions import inspect_api_response
 from . import config_transfer, failure_summary, notifier, run_comparison, storage
 from .defaults import DEFAULT_SETTINGS
-from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs
+from .config import APP_VERSION, BUILD_SHA, NODE_ROLE, RELAY_ENABLED, RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT, REPORTS_DIR, RESPONSES_DIR, RUNNER_HEALTH_POLL_SECONDS, SCREENSHOTS_DIR, STATIC_DIR, TRACES_DIR, WORKER_ADDRESS, WORKER_IMAGE, WORKER_NAME, WORKER_REGION, WORKER_RUNNER_ID, WORKER_TOKEN, WORKER_TOKEN_SOURCE, WORKER_UPDATE_IMAGE, WORKER_UPDATER_URL, ensure_runtime_dirs
+from .relay_cert import relay_fingerprint
 from .runner import CheckRunner
 from .scheduler import PulseScheduler
 from .browser_installation import browser_capabilities, schedule_browser_install
 from .browser_types import enabled_browser_types, normalize_browser_types
-from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
+from .schemas import ApiInspectRequest, BrowserInstallRequest, CheckBatchRequest, CheckCreate, CheckUpdate, ConfigImportRequest, NOTIFICATION_STATUSES, ProbeRunnerCreate, ProbeRunnerUpdate, ReadOnlyTokenCreate, RunnerHeartbeatRequest, RunnerProvisionRequest, SettingsUpdate, UiInspectRequest, UiInspectRulesRequest, WorkerUpdateRequest, _runner_address
 from .variables import mask_data, mask_text
 
 
@@ -325,6 +326,11 @@ def runners(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any
     return mask_data(storage.list_probe_runners(limit=limit), storage.get_settings())
 
 
+@app.get("/api/relay/status")
+def relay_status(request: Request) -> dict[str, Any]:
+    return _relay_status_payload(request)
+
+
 @app.post("/api/runners")
 def create_runner(payload: ProbeRunnerCreate) -> dict[str, Any]:
     try:
@@ -333,6 +339,34 @@ def create_runner(payload: ProbeRunnerCreate) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     storage.record_audit_event("created", "runner", runner.get("runner_id"), runner.get("name", ""), "创建执行节点")
     return _runner_response(runner)
+
+
+@app.post("/api/runners/provision")
+def provision_runner(payload: RunnerProvisionRequest, request: Request) -> dict[str, Any]:
+    status = _relay_status_payload(request)
+    if not status["enabled"] or not status.get("public_url") or not status.get("server_fingerprint"):
+        raise HTTPException(status_code=503, detail=status.get("error") or "Relay 未启用")
+    try:
+        runner = storage.provision_probe_runner(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    storage.record_audit_event("created", "runner", runner.get("runner_id"), runner.get("name", ""), "生成 relay 子节点部署命令")
+    return _runner_provision_response(runner, status, payload.target_platform, payload.compose_url)
+
+
+@app.post("/api/runners/{runner_id}/provision/regenerate")
+def regenerate_runner_provision(runner_id: str, payload: RunnerProvisionRequest, request: Request) -> dict[str, Any]:
+    status = _relay_status_payload(request)
+    if not status["enabled"] or not status.get("public_url") or not status.get("server_fingerprint"):
+        raise HTTPException(status_code=503, detail=status.get("error") or "Relay 未启用")
+    try:
+        runner = storage.regenerate_probe_runner_provision(runner_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not runner:
+        raise HTTPException(status_code=404, detail="Runner 不存在")
+    storage.record_audit_event("updated", "runner", runner.get("runner_id"), runner.get("name", ""), "重新生成 relay 子节点部署命令")
+    return _runner_provision_response(runner, status, payload.target_platform, payload.compose_url)
 
 
 @app.post("/api/runners/heartbeat")
@@ -468,6 +502,34 @@ def audit_events(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str
 @app.get("/api/run-archives")
 def run_archives(limit: int = Query(default=90, ge=1, le=365)) -> list[dict[str, Any]]:
     return storage.list_run_archives(limit=limit)
+
+
+@app.get("/api/monitoring-trends")
+def monitoring_trends(
+    period: str = Query(default="24h"),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    type: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=12, ge=1, le=50),
+    hour_start: str | None = Query(default=None),
+    hour_end: str | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        return storage.list_monitoring_trends(
+            period=period,
+            start=start,
+            end=end,
+            check_type=type,
+            q=q,
+            page=page,
+            page_size=page_size,
+            hour_start=hour_start,
+            hour_end=hour_end,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/anomaly-cycles")
@@ -619,6 +681,31 @@ def check_versions(check_id: int, limit: int = Query(default=50, ge=1, le=200)) 
     if not storage.get_check(check_id):
         raise HTTPException(status_code=404, detail="任务不存在")
     return mask_data(storage.list_check_versions(check_id, limit=limit), storage.get_settings())
+
+
+@app.get("/api/checks/{check_id}/trend")
+def check_trend(
+    check_id: int,
+    period: str = Query(default="24h"),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    hour_start: str | None = Query(default=None),
+    hour_end: str | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        trend = storage.get_check_trend(
+            check_id,
+            period=period,
+            start=start,
+            end=end,
+            hour_start=hour_start,
+            hour_end=hour_end,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not trend:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return trend
 
 
 @app.post("/api/check-versions/{version_id}/restore")
@@ -1048,7 +1135,7 @@ def _worker_artifacts(run: dict[str, Any]) -> dict[str, Any]:
 
 def _runner_response(runner: dict[str, Any]) -> dict[str, Any]:
     token = runner.get("token")
-    hidden_fields = {"token", "token_value", "token_hash", "_token"}
+    hidden_fields = {"token", "token_value", "token_hash", "_token", "relay_token", "worker_token"}
     visible = mask_data({key: value for key, value in runner.items() if key not in hidden_fields}, storage.get_settings())
     if token:
         visible["token"] = token
@@ -1085,6 +1172,88 @@ async def _run_enabled_checks(
             for check in checks_to_run
         ]
     )
+
+
+def _relay_status_payload(request: Request) -> dict[str, Any]:
+    host = RELAY_PUBLIC_HOST or (request.url.hostname or "")
+    public_url = f"wss://{host}:{RELAY_PUBLIC_PORT}/relay/connect" if host else ""
+    error = ""
+    fingerprint = ""
+    if not RELAY_ENABLED:
+        error = "Relay 未启用；设置 PULSEGUARD_RELAY_ENABLED=true 并启动 pulseguard-relay 服务"
+    elif not host:
+        error = "Relay 公网地址未配置；设置 PULSEGUARD_RELAY_PUBLIC_HOST"
+    else:
+        try:
+            fingerprint = relay_fingerprint()
+        except Exception as exc:
+            error = f"Relay 自签证书不可用：{exc}"
+    return {
+        "enabled": bool(RELAY_ENABLED and public_url and fingerprint and not error),
+        "public_host": host,
+        "public_port": RELAY_PUBLIC_PORT,
+        "public_url": public_url,
+        "server_fingerprint": fingerprint,
+        "error": error,
+    }
+
+
+def _runner_provision_response(runner: dict[str, Any], relay_status: dict[str, Any], target_platform: str, compose_url: str) -> dict[str, Any]:
+    visible = _runner_response(runner)
+    command = _runner_deploy_command(runner, relay_status, target_platform, compose_url)
+    visible["deployment"] = {
+        "target_platform": target_platform,
+        "compose_url": compose_url,
+        "command": command,
+        "expires_at": runner.get("deploy_command_expires_at"),
+        "relay_url": relay_status.get("public_url"),
+        "server_fingerprint": relay_status.get("server_fingerprint"),
+    }
+    return visible
+
+
+def _shell_quote(value: object) -> str:
+    text = str(value or "")
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def _ps_quote(value: object) -> str:
+    return '"' + str(value or "").replace("`", "``").replace('"', '`"') + '"'
+
+
+def _runner_deploy_command(runner: dict[str, Any], relay_status: dict[str, Any], target_platform: str, compose_url: str) -> str:
+    env = {
+        "PULSEGUARD_WORKER_NAME": runner.get("name") or runner.get("runner_id"),
+        "PULSEGUARD_WORKER_REGION": runner.get("network_region") or "local",
+        "PULSEGUARD_RUNNER_ID": runner.get("runner_id"),
+        "PULSEGUARD_WORKER_TOKEN": runner.get("worker_token"),
+        "PULSEGUARD_RELAY_URL": relay_status.get("public_url"),
+        "PULSEGUARD_RELAY_FINGERPRINT": relay_status.get("server_fingerprint"),
+        "PULSEGUARD_RELAY_TOKEN": runner.get("relay_token"),
+        "PULSEGUARD_RELAY_TOKEN_VERSION": runner.get("relay_token_version") or 1,
+        "COMPOSE_PROJECT_NAME": "pulseguard-worker",
+    }
+    if target_platform == "powershell":
+        lines = [
+            "mkdir pulseguard-worker -Force; cd pulseguard-worker",
+            f"Invoke-WebRequest -UseBasicParsing {_ps_quote(compose_url)} -OutFile docker-compose.relay-worker.yml",
+            *[f"$env:{key} = {_ps_quote(value)}" for key, value in env.items()],
+            "docker compose -f docker-compose.relay-worker.yml pull",
+            "docker compose -f docker-compose.relay-worker.yml up -d",
+            "docker update --restart unless-stopped pulseguard-worker pulseguard-relay-client",
+            "docker logs --tail 80 pulseguard-relay-client",
+        ]
+        return "\n".join(lines)
+    lines = [
+        "mkdir -p pulseguard-worker && cd pulseguard-worker",
+        f"curl -fsSL {_shell_quote(compose_url)} -o docker-compose.relay-worker.yml",
+        *[f"export {key}={_shell_quote(value)}" for key, value in env.items()],
+        "docker compose -f docker-compose.relay-worker.yml pull",
+        "docker compose -f docker-compose.relay-worker.yml up -d",
+        "docker update --restart unless-stopped pulseguard-worker pulseguard-relay-client",
+        "docker logs --tail 80 pulseguard-relay-client",
+    ]
+    return "\n".join(lines)
 
 
 async def _fetch_runner_health(runner: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,4 @@
-import { Alert, App, Button, Card, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
+import { Alert, App, Button, Card, Drawer, Dropdown, Empty, Form, Input, InputNumber, Modal, Popconfirm, Segmented, Select, Skeleton, Space, Switch, Tag, Tooltip, Upload } from "antd";
 import type { MenuProps, UploadProps } from "antd";
 import {
   BellRing,
@@ -41,6 +41,8 @@ import type {
   NotificationChannel,
   ProbeRunner,
   ProbeRunnerPayload,
+  RelayStatus,
+  RunnerProvisionResult,
   RunnerUpdateStatus,
   SettingsValues,
   WebhookType
@@ -955,7 +957,7 @@ export function SettingsPage() {
               <Alert
                 type="info"
                 showIcon
-                message="展示位置：所有页面顶栏右侧"
+                title="展示位置：所有页面顶栏右侧"
                 description="启用并保存后，所有页面右上角“本地运行”旁都会出现公告按钮；点击按钮查看公告详情。关闭后顶栏不展示公告。"
                 className="settings-inline-alert"
               />
@@ -1016,7 +1018,7 @@ export function SettingsPage() {
         onCancel={() => setImportConfirmOpen(false)}
       >
         <div className="config-import-confirm">
-          <Alert type="warning" message="导入会应用预检范围内的配置" showIcon />
+          <Alert type="warning" title="导入会应用预检范围内的配置" showIcon />
           {importFileName && (
             <div className="config-import-file">
               <span>文件</span>
@@ -1071,7 +1073,7 @@ export function SettingsPage() {
           <Alert
             type="warning"
             showIcon
-            message="令牌明文关闭后不可再次查看"
+            title="令牌明文关闭后不可再次查看"
             description="请立即复制并保存到调用方。新令牌会与已有令牌共存，后续设置页只显示名称和创建时间。"
           />
           <div className="created-token-box">
@@ -1099,6 +1101,36 @@ const emptyRunnerDraft: ProbeRunnerPayload = {
   enabled: true,
   token: ""
 };
+
+type RunnerCreateMode = "manual" | "relay";
+type RunnerProvisionPlatform = "linux" | "powershell";
+
+function runnerStatusLabel(runner: ProbeRunner): string {
+  if (!runner.enabled) return "已停用";
+  const status = runner.status || "";
+  const labels: Record<string, string> = {
+    pending_deployment: "待部署",
+    expired: "已过期",
+    connecting: "连接中",
+    available: "可用",
+    unhealthy: "异常",
+    unavailable: "异常",
+    auth_failed: "认证失败",
+    ok: "可用",
+    warning: "异常",
+    offline: "异常",
+    disabled: "已停用"
+  };
+  return labels[status] || (runner.available ? "可用" : "异常");
+}
+
+function runnerStatusColor(runner: ProbeRunner): "default" | "processing" | "success" | "warning" | "error" {
+  if (!runner.enabled) return "default";
+  if (runner.available || runner.status === "available" || runner.status === "ok") return "success";
+  if (runner.status === "pending_deployment" || runner.status === "connecting") return "processing";
+  if (runner.status === "expired" || runner.status === "auth_failed") return "warning";
+  return "error";
+}
 
 function runnerMetaText(runner: ProbeRunner, key: string): string {
   const value = runner.metadata?.[key];
@@ -1133,8 +1165,13 @@ function updateStatusLines(status?: RunnerUpdateStatus): Record<string, unknown>
 function RunnerNodePanel() {
   const { message } = App.useApp();
   const [runners, setRunners] = useState<ProbeRunner[]>([]);
+  const [relayStatus, setRelayStatus] = useState<RelayStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [createMode, setCreateMode] = useState<RunnerCreateMode>("manual");
+  const [provisionPlatform, setProvisionPlatform] = useState<RunnerProvisionPlatform>("linux");
+  const [provisionComposeUrl, setProvisionComposeUrl] = useState("");
+  const [provisionResult, setProvisionResult] = useState<RunnerProvisionResult | null>(null);
   const [draft, setDraft] = useState<ProbeRunnerPayload>(emptyRunnerDraft);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -1149,7 +1186,9 @@ function RunnerNodePanel() {
   async function loadRunners() {
     setLoading(true);
     try {
-      setRunners(await api.runners());
+      const [nextRunners, nextRelayStatus] = await Promise.all([api.runners(), api.relayStatus()]);
+      setRunners(nextRunners);
+      setRelayStatus(nextRelayStatus);
     } catch (err) {
       message.error((err as Error).message);
     } finally {
@@ -1159,6 +1198,9 @@ function RunnerNodePanel() {
 
   function openCreateDrawer() {
     setDraft(emptyRunnerDraft);
+    setCreateMode("manual");
+    setProvisionPlatform("linux");
+    setProvisionComposeUrl("");
     setDrawerOpen(true);
   }
 
@@ -1175,6 +1217,32 @@ function RunnerNodePanel() {
   }
 
   async function createRunner() {
+    if (createMode === "relay") {
+      const payload = {
+        name: draft.name.trim(),
+        network_region: draft.network_region.trim() || "local",
+        target_platform: provisionPlatform,
+        compose_url: provisionComposeUrl.trim(),
+        enabled: draft.enabled !== false
+      };
+      if (!payload.name || !payload.compose_url) {
+        message.error("请填写节点名称和 Compose URL");
+        return;
+      }
+      setSaving(true);
+      try {
+        const result = await api.provisionRunner(payload);
+        setProvisionResult(result);
+        setDrawerOpen(false);
+        await loadRunners();
+        message.success("部署命令已生成");
+      } catch (err) {
+        message.error((err as Error).message);
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
     const payload: ProbeRunnerPayload = {
       name: draft.name.trim(),
       address: draft.address.trim(),
@@ -1296,6 +1364,43 @@ function RunnerNodePanel() {
     });
   }
 
+  async function copyProvisionCommand(result: RunnerProvisionResult) {
+    try {
+      await copyTextToClipboard(result.deployment.command);
+      message.success("部署命令已复制");
+    } catch {
+      message.error("复制失败，请手动选择命令");
+    }
+  }
+
+  async function regenerateProvision(runner: ProbeRunner, platform: RunnerProvisionPlatform = "linux") {
+    const composeUrl = window.prompt("请输入 relay worker compose URL", provisionComposeUrl.trim());
+    if (composeUrl === null) return;
+    const normalizedComposeUrl = composeUrl.trim();
+    if (!normalizedComposeUrl) {
+      message.error("请填写 Compose URL");
+      return;
+    }
+    setProvisionComposeUrl(normalizedComposeUrl);
+    setBusyId(runner.runner_id);
+    try {
+      const result = await api.regenerateRunnerProvision(runner.runner_id, {
+        name: runner.name || runner.runner_id,
+        network_region: runner.network_region || "local",
+        target_platform: platform,
+        compose_url: normalizedComposeUrl,
+        enabled: runner.enabled
+      });
+      setProvisionResult(result);
+      await loadRunners();
+      message.success("部署命令已重新生成");
+    } catch (err) {
+      message.error((err as Error).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   function confirmRunnerUpdate(runner: ProbeRunner) {
     const targetImage = runnerMetaText(runner, "update_target_image");
     const currentImage = runnerMetaText(runner, "image");
@@ -1381,6 +1486,9 @@ function RunnerNodePanel() {
               const buildSummary = buildSha && buildSha !== "unknown" ? buildSha.slice(0, 8) : "-";
               const runnerMenuItems: MenuProps["items"] = [
                 { key: "auth", icon: <KeyRound size={15} />, label: "更新认证" },
+                ...(runner.role !== "local" && runner.connection_mode === "relay"
+                  ? [{ key: "deploy", icon: <Clipboard size={15} />, label: "重新生成命令" }]
+                  : []),
                 { key: "update", icon: <Download size={15} />, label: "更新节点", disabled: !updateSupported || !runner.available },
                 { key: "status", icon: <Info size={15} />, label: "更新状态", disabled: !updateSupported },
                 { type: "divider" },
@@ -1388,6 +1496,7 @@ function RunnerNodePanel() {
               ];
               const onRunnerMenuClick: MenuProps["onClick"] = ({ key }) => {
                 if (key === "auth") setAuthRunner({ runner, token: "" });
+                if (key === "deploy") void regenerateProvision(runner, "linux");
                 if (key === "update") confirmRunnerUpdate(runner);
                 if (key === "status") void showRunnerUpdateStatus(runner);
                 if (key === "delete") confirmRunnerDelete(runner);
@@ -1401,8 +1510,9 @@ function RunnerNodePanel() {
                           <strong>{runner.name || runner.runner_id}</strong>
                           <Space size={6} wrap className="runner-node-tags">
                             <Tag>{runner.role === "local" ? "本机" : "子节点"}</Tag>
+                            {runner.role !== "local" && <Tag>{runner.connection_mode === "relay" ? "Relay 自动" : "手动直连"}</Tag>}
                             <Tag color={runner.enabled ? "success" : "default"}>{runner.enabled ? "已启用" : "已停用"}</Tag>
-                            <Tag color={runner.available ? "success" : "error"}>{runner.available ? "可用" : "不可用"}</Tag>
+                            <Tag color={runnerStatusColor(runner)}>{runnerStatusLabel(runner)}</Tag>
                             <Tag>{runner.network_region || "local"}</Tag>
                             {version && <Tag color="blue">v{version}</Tag>}
                             {runner.role !== "local" && (
@@ -1419,7 +1529,7 @@ function RunnerNodePanel() {
                       <div className="runner-node-facts">
                         <div className="runner-node-fact">
                           <span>认证</span>
-                          <strong>{tokenStatus}</strong>
+                          <strong>{runner.connection_mode === "relay" && runner.relay_token_hint ? `${tokenStatus} / ${runner.relay_token_hint}` : tokenStatus}</strong>
                         </div>
                         <div className="runner-node-fact">
                           <span>镜像</span>
@@ -1430,6 +1540,12 @@ function RunnerNodePanel() {
                           <strong>{buildSummary}</strong>
                         </div>
                       </div>
+                      {runner.connection_mode === "relay" && runner.deploy_command_expires_at && (
+                        <span className="runner-node-target">部署命令过期时间 {formatDate(runner.deploy_command_expires_at)}</span>
+                      )}
+                      {runner.connection_mode === "relay" && runner.last_disconnect_reason && (
+                        <span className="runner-node-target">断开原因 {runner.last_disconnect_reason}</span>
+                      )}
                       {targetImage && targetImage !== image && <span className="runner-node-target">目标镜像 {runnerImageSummary(targetImage)}</span>}
                     </div>
                     <div className="runner-node-controls">
@@ -1463,34 +1579,77 @@ function RunnerNodePanel() {
 
       <Drawer
         title="新增子节点"
-        width={520}
+        size={520}
         open={drawerOpen}
         destroyOnHidden
         onClose={() => setDrawerOpen(false)}
         extra={
           <Button type="primary" icon={<Save size={16} />} loading={saving} onClick={createRunner}>
-            创建
+            {createMode === "relay" ? "生成" : "创建"}
           </Button>
         }
       >
         <Form layout="vertical" autoComplete="off">
+          <Form.Item label="接入模式">
+            <Segmented
+              block
+              value={createMode}
+              onChange={(value) => setCreateMode(value as RunnerCreateMode)}
+              options={[
+                { label: "手动添加", value: "manual" },
+                { label: "生成部署命令", value: "relay" }
+              ]}
+            />
+          </Form.Item>
           <Form.Item label="节点名称" required>
             <Input value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} />
           </Form.Item>
-          <Form.Item label="节点地址" required help="可填写裸 IP/域名，系统会按 worker 默认端口补成 http://地址:8788。">
-            <Input
-              value={draft.address}
-              placeholder="10.0.0.12 或 http://10.0.0.12:8788"
-              onChange={(event) => setDraft((current) => ({ ...current, address: event.target.value }))}
-            />
-          </Form.Item>
-          <Form.Item label="认证信息" required help="粘贴 pgrn_ 开头的 token；也可以粘贴日志里的 token: pgrn_... 整行。">
-            <Input.Password
-              value={draft.token}
-              placeholder="pgrn_..."
-              onChange={(event) => setDraft((current) => ({ ...current, token: event.target.value }))}
-            />
-          </Form.Item>
+          {createMode === "manual" && (
+            <>
+              <Form.Item label="节点地址" required help="可填写裸 IP/域名，系统会按 worker 默认端口补成 http://地址:8788。">
+                <Input
+                  value={draft.address}
+                  placeholder="10.0.0.12 或 http://10.0.0.12:8788"
+                  onChange={(event) => setDraft((current) => ({ ...current, address: event.target.value }))}
+                />
+              </Form.Item>
+              <Form.Item label="认证信息" required help="粘贴 pgrn_ 开头的 token；也可以粘贴日志里的 token: pgrn_... 整行。">
+                <Input.Password
+                  value={draft.token}
+                  placeholder="pgrn_..."
+                  onChange={(event) => setDraft((current) => ({ ...current, token: event.target.value }))}
+                />
+              </Form.Item>
+            </>
+          )}
+          {createMode === "relay" && (
+            <>
+              <Form.Item label="目标平台">
+                <Segmented
+                  block
+                  value={provisionPlatform}
+                  onChange={(value) => setProvisionPlatform(value as RunnerProvisionPlatform)}
+                  options={[
+                    { label: "Linux shell", value: "linux" },
+                    { label: "PowerShell", value: "powershell" }
+                  ]}
+                />
+              </Form.Item>
+              <Form.Item label="Relay 状态">
+                <Space size={8} wrap>
+                  <Tag color={relayStatus?.enabled ? "success" : "warning"}>{relayStatus?.enabled ? "可生成命令" : "未就绪"}</Tag>
+                  <span>{relayStatus?.public_url || relayStatus?.error || "-"}</span>
+                </Space>
+              </Form.Item>
+              <Form.Item label="Compose URL" required help="填写 worker 宿主机可访问的 docker-compose.relay-worker.yml 下载地址。">
+                <Input
+                  value={provisionComposeUrl}
+                  placeholder="https://example.com/docker-compose.relay-worker.yml"
+                  onChange={(event) => setProvisionComposeUrl(event.target.value)}
+                />
+              </Form.Item>
+            </>
+          )}
           <Form.Item label="网络区域">
             <Input
               value={draft.network_region}
@@ -1506,7 +1665,7 @@ function RunnerNodePanel() {
 
       <Drawer
         title="编辑执行节点"
-        width={520}
+        size={520}
         open={Boolean(editRunner)}
         destroyOnHidden
         onClose={() => setEditRunner(null)}
@@ -1580,9 +1739,36 @@ function RunnerNodePanel() {
         </Form>
       </Modal>
 
+      <Modal
+        title="子节点部署命令"
+        open={Boolean(provisionResult)}
+        width={860}
+        okText="复制命令"
+        cancelText="关闭"
+        onOk={() => provisionResult && copyProvisionCommand(provisionResult)}
+        onCancel={() => setProvisionResult(null)}
+      >
+        <Space orientation="vertical" size={10} className="drawer-stack">
+          <Space size={8} wrap>
+            <Tag color="processing">{provisionResult?.runner_id}</Tag>
+            <Tag>{provisionResult?.deployment.target_platform === "powershell" ? "PowerShell" : "Linux shell"}</Tag>
+            {provisionResult?.deployment.compose_url && <Tag>{provisionResult.deployment.compose_url}</Tag>}
+            <span>过期时间 {provisionResult?.deployment.expires_at ? formatDate(provisionResult.deployment.expires_at) : "-"}</span>
+          </Space>
+          <pre>{provisionResult?.deployment.command || ""}</pre>
+          <span>命令只显示一次。重新生成会轮换 relay token，旧命令立即失效。</span>
+        </Space>
+      </Modal>
+
       <Modal title="创建子节点" open={helpOpen} footer={null} onCancel={() => setHelpOpen(false)} width={820}>
         <Space orientation="vertical" size={12} className="drawer-stack">
-          <span>子节点不会主动注册。先在子节点服务器启动 worker，再回到这里点击“新增子节点”，填写子节点地址和日志输出的 token。</span>
+          <span>子节点支持两种接入方式：手动添加适合主节点能直接访问 worker 的网络；生成部署命令适合 worker 只能主动出站连接主节点 relay 的网络。</span>
+          <div className="worker-help-block">
+            <strong>Relay 自动接入</strong>
+            <pre>{`docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d`}</pre>
+            <span>主节点启用 relay 后，在新增子节点里选择“生成部署命令”，复制命令到 worker 宿主机执行。worker 不需要开放 8788 入站端口。</span>
+          </div>
+          <span>手动添加模式下，先在子节点服务器启动 worker，再回到这里填写子节点地址和日志输出的 token。</span>
           <div className="worker-help-block">
             <strong>推荐部署：预构建镜像（Windows PowerShell）</strong>
             <pre>{`mkdir pulseguard-worker -Force; cd pulseguard-worker
@@ -1783,7 +1969,7 @@ function ConfigTransferPanel({
       <Drawer
         title="导入配置"
         open={drawerOpen}
-        width={720}
+        size={720}
         destroyOnHidden={false}
         closable={!importing}
         mask={{ closable: !importing }}
@@ -1817,7 +2003,7 @@ function ConfigTransferPanel({
       >
         <div className="config-import-flow">
           {hasUnsavedChanges && (
-            <Alert type="warning" message="当前存在未保存设置草稿，应用导入前需要保存或撤销。" showIcon />
+            <Alert type="warning" title="当前存在未保存设置草稿，应用导入前需要保存或撤销。" showIcon />
           )}
 
           <Upload.Dragger {...uploadProps} className="config-upload">
@@ -1850,7 +2036,7 @@ function ConfigImportPreviewResult({ preview }: { preview: ConfigImportPreview }
 
   return (
     <section className="config-preview-result">
-      <Alert type={canApply ? "success" : "error"} message={canApply ? "预检通过" : "预检未通过"} showIcon />
+      <Alert type={canApply ? "success" : "error"} title={canApply ? "预检通过" : "预检未通过"} showIcon />
 
       {summaryItems.length > 0 && (
         <div className="config-preview-summary">
@@ -2245,7 +2431,7 @@ function PreviewChannel({ channel }: { channel: AlertPreviewChannel }) {
         <PreviewFact label="查询参数" value={channel.target.query_keys.length ? channel.target.query_keys.join(", ") : "-"} />
         <PreviewFact label="钉钉加签" value={channel.signing_enabled ? "发送时追加 timestamp/sign" : "不追加签名"} tone={channel.signing_enabled ? "ok" : "muted"} />
       </div>
-      {channel.target.issues.length > 0 && <Alert className="compact-alert" type="warning" message={channel.target.issues.join("；")} showIcon />}
+      {channel.target.issues.length > 0 && <Alert className="compact-alert" type="warning" title={channel.target.issues.join("；")} showIcon />}
       <StructuredViewer title="Webhook Payload" value={channel.payload} defaultMode="json" />
     </section>
   );

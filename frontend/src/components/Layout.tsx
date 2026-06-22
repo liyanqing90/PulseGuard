@@ -1,4 +1,4 @@
-import { Button, Menu, Modal, Typography } from "antd";
+import { Button, Dropdown, Menu, Modal, Typography } from "antd";
 import type { MenuProps } from "antd";
 import {
   Activity,
@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   Megaphone,
   MonitorCheck,
+  MoreHorizontal,
   PlugZap,
   ScrollText,
   Settings,
@@ -17,6 +18,7 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { Button as UiButton } from "./ui/button";
 import type { StatusPageSnapshot } from "../types";
 import { formatDate } from "../utils";
 
@@ -45,7 +47,8 @@ const navEntries: NavEntry[] = [
     icon: <MonitorCheck size={16} />,
     children: [
       { to: "/ui-checks", label: "页面监控", icon: <MonitorCheck size={16} /> },
-      { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> }
+      { to: "/api-checks", label: "接口监控", icon: <PlugZap size={16} /> },
+      { to: "/monitoring", label: "监控趋势", icon: <Activity size={16} /> }
     ]
   },
   { to: "/runs", label: "运行记录", icon: <History size={16} /> },
@@ -80,6 +83,23 @@ const menuItems: MenuProps["items"] = navEntries.map((entry) => {
 
 const defaultOpenKeys = navEntries.flatMap((entry) => ("to" in entry ? [] : [entry.key]));
 
+const mobilePrimaryItems = [
+  { to: "/", label: "总览", shortLabel: "总览", icon: <LayoutDashboard size={16} /> },
+  { to: "/ui-checks", label: "页面监控", shortLabel: "页面", icon: <MonitorCheck size={16} /> },
+  { to: "/api-checks", label: "接口监控", shortLabel: "接口", icon: <PlugZap size={16} /> },
+  { to: "/runs", label: "运行记录", shortLabel: "记录", icon: <History size={16} /> }
+];
+
+const mobileMoreItems: NavLeaf[] = [
+  { to: "/monitoring", label: "监控趋势", icon: <Activity size={16} /> },
+  { to: "/members", label: "成员管理", icon: <Users size={16} /> },
+  { to: "/settings/execution", label: "执行配置", icon: <Activity size={16} /> },
+  { to: "/settings/alerts", label: "告警配置", icon: <BellRing size={16} /> },
+  { to: "/settings/variables", label: "变量管理", icon: <KeyRound size={16} /> },
+  { to: "/settings/system", label: "系统配置", icon: <Settings size={16} /> },
+  { to: "/operations", label: "运维审计", icon: <ScrollText size={16} /> }
+];
+
 const titles: Record<string, string> = Object.fromEntries(navItems.map((item) => [item.to, item.label]));
 
 function pathMatchesNavItem(pathname: string, itemPath: string): boolean {
@@ -101,6 +121,7 @@ export function Layout() {
     : titles[selectedPath] || (location.pathname.startsWith("/runs") ? "运行记录" : "PulseGuard");
   const maintenanceWindow = formatMaintenanceWindow(maintenance?.starts_at, maintenance?.ends_at);
   const showMaintenanceButton = Boolean(maintenance?.enabled);
+  const mobileMoreActive = mobileMoreItems.some((item) => pathMatchesNavItem(location.pathname, item.to));
 
   useEffect(() => {
     let disposed = false;
@@ -144,6 +165,7 @@ export function Layout() {
         <Menu
           className="nav-menu"
           mode="inline"
+          inlineIndent={18}
           defaultOpenKeys={defaultOpenKeys}
           selectedKeys={[selectedPath]}
           items={menuItems}
@@ -154,6 +176,49 @@ export function Layout() {
             }
           }}
         />
+        <div className="mobile-nav-grid" aria-label="移动主导航">
+          {mobilePrimaryItems.map((item) => {
+            const active = selectedPath === item.to;
+            return (
+              <UiButton
+                key={item.to}
+                type="button"
+                variant="ghost"
+                size="nav"
+                className={`mobile-nav-item ${active ? "is-active" : ""}`}
+                aria-label={item.label}
+                aria-current={active ? "page" : undefined}
+                onClick={() => navigate(item.to)}
+              >
+                <span className="mobile-nav-item-icon">{item.icon}</span>
+                <span className="mobile-nav-item-label">{item.shortLabel}</span>
+              </UiButton>
+            );
+          })}
+          <Dropdown
+            trigger={["click"]}
+            placement="bottomRight"
+            menu={{
+              items: mobileMoreItems.map((item) => ({ key: item.to, icon: item.icon, label: item.label })),
+              selectedKeys: mobileMoreActive ? [selectedPath] : [],
+              onClick: ({ key }) => navigate(String(key))
+            }}
+          >
+            <UiButton
+              type="button"
+              variant="ghost"
+              size="nav"
+              className={`mobile-nav-item ${mobileMoreActive ? "is-active" : ""}`}
+              aria-label="更多导航"
+              aria-current={mobileMoreActive ? "page" : undefined}
+            >
+              <span className="mobile-nav-item-icon">
+                <MoreHorizontal size={16} />
+              </span>
+              <span className="mobile-nav-item-label">更多</span>
+            </UiButton>
+          </Dropdown>
+        </div>
       </aside>
       <main className="main-area" id="main-content">
         <header className="topbar">

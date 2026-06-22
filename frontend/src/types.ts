@@ -7,6 +7,7 @@ export type RunnerSelectionMode = "selected_parallel" | "round_robin_all";
 export type BrowserType = "chromium" | "firefox" | "webkit";
 export type BrowserSelectionMode = "selected_parallel" | "round_robin_all";
 export type ProbeRunnerRole = "local" | "child" | string;
+export type ProbeRunnerConnectionMode = "manual" | "relay" | string;
 export type TaskSurfaceStatus =
   | "healthy"
   | "suspected_failing"
@@ -269,6 +270,71 @@ export interface RunArchive {
   updated_at: string;
 }
 
+export type TrendPeriod = "24h" | "7d" | "30d" | "custom";
+
+export interface TrendPoint {
+  bucket_start: string;
+  success_count: number;
+  failure_count: number;
+  duration_sum_ms: number;
+  avg_duration_ms?: number | null;
+  p95_duration_ms?: number | null;
+  p99_duration_ms?: number | null;
+}
+
+export interface TrendMetrics {
+  success_count: number;
+  failure_count: number;
+  duration_sum_ms: number;
+  avg_duration_ms?: number | null;
+  p95_duration_ms?: number | null;
+  p99_duration_ms?: number | null;
+  points: TrendPoint[];
+}
+
+export interface MonitoringTrendSummary extends TrendMetrics {
+  check_type: CheckType;
+  label: string;
+}
+
+export interface MonitoringTrendTask extends TrendMetrics {
+  check_id: number;
+  name: string;
+  check_type: CheckType;
+  enabled: boolean;
+  monitor_status: TaskSurfaceStatus | string;
+  last_run_at?: string | null;
+  last_duration_ms?: number | null;
+}
+
+export interface MonitoringTrends {
+  period: TrendPeriod | string;
+  start: string;
+  end: string;
+  summaries: MonitoringTrendSummary[];
+  tasks: {
+    items: MonitoringTrendTask[];
+    total: number;
+    page: number;
+    page_size: number;
+  };
+}
+
+export interface CheckTrend extends TrendMetrics {
+  period: TrendPeriod | string;
+  start: string;
+  end: string;
+  check: {
+    id: number;
+    name: string;
+    type: CheckType;
+    enabled: boolean;
+    monitor_status: TaskSurfaceStatus | string;
+    last_run_at?: string | null;
+    last_duration_ms?: number | null;
+  };
+}
+
 export interface ProbeRunner {
   runner_id: string;
   name: string;
@@ -281,9 +347,19 @@ export interface ProbeRunner {
   status: "ok" | "warning" | "offline" | string;
   enabled: boolean;
   role: ProbeRunnerRole;
+  connection_mode?: ProbeRunnerConnectionMode;
   available: boolean;
   token_set?: boolean;
   token_hint?: string;
+  relay_token_set?: boolean;
+  relay_token_hint?: string;
+  relay_token_version?: number;
+  allocated_internal_port?: number | null;
+  deploy_command_expires_at?: string | null;
+  relay_last_seen_at?: string | null;
+  worker_health_last_success_at?: string | null;
+  last_disconnect_reason?: string | null;
+  was_available?: boolean;
   unavailable_since?: string | null;
   unavailable_notified_at?: string | null;
   created_at?: string | null;
@@ -310,6 +386,34 @@ export interface ProbeRunnerPayload {
   network_region: string;
   enabled?: boolean;
   token?: string;
+}
+
+export interface RelayStatus {
+  enabled: boolean;
+  public_host: string;
+  public_port: number;
+  public_url: string;
+  server_fingerprint: string;
+  error: string;
+}
+
+export interface RunnerProvisionPayload {
+  name: string;
+  network_region: string;
+  target_platform: "linux" | "powershell";
+  compose_url: string;
+  enabled?: boolean;
+}
+
+export interface RunnerProvisionResult extends ProbeRunner {
+  deployment: {
+    target_platform: "linux" | "powershell";
+    compose_url: string;
+    command: string;
+    expires_at?: string | null;
+    relay_url: string;
+    server_fingerprint: string;
+  };
 }
 
 export interface RunnerUpdateRequest {

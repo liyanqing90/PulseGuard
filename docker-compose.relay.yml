@@ -1,0 +1,27 @@
+services:
+  pulseguard:
+    environment:
+      - PULSEGUARD_RELAY_ENABLED=true
+      - PULSEGUARD_RELAY_PUBLIC_HOST=${PULSEGUARD_RELAY_PUBLIC_HOST:-127.0.0.1}
+      - PULSEGUARD_RELAY_PUBLIC_PORT=${PULSEGUARD_RELAY_PUBLIC_PORT:-9443}
+      - PULSEGUARD_RELAY_INTERNAL_HOST=${PULSEGUARD_RELAY_INTERNAL_HOST:-pulseguard-relay}
+
+  pulseguard-relay:
+    build: .
+    container_name: pulseguard-relay
+    restart: unless-stopped
+    command: ["python", "-m", "app.relay_server"]
+    ports:
+      - "${PULSEGUARD_RELAY_PUBLISH_HOST:-0.0.0.0}:${PULSEGUARD_RELAY_PUBLIC_PORT:-9443}:${PULSEGUARD_RELAY_PUBLIC_PORT:-9443}"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PULSEGUARD_RELAY_ENABLED=true
+      - PULSEGUARD_RELAY_PUBLIC_HOST=${PULSEGUARD_RELAY_PUBLIC_HOST:-127.0.0.1}
+      - PULSEGUARD_RELAY_PUBLIC_PORT=${PULSEGUARD_RELAY_PUBLIC_PORT:-9443}
+      - PULSEGUARD_RELAY_INTERNAL_PORT_START=${PULSEGUARD_RELAY_INTERNAL_PORT_START:-18001}
+      - PULSEGUARD_RELAY_INTERNAL_PORT_END=${PULSEGUARD_RELAY_INTERNAL_PORT_END:-18100}
+      - PULSEGUARD_DATA_DIR=/app/data
+    mem_limit: 512m
+    cpus: 0.5

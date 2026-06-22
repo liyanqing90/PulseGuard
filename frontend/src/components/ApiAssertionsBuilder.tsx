@@ -231,7 +231,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
         </Space>
       </div>
 
-      {error && <Alert type="error" message={error} showIcon />}
+      {error && <Alert type="error" title={error} showIcon />}
 
       {inspectResult && (
         <div className="api-inspect-summary">

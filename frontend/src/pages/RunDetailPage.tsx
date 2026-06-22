@@ -62,7 +62,7 @@ export function RunDetailPage() {
         </div>
       </Card>
 
-      {error && <Alert type="error" message={error} showIcon />}
+      {error && <Alert type="error" title={error} showIcon />}
 
       <Card className="run-detail-card">
         {loading ? <Skeleton active paragraph={{ rows: 8 }} /> : <RunDetailContent run={run} />}

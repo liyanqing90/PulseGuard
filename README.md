@@ -17,6 +17,7 @@ PulseGuard 不是 SaaS、公开状态页、完整 E2E 测试管理平台或 inci
 - 规则维护：支持 UI selector 稳定性提示、规则失效检测、API 响应字段预览和一键生成基础断言。
 - 批量操作：按类型、标签和启用状态批量执行、启停、调频，并用命中数量防止误操作。
 - 运行记录：已保存任务的定时、手动、批量和重跑均属于正式执行，会影响健康状态、成功率与告警；只有编辑器配置试运行不影响状态且不触发告警。
+- 监控趋势：独立趋势页展示整体 UI/API 和分页任务趋势，按 24 小时、7 天、30 天或自定义时间段查看平均响应、P95、P99 和失败次数。
 - 可信健康状态：支持健康、疑似故障、故障、疑似恢复、未知、观测陈旧、停用，Runner 异常不会误报为目标故障。
 - 证据保留：失败时保存错误摘要、截图、Trace 和 Response Body；成功 API 响应默认只保留摘要。
 - 执行节点追踪：记录本机和子节点名称、地址、网络区域、浏览器版本，并支持启停、认证心跳、可用状态和状态列表。
@@ -107,13 +108,47 @@ UI 任务支持 `chromium`、`firefox`、`webkit` 三类 Playwright browser type
 
 ## 多运行节点
 
-PulseGuard 默认保留并启用内置 `local` 节点。子节点是独立部署的执行服务，只负责暴露受 token 保护的健康检查和执行接口、执行主节点下发的任务、回传运行结果和证据文件；子节点不会主动注册到主节点、不会启动调度器、不会写主节点数据库，也不会发送告警。
+PulseGuard 默认保留并启用内置 `local` 节点。子节点是独立部署的执行服务，只负责暴露受 token 保护的健康检查和执行接口、执行主节点下发的任务、回传运行结果和证据文件；子节点不会启动调度器、不会写主节点数据库，也不会发送告警。
 
-创建子节点：
+子节点有两种接入模式：
+
+- 手动添加：沿用原有方式。主节点必须能直接访问子节点 `http://<worker>:8788`，页面中填写地址和 worker token。
+- 生成部署命令：新增 PulseGuard Relay 方式。worker 不开放入站端口，只主动出站连接主节点 relay；主节点通过 Docker 网络内的 relay 内部端口访问 worker API。
+
+### Relay 自动接入
+
+主节点启用 relay server：
+
+```sh
+export PULSEGUARD_RELAY_PUBLIC_HOST="<主节点公网 IP>"
+docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
+```
+
+默认公网 relay 端口是 `9443`。如果只能开放 `443`，设置：
+
+```sh
+export PULSEGUARD_RELAY_PUBLIC_PORT=443
+docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
+```
+
+主节点会在 `data/relay/` 下生成自签 TLS 证书，页面和 API 会显示 server fingerprint。worker 侧 relay-client 会校验 fingerprint 后才发送 relay token。
+
+在主节点打开“系统设置 > 执行配置 > 新增子节点”，选择“生成部署命令”，填写节点名称、网络区域、目标平台和 worker 宿主机可访问的 `docker-compose.relay-worker.yml` 下载地址。生成后把命令复制到 worker 宿主机执行。自动模式使用 `docker-compose.relay-worker.yml`，worker 只在 compose 网络内 `expose: 8788`，不会把 `8788` 映射到宿主机。
+
+Relay 自动模式状态：
+
+- `待部署`、`已过期`、`连接中` 不参与“轮询所有启用节点”，也不触发 runner 异常告警。
+- relay 连接成功后先进入 `连接中`；主节点通过内部端口访问 `/api/worker/health` 成功后才进入 `可用`。
+- 曾经可用后断线，才进入可告警的 `异常` 或 `认证失败`。
+- “重新生成命令”会保留 runner ID 和内部端口，轮换 relay token，旧命令立即失效；worker token 默认不轮换。
+
+### 手动添加子节点
+
+创建手动子节点：
 
 1. 在子节点服务器上用 worker 命令部署并启动服务，终端会输出当前子节点地址和认证 token。
 2. 在主节点打开“系统设置 > 执行配置”。
-3. 点击“新增子节点”，填写节点名称、子节点可被主节点访问的地址、网络区域和终端输出的认证 token。这个操作只在主节点保存节点记录，不会让子节点主动注册。
+3. 点击“新增子节点”，选择“手动添加”，填写节点名称、子节点可被主节点访问的地址、网络区域和终端输出的认证 token。这个操作只在主节点保存节点记录，不会让子节点主动注册。
 4. 点击“测试连接”确认主节点可以访问子节点 `/api/worker/health`。
 5. 在任务详情或编辑抽屉中选择“多选并行”并勾选节点，或选择“轮询所有启用节点”。
 
@@ -245,7 +280,7 @@ $env:PULSEGUARD_UV_IMAGE = "registry.example.com/astral-sh/uv:0.9.30"
 $env:PULSEGUARD_PLAYWRIGHT_IMAGE = "registry.example.com/playwright/python:v1.49.1-noble"
 ```
 
-Token 存储与刷新：
+手动模式 token 存储与刷新：
 
 - Docker 子节点默认把 token 存到容器内 `/app/data/worker-token`，`docker-compose.worker.yml` 已经把 `/app/data` 挂到 `pulseguard-worker-data` 卷，容器重建后 token 仍会保留。
 - 查看当前 token：
@@ -273,19 +308,22 @@ docker compose -f docker-compose.worker.yml run --rm pulseguard-worker python -m
 uv run python -m backend.app.worker --rotate-token --token-file data/worker-token
 ```
 
-刷新 token 后，必须回到主节点“系统设置 > 执行配置”，对该子节点执行“更新认证”，填入新 token，然后再点“测试连接”确认可用。
+刷新手动模式 token 后，必须回到主节点“系统设置 > 执行配置”，对该子节点执行“更新认证”，填入新 token，然后再点“测试连接”确认可用。Relay 自动模式需要轮换 relay token 时，使用“重新生成命令”并在 worker 宿主机重新执行命令。
 
 网络要求：
 
-- 主节点必须能访问子节点的 `/api/worker/health` 和 `/api/worker/run`。
+- 手动模式下，主节点必须能访问子节点的 `/api/worker/health` 和 `/api/worker/run`。
+- Relay 自动模式下，公网只需要开放主节点 relay TCP 端口，默认 `9443`；worker 不开放入站端口。
 - 子节点接口使用 `Authorization: Bearer <token>` 认证。
-- 子节点不需要配置主节点地址，也不会主动访问主节点；关联动作由主节点页面手动添加节点完成。
+- 手动模式子节点不需要配置主节点地址，也不会主动访问主节点；Relay 自动模式由 relay-client 主动出站连接主节点。
 - 远程截图、Trace 和 Response Body 通过 JSON base64 回传主节点，单个文件超过大小上限会记录日志但不会伪造成功。
 - 手动停用的节点不会触发不可用告警；启用节点健康检查失败或派发失败时，同一节点只告警一次，恢复可用后重置。
 
 常见排障：
 
 - 主节点“测试连接”失败：检查子节点地址是否从主节点可达，端口是否放行，worker 是否用 `0.0.0.0` 或正确网卡监听。
+- Relay 自动节点停留在“连接中”：检查 `pulseguard-relay` 服务、worker 侧 `pulseguard-relay-client` 日志、server fingerprint 和公网端口。
+- Relay 自动节点显示“认证失败”：重新生成部署命令并在 worker 宿主机重新执行，旧 relay token 已失效。
 - 节点不可用：检查主节点保存的地址和 token 是否与子节点终端输出一致；token 更新后需要在平台“更新认证”里同步。
 - 任务记录显示 Runner 异常：这类记录的 `failure_kind=runner`，不会按目标失败累计；优先查看节点可用状态和子节点日志。
 
@@ -336,6 +374,7 @@ async def setup(ctx):
 
 - 默认使用 SQLite，数据库文件位于 `data/`。
 - SQLite 支持在线备份和恢复，备份位于 `data/backups/`。
+- 趋势数据写入 SQLite `trend_rollups` 轻量聚合表，长期保存响应时间 histogram 和汇总指标，不永久保存完整运行证据。
 - 截图、Trace、Response Body 和归档摘要位于 `reports/`。
 - 环境变量、Webhook、钉钉密钥、只读令牌、常见认证 Header 和 Cookie 会在公开设置、运行记录和只读出口中脱敏。
 - 用户自定义 Python 探活脚本是可信本地工具能力，不是安全沙箱。
@@ -347,7 +386,10 @@ async def setup(ctx):
 - `GET /api/metrics.json`：JSON 指标
 - `GET /api/metrics`：Prometheus 指标
 - `GET /api/read-only/snapshot`：只读快照，需要配置只读令牌
-- `GET /api/runners` / `POST /api/runners`：执行节点列表和创建
+- `GET /api/runners` / `POST /api/runners`：执行节点列表和手动创建
+- `GET /api/relay/status`：Relay 启用状态、公网地址和 server fingerprint
+- `POST /api/runners/provision`：生成 Relay 自动接入子节点和一次性部署命令
+- `POST /api/runners/{runner_id}/provision/regenerate`：保留 runner ID 和内部端口，重新生成 Relay 部署命令
 - `POST /api/runners/{runner_id}/update` / `GET /api/runners/{runner_id}/update-status`：主节点向子节点推送受控镜像更新和查询更新状态
 - `POST /api/runners/heartbeat`：旧版 Runner 主动心跳兼容接口，新子节点默认不需要配置
 - `GET /api/worker/health` / `POST /api/worker/run`：子节点健康检查和执行入口
@@ -357,6 +399,8 @@ async def setup(ctx):
 - `GET /api/runs?run_group_id=...`：按一次多节点触发分组查看所有节点运行结果
 - `GET /api/runs-page?run_group_id=...`：分页查看同组运行结果
 - `GET /api/runs/{id}`：查看基于执行快照的运行详情；UI 运行只附带当次快照中的基础请求信息（URL、页面模式、超时），API 运行保留 request/response snapshots，不再重新加载当前任务定义
+- `GET /api/monitoring-trends`：获取整体 UI/API 和分页任务趋势
+- `GET /api/checks/{id}/trend`：获取单任务放大趋势
 - `POST /api/heartbeats/{key}`：被动心跳上报
 
 ## 目录结构
@@ -371,7 +415,9 @@ Dockerfile               主节点生产镜像构建
 Dockerfile.worker        子节点独立 worker 镜像构建
 Dockerfile.worker-updater 子节点 updater 镜像构建
 docker-compose.yml       主节点单实例部署
+docker-compose.relay.yml 主节点 Relay server overlay
 docker-compose.worker.yml 子节点 worker 部署
+docker-compose.relay-worker.yml Relay 自动模式子节点部署
 pyproject.toml           后端依赖定义
 uv.lock                  后端依赖锁定
 ```

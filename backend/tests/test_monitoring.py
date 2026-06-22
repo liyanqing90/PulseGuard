@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -143,3 +145,141 @@ class MonitoringStorageTests(unittest.TestCase):
 
             self.assertTrue((Path(temp_dir) / "backups" / backup["filename"]).is_file())
             self.assertGreater(backup["size_bytes"], 0)
+
+
+def _seed_rollup(check_id: int, check_type: str, bucket_start: datetime, granularity: str = "1h") -> None:
+    timestamp = storage.now_iso()
+    with storage._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO trend_rollups (
+                check_id, check_type, bucket_granularity, bucket_start, success_count,
+                failure_count, duration_sum_ms, avg_duration_ms, p95_duration_ms,
+                p99_duration_ms, latency_histogram_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                check_id,
+                check_type,
+                granularity,
+                bucket_start.isoformat(timespec="seconds"),
+                1,
+                0,
+                300,
+                300,
+                300,
+                300,
+                json.dumps({"300": 1}),
+                timestamp,
+            ),
+        )
+        conn.commit()
+
+
+def _seed_hour_rollups(check_id: int, check_type: str, anchor: datetime, hours: list[int]) -> None:
+    for hour in hours:
+        bucket_start = anchor.replace(hour=hour, minute=0, second=0, microsecond=0)
+        _seed_rollup(check_id, check_type, bucket_start, "1h")
+
+
+class MonitoringHourWindowTests(unittest.TestCase):
+    def test_parse_hour_window_validates_inputs(self) -> None:
+        self.assertIsNone(storage._parse_hour_window(None, None))
+        self.assertIsNone(storage._parse_hour_window("", ""))
+        with self.assertRaises(ValueError):
+            storage._parse_hour_window("02:00", None)
+        with self.assertRaises(ValueError):
+            storage._parse_hour_window(None, "04:00")
+        with self.assertRaises(ValueError):
+            storage._parse_hour_window("invalid", "04:00")
+        with self.assertRaises(ValueError):
+            storage._parse_hour_window("02:00", "02:00")
+        window = storage._parse_hour_window("02:00", "04:00")
+        self.assertEqual(window, (time(2, 0), time(4, 0)))
+
+    def test_hour_in_window_handles_cross_midnight(self) -> None:
+        normal = (time(2, 0), time(4, 0))
+        self.assertTrue(storage._hour_in_window(time(2, 0), normal))
+        self.assertTrue(storage._hour_in_window(time(3, 30), normal))
+        self.assertFalse(storage._hour_in_window(time(4, 0), normal))
+        self.assertFalse(storage._hour_in_window(time(1, 30), normal))
+
+        cross = (time(22, 0), time(2, 0))
+        self.assertTrue(storage._hour_in_window(time(22, 0), cross))
+        self.assertTrue(storage._hour_in_window(time(23, 30), cross))
+        self.assertTrue(storage._hour_in_window(time(0, 30), cross))
+        self.assertTrue(storage._hour_in_window(time(1, 0), cross))
+        self.assertFalse(storage._hour_in_window(time(2, 0), cross))
+        self.assertFalse(storage._hour_in_window(time(12, 0), cross))
+
+    def test_monitoring_trends_filters_to_hour_window(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "BACKUPS_DIR", Path(temp_dir) / "backups"):
+            storage.init_db()
+            check = storage.list_checks("api")[0]
+            check_id = int(check["id"])
+            anchor = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) - timedelta(days=2)
+            _seed_hour_rollups(check_id, "api", anchor, [1, 2, 3, 4, 5])
+            _seed_hour_rollups(storage.TREND_SUMMARY_CHECK_IDS["api"], "api", anchor, [1, 2, 3, 4, 5])
+
+            full = storage.list_monitoring_trends(period="7d", check_type="api")
+            target_full = next(item for item in full["tasks"]["items"] if item["check_id"] == check_id)
+            self.assertEqual(target_full["success_count"], 5)
+
+            scoped = storage.list_monitoring_trends(
+                period="7d", check_type="api", hour_start="02:00", hour_end="04:00"
+            )
+            target_scoped = next(item for item in scoped["tasks"]["items"] if item["check_id"] == check_id)
+            self.assertEqual(target_scoped["success_count"], 2)
+            self.assertEqual(scoped["hour_start"], "02:00")
+            self.assertEqual(scoped["hour_end"], "04:00")
+            summary = scoped["summaries"][0]
+            self.assertEqual(summary["success_count"], 2)
+
+    def test_monitoring_trends_minute_hour_window_uses_five_minute_rollups(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "BACKUPS_DIR", Path(temp_dir) / "backups"):
+            storage.init_db()
+            check = storage.list_checks("api")[0]
+            check_id = int(check["id"])
+            anchor = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=2)
+            for hour, minute in [(2, 0), (2, 15), (2, 30), (3, 30), (3, 45), (4, 0)]:
+                bucket_start = anchor.replace(hour=hour, minute=minute)
+                _seed_rollup(check_id, "api", bucket_start, "5m")
+                _seed_rollup(storage.TREND_SUMMARY_CHECK_IDS["api"], "api", bucket_start, "5m")
+
+            scoped = storage.list_monitoring_trends(
+                period="7d", check_type="api", hour_start="02:15", hour_end="03:45"
+            )
+            target_scoped = next(item for item in scoped["tasks"]["items"] if item["check_id"] == check_id)
+
+        self.assertEqual(target_scoped["success_count"], 3)
+        self.assertEqual(scoped["summaries"][0]["success_count"], 3)
+
+    def test_monitoring_trends_hour_window_cross_midnight(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "BACKUPS_DIR", Path(temp_dir) / "backups"):
+            storage.init_db()
+            check = storage.list_checks("api")[0]
+            check_id = int(check["id"])
+            anchor = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) - timedelta(days=2)
+            _seed_hour_rollups(check_id, "api", anchor, [21, 22, 23, 0, 1, 2, 3])
+            _seed_hour_rollups(storage.TREND_SUMMARY_CHECK_IDS["api"], "api", anchor, [21, 22, 23, 0, 1, 2, 3])
+
+            scoped = storage.list_monitoring_trends(
+                period="7d", check_type="api", hour_start="22:00", hour_end="02:00"
+            )
+            target_scoped = next(item for item in scoped["tasks"]["items"] if item["check_id"] == check_id)
+            # 22, 23, 0, 1 hit the window (4 buckets); 21, 2, 3 are excluded
+            self.assertEqual(target_scoped["success_count"], 4)
+
+    def test_monitoring_trends_invalid_hour_window(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "BACKUPS_DIR", Path(temp_dir) / "backups"):
+            storage.init_db()
+            with self.assertRaises(ValueError):
+                storage.list_monitoring_trends(period="24h", hour_start="02:00")

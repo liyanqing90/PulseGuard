@@ -424,6 +424,28 @@ class ProbeRunnerUpdate(BaseModel):
         return _worker_token(value, required=False)
 
 
+class RunnerProvisionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    network_region: str = Field(default="local", max_length=120)
+    target_platform: Literal["linux", "powershell"] = "linux"
+    compose_url: str = Field(min_length=1, max_length=2048)
+    enabled: bool = True
+
+    @field_validator("network_region")
+    @classmethod
+    def network_region_must_be_text(cls, value: str) -> str:
+        return value.strip() or "local"
+
+    @field_validator("compose_url")
+    @classmethod
+    def compose_url_must_be_http_url(cls, value: str) -> str:
+        text = value.strip()
+        parts = urlsplit(text)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise ValueError("Compose URL 必须是完整 http(s) 地址")
+        return text
+
+
 class WorkerUpdateRequest(BaseModel):
     target_image: str | None = Field(default=None, max_length=512)
     update_id: str | None = Field(default=None, max_length=120)
