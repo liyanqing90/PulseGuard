@@ -332,6 +332,22 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.streams, {})
         self.assertEqual(websocket.close_kwargs, {})
 
+    async def test_close_stream_removes_stream_after_close_failure(self) -> None:
+        failed_stream = FakeStream(fail=True)
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=FakeWebSocket(),  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        session.streams["stream-1"] = failed_stream  # type: ignore[assignment]
+
+        await relay_server._close_stream_best_effort(session, "stream-1")
+
+        self.assertTrue(failed_stream.closed)
+        self.assertEqual(session.streams, {})
+
     async def test_duplicate_session_replaces_old_session(self) -> None:
         old_server = FakeServer()
         old_websocket = FakeWebSocket()
