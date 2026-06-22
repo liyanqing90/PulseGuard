@@ -214,10 +214,19 @@ async def _handle_data_message(session: RelaySession, message: dict[str, Any]) -
             except TimeoutError:
                 close_stream = True
         if close_stream:
-            async with session.stream_lock:
-                session.streams.pop(stream_id, None)
-            await stream.close()
+            await _close_stream_best_effort(session, stream_id)
     return True
+
+
+async def _close_stream_best_effort(session: RelaySession, stream_id: str) -> None:
+    async with session.stream_lock:
+        stream = session.streams.pop(stream_id, None)
+    if not stream:
+        return
+    try:
+        await stream.close()
+    except Exception:
+        pass
 
 
 async def _receive_session_message(session: RelaySession) -> dict[str, Any]:
@@ -339,10 +348,7 @@ async def relay_connect(websocket: WebSocket) -> None:
                     disconnect_reason = "invalid relay message"
                     await websocket.close(code=4400, reason="invalid relay message")
                     return
-                async with session.stream_lock:
-                    stream = session.streams.pop(stream_id, None)
-                if stream:
-                    await stream.close()
+                await _close_stream_best_effort(session, stream_id)
             else:
                 disconnect_reason = "invalid relay message"
                 await websocket.close(code=4400, reason="invalid relay message")
