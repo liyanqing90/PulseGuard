@@ -126,6 +126,14 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(writer.closed)
         self.assertNotIn("stream-1", streams)
 
+    async def test_relay_data_rejects_invalid_payload_even_for_unknown_stream(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not valid base64"):
+            await relay_client._handle_relay_data_message(
+                "missing-stream",
+                {"type": "data", "stream_id": "missing-stream", "data": "not-base64!"},
+                {},
+            )
+
     async def test_heartbeat_ack_is_valid_noop(self) -> None:
         await relay_client._handle_relay_message({"type": "heartbeat_ack"}, object(), asyncio.Lock(), {})
 
