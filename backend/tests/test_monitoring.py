@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from datetime import datetime, time, timedelta
@@ -147,39 +146,36 @@ class MonitoringStorageTests(unittest.TestCase):
             self.assertGreater(backup["size_bytes"], 0)
 
 
-def _seed_rollup(check_id: int, check_type: str, bucket_start: datetime, granularity: str = "1h") -> None:
-    timestamp = storage.now_iso()
+def _seed_trend_run(check_id: int, check_type: str, started_at: datetime, duration_ms: int = 300) -> None:
+    timestamp = started_at.isoformat(timespec="seconds")
     with storage._connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
-            INSERT INTO trend_rollups (
-                check_id, check_type, bucket_granularity, bucket_start, success_count,
-                failure_count, duration_sum_ms, avg_duration_ms, p95_duration_ms,
-                p99_duration_ms, latency_histogram_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runs (
+                check_id, check_name, check_type, status, started_at, finished_at,
+                duration_ms, failure_kind, observation_kind, affects_health, created_at
+            ) VALUES (?, ?, ?, 'ok', ?, ?, ?, 'none', 'observation', 1, ?)
             """,
             (
                 check_id,
+                "Trend UI" if check_type == "ui" else "Trend API",
                 check_type,
-                granularity,
-                bucket_start.isoformat(timespec="seconds"),
-                1,
-                0,
-                300,
-                300,
-                300,
-                300,
-                json.dumps({"300": 1}),
+                timestamp,
+                timestamp,
+                duration_ms,
                 timestamp,
             ),
         )
-        conn.commit()
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (int(cursor.lastrowid),)).fetchone()
+        assert row is not None
+        storage._record_trend_rollups(conn, row)
+        conn.execute("UPDATE runs SET trend_recorded_at = ? WHERE id = ?", (storage.now_iso(), int(cursor.lastrowid)))
 
 
-def _seed_hour_rollups(check_id: int, check_type: str, anchor: datetime, hours: list[int]) -> None:
+def _seed_hour_runs(check_id: int, check_type: str, anchor: datetime, hours: list[int]) -> None:
     for hour in hours:
-        bucket_start = anchor.replace(hour=hour, minute=0, second=0, microsecond=0)
-        _seed_rollup(check_id, check_type, bucket_start, "1h")
+        started_at = anchor.replace(hour=hour, minute=0, second=0, microsecond=0)
+        _seed_trend_run(check_id, check_type, started_at)
 
 
 class MonitoringHourWindowTests(unittest.TestCase):
@@ -220,8 +216,7 @@ class MonitoringHourWindowTests(unittest.TestCase):
             check = storage.list_checks("api")[0]
             check_id = int(check["id"])
             anchor = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) - timedelta(days=2)
-            _seed_hour_rollups(check_id, "api", anchor, [1, 2, 3, 4, 5])
-            _seed_hour_rollups(storage.TREND_SUMMARY_CHECK_IDS["api"], "api", anchor, [1, 2, 3, 4, 5])
+            _seed_hour_runs(check_id, "api", anchor, [1, 2, 3, 4, 5])
 
             full = storage.list_monitoring_trends(period="7d", check_type="api")
             target_full = next(item for item in full["tasks"]["items"] if item["check_id"] == check_id)
@@ -246,9 +241,8 @@ class MonitoringHourWindowTests(unittest.TestCase):
             check_id = int(check["id"])
             anchor = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=2)
             for hour, minute in [(2, 0), (2, 15), (2, 30), (3, 30), (3, 45), (4, 0)]:
-                bucket_start = anchor.replace(hour=hour, minute=minute)
-                _seed_rollup(check_id, "api", bucket_start, "5m")
-                _seed_rollup(storage.TREND_SUMMARY_CHECK_IDS["api"], "api", bucket_start, "5m")
+                started_at = anchor.replace(hour=hour, minute=minute)
+                _seed_trend_run(check_id, "api", started_at)
 
             scoped = storage.list_monitoring_trends(
                 period="7d", check_type="api", hour_start="02:15", hour_end="03:45"
@@ -266,8 +260,7 @@ class MonitoringHourWindowTests(unittest.TestCase):
             check = storage.list_checks("api")[0]
             check_id = int(check["id"])
             anchor = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) - timedelta(days=2)
-            _seed_hour_rollups(check_id, "api", anchor, [21, 22, 23, 0, 1, 2, 3])
-            _seed_hour_rollups(storage.TREND_SUMMARY_CHECK_IDS["api"], "api", anchor, [21, 22, 23, 0, 1, 2, 3])
+            _seed_hour_runs(check_id, "api", anchor, [21, 22, 23, 0, 1, 2, 3])
 
             scoped = storage.list_monitoring_trends(
                 period="7d", check_type="api", hour_start="22:00", hour_end="02:00"

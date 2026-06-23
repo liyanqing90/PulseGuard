@@ -266,6 +266,16 @@ class DraftRunnerTests(unittest.TestCase):
         }
         created_run = {"id": 190, "status": "running"}
         finished_runs: list[dict[str, object]] = []
+        attempt_count = 0
+
+        async def run_attempt(*_args: object, **_kwargs: object) -> int:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                exc = RunFailure("flaky")
+                setattr(exc, _TASK_DURATION_ATTR, 9000)
+                raise exc
+            return 1200
 
         def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
             finished = {"id": run_id, "check_id": 19, **data}
@@ -285,17 +295,18 @@ class DraftRunnerTests(unittest.TestCase):
             "backend.app.runner.storage.update_check_status", return_value={"current_status": "healthy", "previous_status": "unknown"}
         ), patch(
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
-        ), patch(
-            "backend.app.runner.run_structured_api_check", new_callable=AsyncMock, side_effect=[RunFailure("flaky"), None]
-        ) as run_structured_api_check:
+        ), patch.object(
+            CheckRunner, "_run_check_attempt", side_effect=run_attempt
+        ):
             runner = CheckRunner()
             result = asyncio.run(runner.run_check(19))
 
         self.assertEqual(result["status"], "ok")
         create_run.assert_called_once()
-        self.assertEqual(run_structured_api_check.await_count, 2)
+        self.assertEqual(attempt_count, 2)
         self.assertEqual(len(finished_runs), 1)
         self.assertEqual(finished_runs[0]["status"], "ok")
+        self.assertEqual(finished_runs[0]["duration_ms"], 1200)
         self.assertIn("本次尝试失败，立即重试：flaky", str(finished_runs[0]["logs"]))
 
     def test_retry_duration_uses_final_failed_attempt_instead_of_cumulative_total(self) -> None:

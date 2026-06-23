@@ -100,7 +100,11 @@ TREND_LATENCY_BUCKETS_MS = (
     5000,
     7500,
     10000,
+    12000,
     15000,
+    18000,
+    20000,
+    25000,
     30000,
     60000,
     120000,
@@ -269,6 +273,7 @@ def init_db() -> None:
                 p95_duration_ms INTEGER,
                 p99_duration_ms INTEGER,
                 latency_histogram_json TEXT NOT NULL DEFAULT '{}',
+                duration_samples_json TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL,
                 UNIQUE(check_id, bucket_granularity, bucket_start)
             );
@@ -349,6 +354,7 @@ def init_db() -> None:
         )
         _ensure_check_columns(conn)
         _ensure_run_columns(conn)
+        _ensure_trend_rollup_columns(conn)
         _ensure_check_status_columns(conn)
         _ensure_probe_runner_columns(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_probe_runners_relay_port ON probe_runners(allocated_internal_port)")
@@ -2513,7 +2519,7 @@ def _overview_trend_metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
     total = len(rows)
     successes = sum(1 for row in rows if row["status"] == "ok")
     failures = sum(1 for row in rows if row["status"] in {"failed", "timeout"})
-    durations = sorted(int(row["duration_ms"]) for row in rows if row["duration_ms"] is not None)
+    durations = sorted(int(row["duration_ms"]) for row in rows if row["status"] == "ok" and row["duration_ms"] is not None)
     return {
         "runs": total,
         "success_count": successes,
@@ -2627,7 +2633,7 @@ def _trend_series_by_check(
         WHERE check_id IN ({placeholders})
           AND bucket_granularity = ?
           AND bucket_start >= ?
-          AND bucket_start < ?
+          AND bucket_start <= ?
         ORDER BY bucket_start ASC
         """,
         [
@@ -2732,7 +2738,14 @@ def _empty_trend_series() -> dict[str, Any]:
 
 
 def _empty_trend_accumulator() -> dict[str, Any]:
-    return {"success_count": 0, "failure_count": 0, "duration_sum_ms": 0, "histogram": {}}
+    return {
+        "success_count": 0,
+        "failure_count": 0,
+        "duration_sum_ms": 0,
+        "histogram": {},
+        "durations": [],
+        "duration_sample_count": 0,
+    }
 
 
 def _merge_rollup_into_accumulator(accumulator: dict[str, Any], row: sqlite3.Row) -> None:
@@ -2742,20 +2755,33 @@ def _merge_rollup_into_accumulator(accumulator: dict[str, Any], row: sqlite3.Row
     histogram = accumulator["histogram"]
     for bucket, count in _load_histogram(row["latency_histogram_json"]).items():
         histogram[bucket] = int(histogram.get(bucket, 0)) + int(count)
+    samples = _load_duration_samples(row["duration_samples_json"])
+    if samples:
+        accumulator.setdefault("durations", []).extend(samples)
+        accumulator["duration_sample_count"] = int(accumulator.get("duration_sample_count") or 0) + len(samples)
 
 
 def _trend_metrics(accumulator: dict[str, Any]) -> dict[str, Any]:
     success_count = int(accumulator["success_count"] or 0)
     failure_count = int(accumulator["failure_count"] or 0)
     duration_sum = int(accumulator["duration_sum_ms"] or 0)
+    durations = accumulator.get("durations")
+    duration_sample_count = int(accumulator.get("duration_sample_count") or 0)
     histogram = accumulator.get("histogram") if isinstance(accumulator.get("histogram"), dict) else {}
+    if isinstance(durations, list) and duration_sample_count == success_count:
+        sorted_durations = sorted(int(value) for value in durations)
+        p95_duration_ms = _percentile(sorted_durations, 0.95) if len(sorted_durations) >= 20 else None
+        p99_duration_ms = _percentile(sorted_durations, 0.99) if len(sorted_durations) >= 100 else None
+    else:
+        p95_duration_ms = _histogram_percentile(histogram, 0.95, min_samples=20)
+        p99_duration_ms = _histogram_percentile(histogram, 0.99, min_samples=100)
     return {
         "success_count": success_count,
         "failure_count": failure_count,
         "duration_sum_ms": duration_sum,
         "avg_duration_ms": round(duration_sum / success_count) if success_count else None,
-        "p95_duration_ms": _histogram_percentile(histogram, 0.95, min_samples=20),
-        "p99_duration_ms": _histogram_percentile(histogram, 0.99, min_samples=100),
+        "p95_duration_ms": p95_duration_ms,
+        "p99_duration_ms": p99_duration_ms,
     }
 
 
@@ -2820,10 +2846,13 @@ def _upsert_trend_rollup(
     failure_count = int(row["failure_count"] or 0) if row else 0
     duration_sum = int(row["duration_sum_ms"] or 0) if row else 0
     histogram = _load_histogram(row["latency_histogram_json"]) if row else {}
+    duration_samples = _load_duration_samples(row["duration_samples_json"]) if row else []
     if duration_ms is not None:
+        normalized_duration = max(0, int(duration_ms))
         success_count += 1
-        duration_sum += max(0, int(duration_ms))
-        bucket = str(_latency_bucket(duration_ms))
+        duration_sum += normalized_duration
+        duration_samples.append(normalized_duration)
+        bucket = str(_latency_bucket(normalized_duration))
         histogram[bucket] = int(histogram.get(bucket, 0)) + 1
     if failure:
         failure_count += 1
@@ -2833,6 +2862,8 @@ def _upsert_trend_rollup(
             "failure_count": failure_count,
             "duration_sum_ms": duration_sum,
             "histogram": histogram,
+            "durations": duration_samples,
+            "duration_sample_count": len(duration_samples),
         }
     )
     payload = (
@@ -2847,6 +2878,7 @@ def _upsert_trend_rollup(
         metrics["p95_duration_ms"],
         metrics["p99_duration_ms"],
         json.dumps(histogram, ensure_ascii=False, sort_keys=True),
+        json.dumps(duration_samples, ensure_ascii=False),
         now_iso(),
     )
     conn.execute(
@@ -2854,8 +2886,8 @@ def _upsert_trend_rollup(
         INSERT INTO trend_rollups (
             check_id, check_type, bucket_granularity, bucket_start, success_count,
             failure_count, duration_sum_ms, avg_duration_ms, p95_duration_ms,
-            p99_duration_ms, latency_histogram_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            p99_duration_ms, latency_histogram_json, duration_samples_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(check_id, bucket_granularity, bucket_start) DO UPDATE SET
             check_type = excluded.check_type,
             success_count = excluded.success_count,
@@ -2865,6 +2897,7 @@ def _upsert_trend_rollup(
             p95_duration_ms = excluded.p95_duration_ms,
             p99_duration_ms = excluded.p99_duration_ms,
             latency_histogram_json = excluded.latency_histogram_json,
+            duration_samples_json = excluded.duration_samples_json,
             updated_at = excluded.updated_at
         """,
         payload,
@@ -2896,6 +2929,22 @@ def _load_histogram(value: Any) -> dict[str, int]:
     if not isinstance(raw, dict):
         return {}
     return {str(key): int(count) for key, count in raw.items() if int(count or 0) > 0}
+
+
+def _load_duration_samples(value: Any) -> list[int]:
+    try:
+        raw = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    samples: list[int] = []
+    for item in raw:
+        try:
+            samples.append(max(0, int(item)))
+        except (TypeError, ValueError):
+            continue
+    return samples
 
 
 def _histogram_percentile(histogram: dict[str, int], percentile: float, min_samples: int) -> int | None:
@@ -3076,6 +3125,16 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
     for name, column_type in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {column_type}")
+
+
+def _ensure_trend_rollup_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(trend_rollups)").fetchall()}
+    columns = {
+        "duration_samples_json": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for name, column_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE trend_rollups ADD COLUMN {name} {column_type}")
 
 
 def _ensure_check_status_columns(conn: sqlite3.Connection) -> None:

@@ -168,23 +168,23 @@ class OverviewStorageTests(unittest.TestCase):
         self.assertEqual(trend_24h["api"]["success_count"], 2)
         self.assertEqual(trend_24h["api"]["success_rate"], 50.0)
         self.assertEqual(trend_24h["api"]["failure_count"], 2)
-        self.assertEqual(trend_24h["api"]["duration_p50_ms"], 300)
+        self.assertEqual(trend_24h["api"]["duration_p50_ms"], 100)
         self.assertEqual(trend_24h["api"]["duration_p95_ms"], 700)
         self.assertEqual(trend_24h["ui"]["runs"], 2)
         self.assertEqual(trend_24h["ui"]["success_count"], 1)
         self.assertEqual(trend_24h["ui"]["success_rate"], 50.0)
         self.assertEqual(trend_24h["ui"]["failure_count"], 1)
         self.assertEqual(trend_24h["ui"]["duration_p50_ms"], 120)
-        self.assertEqual(trend_24h["ui"]["duration_p95_ms"], 320)
+        self.assertEqual(trend_24h["ui"]["duration_p95_ms"], 120)
         self.assertEqual(trend_7d["api"]["runs"], 7)
         self.assertEqual(trend_7d["api"]["success_rate"], 57.1)
         self.assertEqual(trend_7d["api"]["failure_count"], 3)
-        self.assertEqual(trend_7d["api"]["duration_p50_ms"], 400)
+        self.assertEqual(trend_7d["api"]["duration_p50_ms"], 200)
         self.assertEqual(trend_7d["api"]["duration_p95_ms"], 700)
         self.assertEqual(trend_7d["ui"]["runs"], 5)
         self.assertEqual(trend_7d["ui"]["success_rate"], 60.0)
         self.assertEqual(trend_7d["ui"]["failure_count"], 2)
-        self.assertEqual(trend_7d["ui"]["duration_p50_ms"], 320)
+        self.assertEqual(trend_7d["ui"]["duration_p50_ms"], 220)
         self.assertEqual(trend_7d["ui"]["duration_p95_ms"], 620)
 
     def test_overview_trends_return_empty_metrics_without_duration_samples(self) -> None:
@@ -688,6 +688,40 @@ class MonitoringTrendStorageTests(unittest.TestCase):
         summary = next(item for item in page["summaries"] if item["check_type"] == "api")
         self.assertEqual(summary["success_count"], 40)
         self.assertEqual(summary["p95_duration_ms"], 3000)
+
+    def test_trend_tail_latency_percentile_uses_exact_success_durations(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            clear_checks()
+            check = storage.create_check(api_check_data("Tail Bucket API"))
+            now = datetime.now().astimezone().replace(microsecond=0)
+            sample_at = now - timedelta(minutes=1)
+
+            for index in range(98):
+                run = storage.create_run(check)
+                set_run_started_at(int(run["id"]), sample_at)
+                storage.finish_run(int(run["id"]), run_payload("ok", duration_ms=1500))
+            for index in range(2):
+                run = storage.create_run(check)
+                set_run_started_at(int(run["id"]), sample_at)
+                storage.finish_run(int(run["id"]), run_payload("ok", duration_ms=16266))
+
+            trend = storage.get_check_trend(
+                int(check["id"]),
+                period="custom",
+                start=(now - timedelta(hours=3)).isoformat(timespec="seconds"),
+                end=(now + timedelta(minutes=1)).isoformat(timespec="seconds"),
+            )
+
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        self.assertEqual(trend["success_count"], 100)
+        self.assertEqual(trend["p99_duration_ms"], 16266)
+        self.assertLess(trend["p99_duration_ms"], 30000)
+        self.assertEqual(len(trend["points"]), 1)
+        self.assertEqual(trend["points"][0]["p99_duration_ms"], 16266)
 
     def test_failed_runs_count_failures_without_latency_and_runner_failures_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
