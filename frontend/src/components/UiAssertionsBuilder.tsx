@@ -390,6 +390,7 @@ export function UiAssertionsBuilder({ check, value, onChange }: Props) {
       title: "类型",
       dataIndex: "type",
       width: 116,
+      responsive: ["sm"],
       render: (_, assertion) => <Tag>{UI_ASSERTION_LABELS[assertion.type]}</Tag>
     },
     {

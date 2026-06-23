@@ -189,6 +189,7 @@ export function ApiAssertionsBuilder({ bodyMode, check, value, onChange }: Props
     {
       title: "类型",
       width: 108,
+      responsive: ["sm"],
       render: (_, assertion) => <Tag>{API_ASSERTION_LABELS[assertion.type]}</Tag>
     },
     {
@@ -363,25 +364,29 @@ function renderRuleEditor(
 ) {
   if (assertion.type === "status_code") {
     return (
-      <InputNumber
-        min={100}
-        max={599}
-        value={assertion.expected_status}
-        addonBefore="等于"
-        onChange={(expected_status) => updateAssertion(assertion.id, { expected_status: Number(expected_status || 200) })}
-      />
+      <Space className="api-assertion-rule" wrap>
+        <Tag>等于</Tag>
+        <InputNumber
+          min={100}
+          max={599}
+          value={assertion.expected_status}
+          onChange={(expected_status) => updateAssertion(assertion.id, { expected_status: Number(expected_status || 200) })}
+        />
+      </Space>
     );
   }
 
   if (assertion.type === "response_time") {
     return (
-      <InputNumber
-        min={1}
-        value={assertion.max_ms}
-        addonBefore="小于等于"
-        suffix="ms"
-        onChange={(max_ms) => updateAssertion(assertion.id, { max_ms: Number(max_ms || 1) })}
-      />
+      <Space className="api-assertion-rule" wrap>
+        <Tag>小于等于</Tag>
+        <InputNumber
+          min={1}
+          value={assertion.max_ms}
+          suffix="ms"
+          onChange={(max_ms) => updateAssertion(assertion.id, { max_ms: Number(max_ms || 1) })}
+        />
+      </Space>
     );
   }
 

@@ -297,13 +297,20 @@ export function OperationsPage() {
         <Tooltip title="查看执行节点元数据">
           <Button
             icon={<Eye size={16} />}
-            onClick={() => setDrawer({ title: `执行节点 ${runner.runner_id}`, value: runnerDetail(runner) })}
+            onClick={(event) => {
+              event.stopPropagation();
+              openRunnerDetail(runner);
+            }}
             aria-label={`查看执行节点 ${runner.runner_id}`}
           />
         </Tooltip>
       )
     }
   ];
+
+  function openRunnerDetail(runner: ProbeRunner) {
+    setDrawer({ title: `执行节点 ${runner.runner_id}`, value: runnerDetail(runner) });
+  }
 
   if (loading) {
     return (
@@ -334,7 +341,16 @@ export function OperationsPage() {
               runners.length === 0 ? (
                 <Empty description="暂无执行节点心跳" />
               ) : (
-                <Table rowKey="runner_id" columns={runnerColumns} dataSource={runners} pagination={{ pageSize: 12 }} />
+                <Table
+                  rowKey="runner_id"
+                  columns={runnerColumns}
+                  dataSource={runners}
+                  pagination={{ pageSize: 12 }}
+                  rowClassName="operations-runner-row"
+                  onRow={(runner) => ({
+                    onClick: () => openRunnerDetail(runner)
+                  })}
+                />
               )
           },
           {

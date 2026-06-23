@@ -1,4 +1,4 @@
-import { App, Button, Empty, Form, Input, Modal, Popconfirm, Table, Tag, Tooltip } from "antd";
+import { App, Button, Empty, Form, Input, Modal, Popconfirm, Skeleton, Table, Tag, Tooltip } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Edit3, Plus, Trash2, Users } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -24,6 +24,7 @@ export function MembersPage() {
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<Member | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [isCompactList, setIsCompactList] = useState(() => window.matchMedia("(max-width: 720px)").matches);
 
   useEffect(() => {
     api
@@ -37,6 +38,14 @@ export function MembersPage() {
     if (!modalOpen) return;
     form.setFieldsValue(editing || EMPTY_MEMBER);
   }, [editing, form, modalOpen]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 720px)");
+    const sync = () => setIsCompactList(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
 
   const channelCounts = useMemo(
     () => ({
@@ -88,19 +97,66 @@ export function MembersPage() {
     await persist(members.filter((member) => member.id !== memberId), "成员已删除，任务关联已同步清理");
   }
 
+  function renderMemberActions(member: Member, compact = false) {
+    return (
+      <div className={compact ? "member-row-actions member-row-actions-compact" : "member-row-actions"}>
+        <Tooltip title="编辑成员">
+          <Button aria-label={`编辑成员 ${member.name}`} icon={<Edit3 size={15} />} onClick={() => openEdit(member)}>
+            {compact ? "编辑" : undefined}
+          </Button>
+        </Tooltip>
+        <Popconfirm
+          title="删除成员"
+          description="删除后会同步清理所有任务中的成员关联。"
+          okText="删除"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+          onConfirm={() => removeMember(member.id)}
+        >
+          <Tooltip title="删除成员">
+            <Button danger aria-label={`删除成员 ${member.name}`} icon={<Trash2 size={15} />}>
+              {compact ? "删除" : undefined}
+            </Button>
+          </Tooltip>
+        </Popconfirm>
+      </div>
+    );
+  }
+
   const columns: ColumnsType<Member> = [
     {
       title: "成员",
       dataIndex: "name",
-      width: 220,
-      render: (name: string) => <strong>{name}</strong>
+      width: 176,
+      render: (name: string, member) => (
+        <div className="member-name-cell">
+          <strong>{name}</strong>
+          <div className="member-mobile-channels">
+            <ChannelAccount configured={Boolean(member.feishu_open_id)} detail={member.feishu_open_id} label="飞书" />
+            <ChannelAccount
+              configured={Boolean(member.wecom_user_id || member.wecom_mobile)}
+              detail={[member.wecom_user_id, member.wecom_mobile].filter(Boolean).join(" / ")}
+              label="企微"
+            />
+            <ChannelAccount
+              configured={Boolean(member.dingtalk_user_id || member.dingtalk_mobile)}
+              detail={[member.dingtalk_user_id, member.dingtalk_mobile].filter(Boolean).join(" / ")}
+              label="钉钉"
+            />
+          </div>
+        </div>
+      )
     },
     {
       title: "飞书",
+      width: 132,
+      responsive: ["lg"],
       render: (_, member) => <ChannelAccount configured={Boolean(member.feishu_open_id)} detail={member.feishu_open_id} />
     },
     {
       title: "企业微信",
+      width: 148,
+      responsive: ["lg"],
       render: (_, member) => (
         <ChannelAccount
           configured={Boolean(member.wecom_user_id || member.wecom_mobile)}
@@ -110,6 +166,8 @@ export function MembersPage() {
     },
     {
       title: "钉钉",
+      width: 132,
+      responsive: ["lg"],
       render: (_, member) => (
         <ChannelAccount
           configured={Boolean(member.dingtalk_user_id || member.dingtalk_mobile)}
@@ -120,26 +178,8 @@ export function MembersPage() {
     {
       title: "操作",
       align: "right",
-      width: 116,
-      render: (_, member) => (
-        <div className="member-row-actions">
-          <Tooltip title="编辑成员">
-            <Button aria-label={`编辑成员 ${member.name}`} icon={<Edit3 size={15} />} onClick={() => openEdit(member)} />
-          </Tooltip>
-          <Popconfirm
-            title="删除成员"
-            description="删除后会同步清理所有任务中的成员关联。"
-            okText="删除"
-            cancelText="取消"
-            okButtonProps={{ danger: true }}
-            onConfirm={() => removeMember(member.id)}
-          >
-            <Tooltip title="删除成员">
-              <Button danger aria-label={`删除成员 ${member.name}`} icon={<Trash2 size={15} />} />
-            </Tooltip>
-          </Popconfirm>
-        </div>
-      )
+      width: 96,
+      render: (_, member) => renderMemberActions(member)
     }
   ];
 
@@ -158,15 +198,51 @@ export function MembersPage() {
         </Button>
       </section>
 
-      <Table
-        rowKey="id"
-        columns={columns}
-        dataSource={members}
-        loading={loading}
-        pagination={false}
-        locale={{ emptyText: <Empty description="暂无成员" /> }}
-        className="members-table"
-      />
+      {isCompactList ? (
+        <section className="members-compact-list" aria-label="成员列表">
+          {loading ? (
+            <Skeleton active paragraph={{ rows: 6 }} />
+          ) : members.length ? (
+            members.map((member) => (
+              <article className="member-compact-card" key={member.id}>
+                <div className="member-compact-header">
+                  <div className="member-compact-title">
+                    <strong>{member.name}</strong>
+                    <span>通知账号</span>
+                  </div>
+                  {renderMemberActions(member, true)}
+                </div>
+                <div className="member-compact-channels">
+                  <ChannelAccount configured={Boolean(member.feishu_open_id)} detail={member.feishu_open_id} label="飞书" />
+                  <ChannelAccount
+                    configured={Boolean(member.wecom_user_id || member.wecom_mobile)}
+                    detail={[member.wecom_user_id, member.wecom_mobile].filter(Boolean).join(" / ")}
+                    label="企微"
+                  />
+                  <ChannelAccount
+                    configured={Boolean(member.dingtalk_user_id || member.dingtalk_mobile)}
+                    detail={[member.dingtalk_user_id, member.dingtalk_mobile].filter(Boolean).join(" / ")}
+                    label="钉钉"
+                  />
+                </div>
+              </article>
+            ))
+          ) : (
+            <Empty description="暂无成员" />
+          )}
+        </section>
+      ) : (
+        <Table
+          rowKey="id"
+          columns={columns}
+          dataSource={members}
+          loading={loading}
+          pagination={false}
+          locale={{ emptyText: <Empty description="暂无成员" /> }}
+          className="members-table"
+          tableLayout="fixed"
+        />
+      )}
 
       <Modal
         title={editing ? "编辑成员" : "添加成员"}
@@ -216,8 +292,8 @@ export function MembersPage() {
   );
 }
 
-function ChannelAccount({ configured, detail }: { configured: boolean; detail: string }) {
-  const tag = <Tag color={configured ? "success" : "default"}>{configured ? "已配置" : "未配置"}</Tag>;
+function ChannelAccount({ configured, detail, label }: { configured: boolean; detail: string; label?: string }) {
+  const tag = <Tag color={configured ? "success" : "default"}>{label ? `${label} ${configured ? "已配" : "未配"}` : configured ? "已配置" : "未配置"}</Tag>;
   return configured ? <Tooltip title={detail}>{tag}</Tooltip> : tag;
 }
 

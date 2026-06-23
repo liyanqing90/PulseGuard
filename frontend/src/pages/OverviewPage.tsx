@@ -247,12 +247,21 @@ function TrendSeriesRow({ item }: { item: OverviewTrendSeries }) {
   return (
     <div className="trend-series-row">
       <span className="trend-series-label">{checkTypeLabel(item.check_type)}</span>
-      <TrendValue value={`${item.runs} 次`} />
-      <TrendValue value={formatSuccessRate(item.success_rate)} />
-      <TrendValue value={`${item.failure_count} 次`} />
-      <TrendValue value={formatDuration(item.duration_p50_ms)} />
-      <TrendValue value={formatDuration(item.duration_p95_ms)} />
+      <TrendValue label="运行" value={`${item.runs} 次`} />
+      <TrendValue label="成功率" value={formatSuccessRate(item.success_rate)} />
+      <TrendValue label="失败" value={`${item.failure_count} 次`} />
+      <TrendValue label="P50" value={formatDuration(item.duration_p50_ms)} />
+      <TrendValue label="P95" value={formatDuration(item.duration_p95_ms)} />
     </div>
+  );
+}
+
+function TrendValue({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="trend-value">
+      <span className="trend-value-label">{label}</span>
+      <strong>{value}</strong>
+    </span>
   );
 }
 
@@ -263,10 +272,6 @@ function checkTypeLabel(type: CheckType): string {
 function formatSuccessRate(value: number | null | undefined): string {
   if (value == null) return "-";
   return `${value.toLocaleString("zh-CN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`;
-}
-
-function TrendValue({ value }: { value: string }) {
-  return <strong className="trend-value">{value}</strong>;
 }
 
 function OverviewRunIssueSummary({ run }: { run: Run }) {

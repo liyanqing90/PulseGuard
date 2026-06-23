@@ -39,6 +39,9 @@ interface RunGroupSummary {
   running: number;
 }
 
+const detailDescriptionColumns = { xs: 1, sm: 1, md: 2 } as const;
+const fullDescriptionSpan = { xs: 1, sm: 1, md: 2 } as const;
+
 interface Props {
   run: Run | null;
   mode?: RunResultMode;
@@ -191,7 +194,7 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
       {showFailureSummary && <FailureSummaryPanel summary={failureSummary} error={failureSummaryError} loading={failureSummaryLoading} />}
       {uiRequestInfo && <CheckRequestSection check={uiRequestInfo} />}
       <DetailSection title={compactNodeDetail ? "节点信息" : "运行信息"}>
-        <Descriptions bordered column={2} size="small">
+        <Descriptions bordered column={detailDescriptionColumns} size="small">
           <Descriptions.Item label="执行结果">
             <RunnerExecutionTag run={run} />
           </Descriptions.Item>
@@ -397,8 +400,8 @@ function CheckRequestSection({ check }: { check: RunCheckRequestInfo }) {
   const isApi = check.type === "api";
   return (
     <DetailSection title="基础请求信息">
-      <Descriptions bordered column={2} size="small">
-        <Descriptions.Item label={isApi ? "接口 URL" : "页面 URL"} span={2}>
+      <Descriptions bordered column={detailDescriptionColumns} size="small">
+        <Descriptions.Item label={isApi ? "接口 URL" : "页面 URL"} span={fullDescriptionSpan}>
           <code className="run-config-url">{check.entry_url || "-"}</code>
         </Descriptions.Item>
         {isApi && <Descriptions.Item label="Method">{check.method || "GET"}</Descriptions.Item>}
@@ -439,7 +442,7 @@ function RunComparisonPanel({
 
   return (
     <Space orientation="vertical" size={14} className="drawer-stack">
-      <Descriptions bordered column={2} size="small">
+      <Descriptions bordered column={detailDescriptionColumns} size="small">
         <Descriptions.Item label="当前运行">#{comparison.current_run?.id || "-"}</Descriptions.Item>
         <Descriptions.Item label="成功基线">#{comparison.baseline_run?.id || "-"}</Descriptions.Item>
         <Descriptions.Item label="当前时间">{formatDate(comparison.current_run?.finished_at || comparison.current_run?.started_at)}</Descriptions.Item>
@@ -810,7 +813,7 @@ function AssertionResultsPanel({ results }: { results: AssertionResult[] }) {
 
   return (
     <Table
-      rowKey={(_, index) => String(index)}
+      rowKey={(record) => String(results.indexOf(record))}
       size="small"
       pagination={false}
       columns={columns}

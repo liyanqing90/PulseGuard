@@ -18,10 +18,10 @@ data/*.db
 data/*.db-*
 data/*.db.backup-*
 data/backups/*
+data/*.key
 reports/screenshots/*
 reports/traces/*
 reports/responses/*
-!.gitkeep
 .env
 *.log
 npm-debug.log*
