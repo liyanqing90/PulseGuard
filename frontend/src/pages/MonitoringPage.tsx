@@ -8,6 +8,7 @@ import {
   Drawer,
   Empty,
   Input,
+  Modal,
   Pagination,
   Popover,
   Segmented,
@@ -19,7 +20,7 @@ import {
   Typography
 } from "antd";
 import dayjs, { type Dayjs } from "dayjs";
-import { Activity, Maximize2, RefreshCw, RotateCcw, SlidersHorizontal } from "lucide-react";
+import { Activity, Calendar, Maximize2, RefreshCw, RotateCcw, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
@@ -101,6 +102,39 @@ function dimensionToQuery(dim: Dimension): TrendQuery {
   };
 }
 
+function isCompleteDateRange(value: DateRange): value is [Dayjs, Dayjs] {
+  if (!value?.[0] || !value?.[1]) return false;
+  return !value[0].isAfter(value[1], "day");
+}
+
+function isTrendDimensionReady(dim: Dimension): boolean {
+  return dim.period !== "custom" || Boolean(dim.start && dim.end);
+}
+
+function dimensionDateRange(dim: Dimension): DateRange {
+  if (dim.period !== "custom") return null;
+  return [dim.start ? dayjs(dim.start) : null, dim.end ? dayjs(dim.end) : null];
+}
+
+function normalizeDateRange(value: DateRange): DateRange {
+  return value ? [value[0] ?? null, value[1] ?? null] : null;
+}
+
+function customRangeButtonLabel(dim: Dimension): string {
+  if (dim.period === "custom" && dim.start && dim.end) {
+    return `${dayjs(dim.start).format("MM-DD")} - ${dayjs(dim.end).format("MM-DD")}`;
+  }
+  return "选择时间范围";
+}
+
+function dateRangeToDimensionRange(value: DateRange): Pick<Dimension, "start" | "end"> | null {
+  if (!isCompleteDateRange(value)) return null;
+  return {
+    start: value[0].startOf("day").toISOString(),
+    end: value[1].endOf("day").toISOString()
+  };
+}
+
 function defaultDimension(): Dimension {
   return { period: "24h" };
 }
@@ -157,10 +191,15 @@ function parseHourParam(value: string | null): string | undefined {
   return /^\d{2}:\d{2}$/.test(value) ? value : undefined;
 }
 
+function parseDateParam(value: string | null): string | undefined {
+  if (!value) return undefined;
+  return dayjs(value).isValid() ? value : undefined;
+}
+
 function dimensionFromParams(params: URLSearchParams): Dimension {
   const period = parsePeriodParam(params.get("period"));
-  const start = params.get("start") || undefined;
-  const end = params.get("end") || undefined;
+  const start = parseDateParam(params.get("start"));
+  const end = parseDateParam(params.get("end"));
   return {
     period,
     start: period === "custom" ? start : undefined,
@@ -201,7 +240,22 @@ export function MonitoringPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<MonitoringTrendTask | null>(null);
   const [overrides, setOverrides] = useState<Record<number, Dimension>>({});
+  const [customRangeOpen, setCustomRangeOpen] = useState(() => {
+    const initialDimension = dimensionFromParams(searchParams);
+    return initialDimension.period === "custom" && !isTrendDimensionReady(initialDimension);
+  });
+  const [customRangeDraft, setCustomRangeDraft] = useState<DateRange>(() => {
+    const initialDimension = dimensionFromParams(searchParams);
+    return dimensionDateRange(initialDimension);
+  });
   const didMountFilterReset = useRef(false);
+
+  useEffect(() => {
+    if (!isTrendDimensionReady(globalDimension)) {
+      setCustomRangeDraft(dimensionDateRange(globalDimension));
+      setCustomRangeOpen(true);
+    }
+  }, [globalDimension]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => setDebouncedQ(q.trim()), 280);
@@ -236,6 +290,12 @@ export function MonitoringPage() {
 
   const loadList = useCallback(
     (signal: AbortSignal) => {
+      if (!isTrendDimensionReady(globalDimension)) {
+        setData(null);
+        setError(null);
+        setLoading(false);
+        return Promise.resolve();
+      }
       setLoading(true);
       const query = dimensionToQuery(globalDimension);
       return api
@@ -281,6 +341,29 @@ export function MonitoringPage() {
     setGlobalDimension(next);
   }
 
+  function openCustomRangeDialog() {
+    setCustomRangeDraft(dimensionDateRange({ ...globalDimension, period: "custom" }));
+    setCustomRangeOpen(true);
+  }
+
+  function confirmCustomRange() {
+    const range = dateRangeToDimensionRange(customRangeDraft);
+    if (!range) return;
+    handleGlobalDimensionChange({
+      ...globalDimension,
+      period: "custom",
+      ...range
+    });
+    setCustomRangeOpen(false);
+  }
+
+  function cancelCustomRange() {
+    setCustomRangeOpen(false);
+    if (!isTrendDimensionReady(globalDimension)) {
+      handleGlobalDimensionChange(defaultDimension());
+    }
+  }
+
   function handleOverrideChange(checkId: number, next: Dimension | null) {
     setOverrides((prev) => {
       const draft = { ...prev };
@@ -305,6 +388,7 @@ export function MonitoringPage() {
   }, null);
   const activeWindow = dimensionSummary(globalDimension);
   const lastUpdated = data?.end ? dayjs(data.end).format("MM-DD HH:mm") : "-";
+  const waitingForCustomRange = !isTrendDimensionReady(globalDimension);
 
   return (
     <div className="page-content monitoring-page">
@@ -314,7 +398,11 @@ export function MonitoringPage() {
             趋势概览
           </Title>
           <Text type="secondary" aria-live="polite">
-            {data ? `本地 / LAN，最后更新 ${lastUpdated}，${activeWindow}` : "正在加载趋势数据..."}
+            {waitingForCustomRange
+              ? "请选择自定义时间范围后查看趋势数据"
+              : data
+                ? `本地 / LAN，最后更新 ${lastUpdated}，${activeWindow}`
+                : "正在加载趋势数据..."}
           </Text>
         </div>
         <Space className="monitoring-header-actions" size={8}>
@@ -354,11 +442,35 @@ export function MonitoringPage() {
       <GlobalFilterBar
         dimension={globalDimension}
         onDimensionChange={handleGlobalDimensionChange}
+        onCustomPeriodRequest={openCustomRangeDialog}
         type={type}
         onTypeChange={setType}
         q={q}
         onQueryChange={setQ}
       />
+
+      <Modal
+        title="选择自定义时间范围"
+        open={customRangeOpen}
+        onOk={confirmCustomRange}
+        onCancel={cancelCustomRange}
+        okText="确定"
+        cancelText="取消"
+        destroyOnHidden
+        width={624}
+        className="monitoring-custom-range-modal"
+        okButtonProps={{ disabled: !isCompleteDateRange(customRangeDraft) }}
+      >
+        <RangePicker
+          value={customRangeDraft}
+          allowClear
+          onCalendarChange={(next) => setCustomRangeDraft(normalizeDateRange(next as DateRange))}
+          onChange={(next) => setCustomRangeDraft(normalizeDateRange(next as DateRange))}
+          className="monitoring-custom-range-picker"
+          popupClassName="monitoring-custom-range-dropdown"
+          style={{ width: "100%" }}
+        />
+      </Modal>
 
       <section className="monitoring-summary-grid">
         {loading && !data ? (
@@ -427,6 +539,7 @@ export function MonitoringPage() {
 function GlobalFilterBar({
   dimension,
   onDimensionChange,
+  onCustomPeriodRequest,
   type,
   onTypeChange,
   q,
@@ -434,16 +547,12 @@ function GlobalFilterBar({
 }: {
   dimension: Dimension;
   onDimensionChange: (next: Dimension) => void;
+  onCustomPeriodRequest: () => void;
   type: CheckType | "";
   onTypeChange: (next: CheckType | "") => void;
   q: string;
   onQueryChange: (next: string) => void;
 }) {
-  const dateRange: DateRange = useMemo(() => {
-    if (dimension.period !== "custom") return null;
-    return [dimension.start ? dayjs(dimension.start) : null, dimension.end ? dayjs(dimension.end) : null];
-  }, [dimension.end, dimension.period, dimension.start]);
-
   const hourRange: HourRange = useMemo(() => {
     if (!dimension.hourStart || !dimension.hourEnd) return null;
     return [dayjs(dimension.hourStart, "HH:mm"), dayjs(dimension.hourEnd, "HH:mm")];
@@ -460,6 +569,10 @@ function GlobalFilterBar({
             value={dimension.period}
             onChange={(value) => {
               const period = value as TrendPeriod;
+              if (period === "custom" && !dimension.start && !dimension.end) {
+                onCustomPeriodRequest();
+                return;
+              }
               const next: Dimension = { ...dimension, period };
               if (period !== "custom") {
                 next.start = undefined;
@@ -471,23 +584,16 @@ function GlobalFilterBar({
           />
         </div>
         {dimension.period === "custom" && (
-          <DatePicker.RangePicker
-            value={dateRange}
-            showTime={{ format: "HH:mm" }}
-            allowClear
-            onChange={(value) => {
-              if (!value) {
-                onDimensionChange({ ...dimension, start: undefined, end: undefined });
-                return;
-              }
-              onDimensionChange({
-                ...dimension,
-                start: value[0]?.toISOString(),
-                end: value[1]?.toISOString()
-              });
-            }}
-            className="monitoring-filter-range"
-          />
+          <div className="monitoring-filter-block monitoring-date-filter-block">
+            <span className="monitoring-filter-label">时间</span>
+            <Button
+              className="monitoring-filter-range"
+              icon={<Calendar size={14} aria-hidden="true" />}
+              onClick={onCustomPeriodRequest}
+            >
+              {customRangeButtonLabel(dimension)}
+            </Button>
+          </div>
         )}
         <div className="monitoring-filter-block">
           <span className="monitoring-filter-label">类型</span>
@@ -600,6 +706,13 @@ function TaskTrendRow({
     if (!override) {
       setDimensionData(null);
       setLoadError(null);
+      lastQueryRef.current = "";
+      return;
+    }
+    if (!isTrendDimensionReady(override)) {
+      setDimensionData(null);
+      setLoadError(null);
+      setLoading(false);
       lastQueryRef.current = "";
       return;
     }
@@ -776,17 +889,16 @@ function DimensionEditor({
           <span className="monitoring-filter-label">自定义时间段</span>
           <RangePicker
             value={dateRange}
-            showTime={{ format: "HH:mm" }}
             allowClear
             onChange={(next) => {
-              if (!next) {
+              const range = dateRangeToDimensionRange(normalizeDateRange(next as DateRange));
+              if (!range) {
                 onChange({ ...value, start: undefined, end: undefined });
                 return;
               }
               onChange({
                 ...value,
-                start: next[0]?.toISOString(),
-                end: next[1]?.toISOString()
+                ...range
               });
             }}
             style={{ width: "100%" }}
@@ -860,6 +972,12 @@ function TaskTrendDrawer({
   useEffect(() => {
     if (!task) {
       setTrend(null);
+      return;
+    }
+    if (!isTrendDimensionReady(dimension)) {
+      setTrend(null);
+      setError(null);
+      setLoading(false);
       return;
     }
     const controller = new AbortController();
