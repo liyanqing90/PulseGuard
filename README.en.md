@@ -113,7 +113,7 @@ UI tasks support the Playwright browser types `chromium`, `firefox`, and `webkit
 
 Each prewarmed browser type keeps one Playwright browser process alive and pre-creates empty `BrowserContext` instances according to that type's pool size. Each UI task leases one exclusive context/page. When the task ends, only that context is closed; the browser process stays alive and the pool refills an empty context. Web and H5 sizing are separated by context options, so different viewport tasks can run concurrently under the same browser process.
 
-`browser_type` only applies to UI tasks. Execution resolves target nodes first, then browser types inside each node. Node multi-select plus browser type multi-select creates a node x browser-type execution matrix. A browser type runs only when it is enabled in settings and installed on the selected node; missing or disabled combinations are recorded as runner-side failures. When new browser types are enabled, the main node asks the local process and available child nodes to install the matching Playwright browsers. Child nodes report installed and available browser types in their health response.
+`browser_type` only applies to UI tasks. Execution resolves target nodes first, then browser types inside each node. Node multi-select plus browser type multi-select creates a node x browser-type execution matrix. A browser type runs only when it is enabled in settings and installed on the selected node; missing or disabled combinations are recorded as runner-side failures. When new browser types are enabled, the main node asks the local process and available child nodes to install the matching Playwright browsers. For each formal worker run, the main node also sends `enabled_browser_types`, `prewarmed_browser_types`, and `browser_pool_sizes`; child nodes reload their resource pools and prewarm browsers from the same execution settings.
 
 ## Remote Runners
 
@@ -131,11 +131,16 @@ docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
 
 The default public relay port is `9443`. In Settings > Execution > Add child runner, choose “Generate deployment command” and enter a worker-reachable `docker-compose.relay-worker.yml` URL to create a one-time worker deployment command for Linux shell or PowerShell. Relay worker deployments use that compose file; the worker exposes `8788` only inside the compose network.
 
+Relay stream concurrency follows the system “max concurrent tasks” setting by default. `PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS` is only the fallback while settings or the database are unavailable. Extra streams are rejected so the main-node queue remains responsible for task ordering and backpressure.
+
 Relay runner states:
 
 - `pending_deployment`, `expired`, and `connecting` are not scheduled by “round-robin all enabled runners” and do not trigger runner-unavailable alerts.
 - A relay runner becomes schedulable only after the relay session is connected and `/api/worker/health` succeeds through the internal relay port.
 - Regenerating the deployment command keeps the runner ID and internal port, rotates the relay token, and invalidates old commands.
+- Runner-side failures are kept as `status=skipped`, `failure_kind=runner`, and `affects_health=false` run records. They remain visible without counting as target failures.
+
+Scheduled distributed runs enter the main-node queue first. The scheduler keeps a 30-second misfire grace window so short queue delays do not silently drop run records.
 
 ## Verification
 
@@ -157,6 +162,12 @@ Docker:
 ```powershell
 uv lock --check
 .\scripts\deploy.ps1
+```
+
+China-network deployment notes live in [docs/china-deployment.md](./docs/china-deployment.md). Volcano main-node and local relay-worker notes live in [docs/volcano-deployment.md](./docs/volcano-deployment.md). To sync local main-node data to Volcano:
+
+```powershell
+.\scripts\sync-volcano-main.ps1 -RemoteEnvPath "D:\project\PulseGuard\remote.env" -DeploymentMode auto
 ```
 
 ## Script Task Entry Points

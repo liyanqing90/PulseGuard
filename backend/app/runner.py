@@ -47,6 +47,7 @@ class RunJob:
     runner_metadata: dict[str, Any] | None = None
     started: bool = False
     manage_active: bool = True
+    manage_capacity: bool = True
 
 
 @dataclass(frozen=True)
@@ -241,6 +242,11 @@ class CheckRunner:
         run_id: int,
         settings: dict[str, Any],
     ) -> dict[str, Any]:
+        await self.resources.reload(
+            settings,
+            api_pool_size=self._api_pool_size(settings),
+            browser_pool_sizes_value=self._browser_pool_sizes(settings),
+        )
         if self._uses_browser(check):
             async with self._ui_limiter.slot():
                 async with self._global_limiter.slot():
@@ -377,6 +383,7 @@ class CheckRunner:
         notify: bool = True,
         runner_metadata: dict[str, Any] | None = None,
         manage_active: bool = True,
+        manage_capacity: bool = True,
     ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         check_id = int(check.get("id") or 0)
@@ -386,7 +393,7 @@ class CheckRunner:
                 return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger, record_status=record_status)
             if manage_active and check_id > 0 and check_id in self._active_checks:
                 return self._create_skipped_run(check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger, record_status=record_status)
-            if self._queued_jobs >= self._queue_limit:
+            if manage_capacity and self._queued_jobs >= self._queue_limit:
                 return self._create_skipped_run(check, "执行队列已满，本次已跳过", trigger, record_status=record_status)
 
             settings = storage.get_settings()
@@ -413,8 +420,10 @@ class CheckRunner:
                 future=loop.create_future(),
                 runner_metadata=runner_payload,
                 manage_active=manage_active,
+                manage_capacity=manage_capacity,
             )
-            self._queued_jobs += 1
+            if manage_capacity:
+                self._queued_jobs += 1
             if manage_active and check_id > 0:
                 self._active_checks.add(check_id)
             task = loop.create_task(self._run_job(job))
@@ -426,7 +435,10 @@ class CheckRunner:
     async def _run_job(self, job: RunJob) -> None:
         result: dict[str, Any] | None = None
         try:
-            if self._uses_browser(job.check):
+            if not job.manage_capacity:
+                storage.start_run(job.run_id)
+                result = await self._execute(job.check, job.trigger, job.run_id, job.record_status, job.notify, job.runner_metadata)
+            elif self._uses_browser(job.check):
                 async with self._ui_limiter.slot():
                     async with self._global_limiter.slot():
                         result = await self._start_and_execute(job)
@@ -451,10 +463,11 @@ class CheckRunner:
     async def _complete_job(self, job: RunJob, result: dict[str, Any] | None) -> None:
         check_id = int(job.check.get("id") or 0)
         async with self._lock:
-            if job.started:
-                self._running_jobs = max(0, self._running_jobs - 1)
-            else:
-                self._queued_jobs = max(0, self._queued_jobs - 1)
+            if job.manage_capacity:
+                if job.started:
+                    self._running_jobs = max(0, self._running_jobs - 1)
+                else:
+                    self._queued_jobs = max(0, self._queued_jobs - 1)
             if job.manage_active and check_id > 0:
                 self._active_checks.discard(check_id)
         if result is None:
@@ -910,38 +923,72 @@ class CheckRunner:
     async def _run_distributed_check(self, check: dict[str, Any], targets: list[BrowserRunTarget], trigger: str) -> dict[str, Any]:
         check_id = int(check.get("id") or 0)
         run_group_id = f"rg_{uuid.uuid4().hex}"
+        queued = False
+        running = False
+
+        async def run_started_group() -> dict[str, Any]:
+            nonlocal queued, running
+            async with self._lock:
+                if queued:
+                    self._queued_jobs = max(0, self._queued_jobs - 1)
+                    queued = False
+                self._running_jobs += 1
+                running = True
+            jobs = [self._dispatch_runner(check, target, trigger, run_group_id, capacity_managed=True) for target in targets]
+            runs = await asyncio.gather(*jobs)
+            return await self._finish_distributed_group(check, runs, trigger)
+
         async with self._lock:
             self._jobs = {job for job in self._jobs if not job.done()}
             if self._closing:
                 return self._create_skipped_run(check, "执行器正在关闭，本次已跳过", trigger)
             if check_id > 0 and check_id in self._active_checks:
                 return self._create_skipped_run(check, "同一任务上一次执行尚未结束或仍在排队，本次已跳过", trigger)
+            if self._queued_jobs >= self._queue_limit:
+                return self._create_skipped_run(check, "执行队列已满，本次已跳过", trigger)
+            self._queued_jobs += 1
+            queued = True
             if check_id > 0:
                 self._active_checks.add(check_id)
         try:
-            jobs = [self._dispatch_runner(check, target, trigger, run_group_id) for target in targets]
-            runs = await asyncio.gather(*jobs)
-            return await self._finish_distributed_group(check, runs, trigger)
+            if self._uses_browser(check):
+                async with self._ui_limiter.slot():
+                    async with self._global_limiter.slot():
+                        return await run_started_group()
+            async with self._global_limiter.slot():
+                return await run_started_group()
         finally:
             async with self._lock:
+                if queued:
+                    self._queued_jobs = max(0, self._queued_jobs - 1)
+                if running:
+                    self._running_jobs = max(0, self._running_jobs - 1)
                 if check_id > 0:
                     self._active_checks.discard(check_id)
 
-    async def _dispatch_runner(self, check: dict[str, Any], target: BrowserRunTarget, trigger: str, run_group_id: str) -> dict[str, Any]:
+    async def _dispatch_runner(
+        self,
+        check: dict[str, Any],
+        target: BrowserRunTarget,
+        trigger: str,
+        run_group_id: str,
+        capacity_managed: bool = False,
+    ) -> dict[str, Any]:
         runner = target.runner
         runner_id = str(runner.get("runner_id") or storage.LOCAL_RUNNER_ID)
         check_payload = self._with_browser_type({**check, "_run_group_id": run_group_id}, target.browser_type)
         runner_payload = storage.runner_metadata(runner, browser_type=target.browser_type)
         metadata = {**run_metadata(trigger), "run_group_id": run_group_id}
+        runner_system_metadata = {**metadata, "affects_health": False}
         if target.skip_reason:
             run = storage.create_run(
-                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=metadata),
+                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
             )
             return self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
         if not runner.get("available"):
             run = storage.create_run(
-                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=metadata),
+                self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
             )
             unavailable = self._finish_runner_unavailable(int(run["id"]), check, trigger, runner, "执行节点不可用")
@@ -955,6 +1002,7 @@ class CheckRunner:
                 notify=False,
                 runner_metadata=runner_payload,
                 manage_active=False,
+                manage_capacity=not capacity_managed,
             )
         run = storage.create_run(
             self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=metadata),
@@ -1087,9 +1135,11 @@ class CheckRunner:
             "request_snapshot": None,
             "response_snapshot": None,
             **storage.runner_metadata(runner, failure_kind="runner", browser_type=str(check.get("_browser_type") or "")),
+            "affects_health": False,
         }
-        storage.discard_incomplete_run(run_id)
-        return self._ephemeral_runner_result(check, trigger, run_id, payload)
+        finished = storage.finish_run(run_id, payload)
+        storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
+        return storage.get_run(run_id) or finished or self._ephemeral_runner_result(check, trigger, run_id, payload)
 
     async def _finish_distributed_group(self, check: dict[str, Any], runs: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
         if not runs:
@@ -1146,9 +1196,13 @@ class CheckRunner:
             "max_task_runtime_seconds",
             "browser_headless",
             "browser_type",
+            "enabled_browser_types",
+            "prewarmed_browser_types",
+            "browser_pool_sizes",
             "browser_proxy",
             "browser_viewport",
             "success_response_artifacts_enabled",
+            "api_pool_size",
             "api_retry_attempts",
             "ui_retry_attempts",
             "environment_variables",

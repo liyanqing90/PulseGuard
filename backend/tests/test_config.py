@@ -98,6 +98,19 @@ print(json.dumps({
         self.assertEqual(payload["port_quarantine"], 960)
         self.assertGreater(payload["port_quarantine"], payload["stream_idle"])
 
+    def test_relay_concurrent_streams_fallback_matches_default_execution_concurrency(self) -> None:
+        script = """
+import json
+import os
+os.environ.pop("PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS", None)
+from backend.app import config
+print(json.dumps({"relay_streams": config.RELAY_MAX_CONCURRENT_STREAMS}))
+"""
+        output = subprocess.check_output([sys.executable, "-c", script], text=True)
+        payload = json.loads(output)
+
+        self.assertEqual(payload["relay_streams"], 2)
+
     def test_relay_port_quarantine_env_can_extend_default(self) -> None:
         script = """
 import json

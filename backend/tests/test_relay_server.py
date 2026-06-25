@@ -606,7 +606,10 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
             server=FakeServer(),  # type: ignore[arg-type]
         )
 
-        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.get_settings",
+            return_value={"max_concurrency": 1},
+        ):
             with self.assertRaisesRegex(ValueError, "not valid base64"):
                 await relay_server._handle_data_message(
                     session,
@@ -622,7 +625,10 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
             server=FakeServer(),  # type: ignore[arg-type]
         )
 
-        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.get_settings",
+            return_value={"max_concurrency": 1},
+        ):
             with self.assertRaisesRegex(ValueError, "missing stream_id"):
                 await relay_server._handle_data_message(
                     session,
@@ -705,33 +711,24 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
             websocket=websocket,  # type: ignore[arg-type]
             server=FakeServer(),  # type: ignore[arg-type]
         )
-        first_reader = BlockingReader()
-        first_writer = FakeWriter()
+        session.streams["existing"] = relay_server.TunnelStream(  # type: ignore[arg-type]
+            reader=BlockingReader(),
+            writer=FakeWriter(),
+        )
         second_writer = FakeWriter()
 
-        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
-            first = asyncio.create_task(
-                relay_server._tcp_client_connected(  # type: ignore[arg-type]
-                    session,
-                    first_reader,
-                    first_writer,
-                )
-            )
-            for _ in range(50):
-                if session.streams:
-                    break
-                await asyncio.sleep(0.01)
-
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.get_settings",
+            return_value={"max_concurrency": 1},
+        ):
             await relay_server._tcp_client_connected(  # type: ignore[arg-type]
                 session,
                 EmptyReader(),
                 second_writer,
             )
-            first_reader.done.set()
-            await first
 
         self.assertTrue(second_writer.closed)
-        self.assertEqual(sum('"type":"open"' in message for message in websocket.messages), 1)
+        self.assertEqual(sum('"type":"open"' in message for message in websocket.messages), 0)
 
     async def test_tcp_client_connection_rejects_extra_stream_close_failure(self) -> None:
         session = relay_server.RelaySession(
@@ -747,7 +744,10 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         rejected_writer = FailingCloseWriter()
 
-        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}):
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.get_settings",
+            return_value={"max_concurrency": 1},
+        ):
             await relay_server._tcp_client_connected(  # type: ignore[arg-type]
                 session,
                 EmptyReader(),
@@ -756,3 +756,36 @@ class RelayServerStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(rejected_writer.closed)
         self.assertIn("existing", session.streams)
+
+    async def test_tcp_client_connection_limit_uses_execution_concurrency_setting(self) -> None:
+        websocket = FakeWebSocket()
+        session = relay_server.RelaySession(
+            runner_id="edge-1",
+            token="relay-token",
+            token_version=1,
+            websocket=websocket,  # type: ignore[arg-type]
+            server=FakeServer(),  # type: ignore[arg-type]
+        )
+        first_reader = BlockingReader()
+        second_reader = BlockingReader()
+        first_writer = FakeWriter()
+        second_writer = FakeWriter()
+
+        with patch("backend.app.relay_server.storage.verify_probe_runner_relay_token", return_value={"ok": True}), patch(
+            "backend.app.relay_server.storage.get_settings",
+            return_value={"max_concurrency": 2},
+        ):
+            first = asyncio.create_task(relay_server._tcp_client_connected(session, first_reader, first_writer))  # type: ignore[arg-type]
+            second = asyncio.create_task(relay_server._tcp_client_connected(session, second_reader, second_writer))  # type: ignore[arg-type]
+            for _ in range(50):
+                if len(session.streams) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(session.streams), 2)
+            first_reader.done.set()
+            second_reader.done.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(sum('"type":"open"' in message for message in websocket.messages), 2)
+        self.assertTrue(first_writer.closed)
+        self.assertTrue(second_writer.closed)

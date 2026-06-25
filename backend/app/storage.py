@@ -956,6 +956,8 @@ def start_run(run_id: int) -> dict[str, Any] | None:
 
 
 def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
+    affects_health = data.get("affects_health")
+    affects_health_value = None if affects_health is None else (1 if affects_health else 0)
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
@@ -964,7 +966,8 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 error_stack = ?, logs = ?, screenshot_path = ?, trace_path = ?,
                 response_path = ?, request_snapshot = ?, response_snapshot = ?,
                 runner_id = ?, runner_name = ?, runner_address = ?, runner_region = ?,
-                runner_browser_version = ?, browser_type = CASE WHEN check_type = 'ui' THEN ? ELSE '' END, failure_kind = ?
+                runner_browser_version = ?, browser_type = CASE WHEN check_type = 'ui' THEN ? ELSE '' END,
+                failure_kind = ?, affects_health = COALESCE(?, affects_health)
             WHERE id = ?
             """,
             (
@@ -986,6 +989,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("runner_browser_version"),
                 data.get("browser_type"),
                 data.get("failure_kind"),
+                affects_health_value,
                 run_id,
             ),
         )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,12 @@ _install_status: dict[str, dict[str, Any]] = {}
 
 
 def installed_browser_types() -> list[str]:
+    if _has_running_event_loop():
+        return _installed_browser_types_subprocess()
+    return _installed_browser_types_direct()
+
+
+def _installed_browser_types_direct() -> list[str]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -30,6 +38,43 @@ def installed_browser_types() -> list[str]:
     except Exception:
         return []
     return installed
+
+
+def _installed_browser_types_subprocess() -> list[str]:
+    script = """
+import json
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+installed = []
+with sync_playwright() as playwright:
+    for browser_type in ("chromium", "firefox", "webkit"):
+        candidate = getattr(playwright, browser_type, None)
+        executable_path = getattr(candidate, "executable_path", "") if candidate is not None else ""
+        if executable_path and Path(str(executable_path)).exists():
+            installed.append(browser_type)
+print(json.dumps(installed))
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        parsed = json.loads(result.stdout or "[]")
+    except Exception:
+        return []
+    return normalize_browser_types(parsed, default=[], allow_empty=True) if isinstance(parsed, list) else []
+
+
+def _has_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def browser_capabilities(settings: dict[str, Any] | None = None) -> dict[str, Any]:

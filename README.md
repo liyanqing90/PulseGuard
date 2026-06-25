@@ -115,7 +115,7 @@ UI 任务支持 `chromium`、`firefox`、`webkit` 三类 Playwright browser type
 
 每个预热的 browser type 会保留 1 个 Playwright browser 进程，并按该 type 的 pool size 预创建空 `BrowserContext`。UI 任务会独占租用 1 个 context/page；任务结束只关闭 context，不关闭 browser，资源池随后补齐空 context。Web 与 H5 尺寸通过 context options 区分，同一个 browser 进程下可以并发运行不同 viewport 的任务。
 
-`browser_type` 只对 UI 任务生效。任务执行时先解析执行节点，再在每个节点内解析 browser type；节点多选和 browser type 多选会按节点 × browser type 矩阵创建运行记录。只有“已启用且该节点已安装”的 browser type 会实际执行，缺失或未启用的组合会记录为 Runner 异常。启用新的 browser type 后，主节点会请求本机和可用子节点安装对应 Playwright browser，子节点也会在健康检查中上报当前已安装和可用的 browser type。
+`browser_type` 只对 UI 任务生效。任务执行时先解析执行节点，再在每个节点内解析 browser type；节点多选和 browser type 多选会按节点 × browser type 矩阵创建运行记录。只有“已启用且该节点已安装”的 browser type 会实际执行，缺失或未启用的组合会记录为 Runner 异常。启用新的 browser type 后，主节点会请求本机和可用子节点安装对应 Playwright browser；正式执行时，主节点也会把 `enabled_browser_types`、`prewarmed_browser_types` 和 `browser_pool_sizes` 下发给子节点，子节点按同一套配置刷新资源池并预热浏览器。
 
 ## 多运行节点
 
@@ -150,7 +150,7 @@ Relay 控制面默认使用 Docker 内部地址 `http://pulseguard-relay-interna
 
 Docker relay overlay 会额外创建 internal-only 网络。主节点默认通过 `pulseguard-relay-internal` 访问 relay 内部端口，relay server 也默认只把 per-runner 内部 listener 绑定到这个 internal alias；如需改动，成对设置 `PULSEGUARD_RELAY_INTERNAL_HOST` 和 `PULSEGUARD_RELAY_INTERNAL_LISTEN_HOST`。
 
-Relay v1 默认每个 worker session 只转发 1 条并发内部 TCP stream，避免在完整 backpressure 协议前放开无界多路复用。可用 `PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS` 调整；空闲 stream 默认 900 秒关闭，可用 `PULSEGUARD_RELAY_STREAM_IDLE_TIMEOUT_SECONDS` 调整。已删除 runner 的内部端口默认至少 quarantine 到 `stream idle timeout + 60s`，并且不少于 10 分钟；可用 `PULSEGUARD_RELAY_PORT_QUARANTINE_SECONDS` 延长。
+Relay 每个 worker session 的并发内部 TCP stream 上限默认跟随系统设置里的“最大并发任务数”；数据库或设置暂不可读时，才回退到 `PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS`。超出上限的 stream 会被拒绝，让主节点任务队列继续承担排队和限流。空闲 stream 默认 900 秒关闭，可用 `PULSEGUARD_RELAY_STREAM_IDLE_TIMEOUT_SECONDS` 调整。已删除 runner 的内部端口默认至少 quarantine 到 `stream idle timeout + 60s`，并且不少于 10 分钟；可用 `PULSEGUARD_RELAY_PORT_QUARANTINE_SECONDS` 延长。
 
 同一个 runner ID 只保留一个活跃 relay session；新 session 认证成功后会替换旧 session，避免 worker 重启后被旧连接卡住。
 
@@ -181,8 +181,14 @@ Relay 自动模式状态：
 
 - 多选并行时，同一次触发会为每个节点创建运行记录，并写入同一个 `run_group_id`；如果 UI 任务同时选择多个 browser type，会按节点和 browser type 的矩阵创建记录。
 - 运行详情和运行抽屉会在“多节点执行结果”中展示同组所有节点、browser type、节点执行状态、运行状态、失败来源、耗时、错误摘要和证据文件入口；点击下方节点详情 Tab 可在当前详情内切换不同节点和 browser type 的完整结果。
-- 多节点聚合只更新一次任务健康状态：任一可用节点出现目标失败/超时，本轮任务失败；全部可用节点成功才算成功；节点不可用只记录 `failure_kind=runner`，不计入目标失败。
+- 多节点聚合只更新一次任务健康状态：任一可用节点出现目标失败/超时，本轮任务失败；全部可用节点成功才算成功；节点不可用会保留一条 `status=skipped`、`failure_kind=runner`、`affects_health=false` 的运行记录，不计入目标失败。
 - 运行记录页可按执行节点筛选；需要按一次触发查看全量节点结果时，可用 `run_group_id` 查询同组运行记录。
+
+调度说明：
+
+- 定时任务仍按任务维度进入主节点队列，主节点负责最大并发、UI 并发和队列上限；relay 不再替主节点排队，只按当前最大并发拒绝多余 stream。
+- 同一分钟内多个任务会按每个任务自己的 round-robin 游标选择节点，单分钟可能出现 4:2 或 2:4，完整轮次和每个任务累计应保持 1:1。
+- 调度器保留 30 秒 misfire 宽限，避免短暂排队或服务抖动直接丢掉本轮运行记录。
 
 下面的子节点启动命令都在子节点服务器执行，不在主节点执行。主节点只负责在页面里手动添加该子节点的地址和 token。
 
@@ -336,6 +342,12 @@ Docker：
 ```powershell
 uv lock --check
 .\scripts\deploy.ps1
+```
+
+中国网络环境部署方法见 [docs/china-deployment.md](./docs/china-deployment.md)；火山主节点和本地子节点接入见 [docs/volcano-deployment.md](./docs/volcano-deployment.md)。从本地主节点迁移数据到火山时使用：
+
+```powershell
+.\scripts\sync-volcano-main.ps1 -RemoteEnvPath "D:\project\PulseGuard\remote.env" -DeploymentMode auto
 ```
 
 ## 脚本任务入口

@@ -179,7 +179,7 @@ async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamRea
         await _close_websocket_best_effort(session.websocket, code=4403, reason="relay token rotated")
         return
     async with session.stream_lock:
-        if len(session.streams) >= RELAY_MAX_CONCURRENT_STREAMS:
+        if len(session.streams) >= _max_concurrent_streams():
             await _close_writer_best_effort(writer)
             return
         stream_id = uuid.uuid4().hex
@@ -203,6 +203,14 @@ async def _tcp_client_connected(session: RelaySession, reader: asyncio.StreamRea
             pass
     finally:
         await _close_stream_best_effort(session, stream_id)
+
+
+def _max_concurrent_streams() -> int:
+    try:
+        settings = storage.get_settings()
+        return max(1, int(settings.get("max_concurrency") or RELAY_MAX_CONCURRENT_STREAMS))
+    except Exception:
+        return RELAY_MAX_CONCURRENT_STREAMS
 
 
 async def _start_internal_server(handler: Any, port: int) -> asyncio.AbstractServer:

@@ -648,6 +648,56 @@ class RunnerQueueTests(unittest.TestCase):
 
 
 class DistributedRunnerTests(unittest.TestCase):
+    def test_worker_settings_include_browser_prewarm_configuration(self) -> None:
+        settings = {
+            "max_task_runtime_seconds": 60,
+            "browser_headless": True,
+            "browser_type": "chromium",
+            "enabled_browser_types": ["chromium", "firefox"],
+            "prewarmed_browser_types": ["chromium"],
+            "browser_pool_sizes": {"chromium": 3, "firefox": 1, "webkit": 1},
+            "browser_proxy": "",
+            "browser_viewport": "1440x900",
+            "success_response_artifacts_enabled": True,
+            "api_pool_size": 4,
+            "api_retry_attempts": 1,
+            "ui_retry_attempts": 1,
+            "environment_variables": [],
+        }
+
+        payload = CheckRunner()._worker_settings(settings)
+
+        self.assertEqual(payload["prewarmed_browser_types"], ["chromium"])
+        self.assertEqual(payload["browser_pool_sizes"]["chromium"], 3)
+        self.assertEqual(payload["api_pool_size"], 4)
+
+    def test_worker_run_reloads_resource_pool_from_main_settings(self) -> None:
+        async def scenario() -> None:
+            runner = CheckRunner()
+            settings = {
+                "max_task_runtime_seconds": 60,
+                "api_pool_size": 4,
+                "browser_type": "chromium",
+                "browser_headless": True,
+                "enabled_browser_types": ["chromium"],
+                "prewarmed_browser_types": ["chromium"],
+                "browser_pool_sizes": {"chromium": 3, "firefox": 1, "webkit": 1},
+            }
+            check = {"id": 41, "name": "worker api", "type": "api"}
+            runner.resources.reload = AsyncMock()  # type: ignore[method-assign]
+            runner._execute_core = AsyncMock(return_value={"status": "ok"})  # type: ignore[method-assign]
+
+            result = await runner.execute_worker_run(check, "scheduled", 410, settings)
+
+            self.assertEqual(result["status"], "ok")
+            runner.resources.reload.assert_awaited_once_with(  # type: ignore[attr-defined]
+                settings,
+                api_pool_size=4,
+                browser_pool_sizes_value={"chromium": 3, "firefox": 1, "webkit": 1},
+            )
+
+        asyncio.run(scenario())
+
     def test_selected_parallel_uses_only_schedulable_runners_when_any_exist(self) -> None:
         check = {
             "id": 40,
@@ -788,7 +838,7 @@ class DistributedRunnerTests(unittest.TestCase):
             "backend.app.runner.storage.list_probe_runners_by_ids", return_value=[local_runner]
         ), patch("backend.app.runner.storage.get_settings", return_value={}), patch(
             "backend.app.runner.storage.create_run", return_value={"id": 310, "check_id": 31, "status": "pending"}
-        ), patch("backend.app.runner.storage.finish_run", side_effect=finish_run), patch(
+        ) as create_run, patch("backend.app.runner.storage.finish_run", side_effect=finish_run) as finish_run_mock, patch(
             "backend.app.runner.storage.get_run", return_value=None
         ), patch("backend.app.runner.storage.discard_incomplete_run", return_value=True) as discard_incomplete_run, patch(
             "backend.app.runner.storage.update_run_notification"
@@ -807,8 +857,11 @@ class DistributedRunnerTests(unittest.TestCase):
         self.assertEqual(result["failure_kind"], "runner")
         self.assertFalse(result["affects_health"])
         execute.assert_not_awaited()
-        discard_incomplete_run.assert_called_once_with(310)
-        update_run_notification.assert_not_called()
+        created_payload = create_run.call_args.args[0]
+        self.assertFalse(created_payload["_run"]["affects_health"])
+        finish_run_mock.assert_called_once()
+        discard_incomplete_run.assert_not_called()
+        update_run_notification.assert_called_once_with(310, "not_required", channel=None, error=None, sent_at=None)
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
 

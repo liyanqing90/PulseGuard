@@ -1,0 +1,254 @@
+param(
+    [string]$RemoteEnvPath = "D:\project\PulseGuard\remote.env",
+    [string]$RemoteRoot = "/opt/pulseguard",
+    [string]$PublicHost = "",
+    [int]$ApiPort = 8787,
+    [int]$RelayPort = 9443,
+    [string]$PyPiMirror = "https://mirrors.ivolces.com/pypi/simple",
+    [switch]$SkipTests,
+    [switch]$SkipFrontendBuild,
+    [switch]$SkipBrowserInstall
+)
+
+$ErrorActionPreference = "Stop"
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $PSNativeCommandUseErrorActionPreference = $true
+}
+
+function Read-RemoteEnv {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "remote env file not found: $Path"
+    }
+
+    $values = @{}
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $text = $line.Trim()
+        if (-not $text -or $text.StartsWith("#") -or -not $text.Contains("=")) {
+            continue
+        }
+        $key, $value = $text.Split("=", 2)
+        $values[$key.Trim()] = $value.Trim()
+    }
+    foreach ($required in @("user", "ip")) {
+        if ([string]::IsNullOrWhiteSpace($values[$required])) {
+            throw "remote env missing '$required': $Path"
+        }
+    }
+    return $values
+}
+
+function Invoke-Native {
+    param([Parameter(Mandatory = $true)][string]$File, [Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    & $File @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$File $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+    }
+}
+
+foreach ($tool in @("ssh", "scp", "tar")) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        throw "missing required command: $tool"
+    }
+}
+
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$remote = Read-RemoteEnv -Path $RemoteEnvPath
+if ([string]::IsNullOrWhiteSpace($PublicHost)) {
+    $PublicHost = $remote.ip
+}
+$target = "$($remote.user)@$($remote.ip)"
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("pulseguard-deploy-" + [guid]::NewGuid().ToString("N"))
+$payload = Join-Path $tempRoot "pulseguard-source.tar.gz"
+$remotePayload = "$RemoteRoot/pulseguard-source.tar.gz"
+$remoteScript = "$RemoteRoot/apply-china-systemd-deploy.sh"
+
+New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+try {
+    Push-Location $repoRoot
+    try {
+        if (-not $SkipTests) {
+            Invoke-Native -File "uv" -Arguments @("run", "python", "-m", "unittest", "discover", "-s", "backend/tests", "-p", "test_*.py", "-v")
+        }
+        if (-not $SkipFrontendBuild) {
+            Push-Location "frontend"
+            try {
+                Invoke-Native -File "npm" -Arguments @("run", "build")
+            }
+            finally {
+                Pop-Location
+            }
+        }
+        $archiveItems = @(
+            "assets",
+            "backend",
+            "docs",
+            "frontend",
+            "scripts",
+            ".dockerignore",
+            ".env.example",
+            "AGENTS.md",
+            "DESIGN.md",
+            "Dockerfile",
+            "Dockerfile.worker",
+            "Dockerfile.worker-updater",
+            "LICENSE",
+            "NOTICE",
+            "PRODUCT.md",
+            "PulseGuard_PRD.md",
+            "README.en.md",
+            "README.md",
+            "docker-compose.relay-worker.yml",
+            "docker-compose.relay.yml",
+            "docker-compose.worker.build.yml",
+            "docker-compose.worker.yml",
+            "docker-compose.yml",
+            "pyproject.toml",
+            "uv.lock"
+        ) | Where-Object { Test-Path -LiteralPath $_ }
+        Invoke-Native -File "tar" -Arguments (@(
+            "--exclude=frontend/node_modules",
+            "--exclude=node_modules",
+            "--exclude=.pytest_cache",
+            "--exclude=*.log",
+            "-czf",
+            $payload
+        ) + $archiveItems)
+    }
+    finally {
+        Pop-Location
+    }
+
+    $browserInstall = if ($SkipBrowserInstall) { "0" } else { "1" }
+    $remoteApply = @"
+set -euo pipefail
+remote_root="$RemoteRoot"
+payload="$remotePayload"
+public_host="$PublicHost"
+api_port="$ApiPort"
+relay_port="$RelayPort"
+pypi_mirror="$PyPiMirror"
+browser_install="$browserInstall"
+stamp=`$(date +%Y%m%d-%H%M%S)
+work="/tmp/pulseguard-release-`${stamp}"
+
+if [ "`$(id -u)" != "0" ]; then
+  echo "deploy-china-systemd requires a root SSH user because it writes systemd units and may install Playwright system dependencies" >&2
+  exit 1
+fi
+
+mkdir -p "`${remote_root}" /opt/pulseguard-backups "`${work}" "`${remote_root}/data" "`${remote_root}/reports"
+tar -xzf "`${payload}" -C "`${work}"
+
+python3 -m venv "`${remote_root}/.venv"
+"`${remote_root}/.venv/bin/python" -m pip install -i "`${pypi_mirror}" -U pip
+cd "`${work}"
+"`${remote_root}/.venv/bin/python" - <<'PY' > requirements.deploy.txt
+import tomllib
+with open("pyproject.toml", "rb") as fh:
+    data = tomllib.load(fh)
+print("\n".join(data["project"]["dependencies"]))
+PY
+"`${remote_root}/.venv/bin/python" -m pip install -i "`${pypi_mirror}" -r requirements.deploy.txt
+if [ "`${browser_install}" = "1" ]; then
+  if [ "`$(id -u)" = "0" ]; then
+    "`${remote_root}/.venv/bin/python" -m playwright install --with-deps chromium
+  else
+    "`${remote_root}/.venv/bin/python" -m playwright install chromium
+  fi
+fi
+
+systemctl stop pulseguard.service pulseguard-relay.service 2>/dev/null || true
+tar -czf "/opt/pulseguard-backups/source-before-deploy-`${stamp}.tar.gz" -C "`${remote_root}" --exclude=data --exclude=reports --exclude=.venv . 2>/dev/null || true
+find "`${remote_root}" -mindepth 1 -maxdepth 1 ! -name data ! -name reports ! -name .venv -exec rm -rf {} +
+tar -xzf "`${payload}" -C "`${remote_root}"
+cat > "`${remote_root}/.env" <<EOF_ENV
+PULSEGUARD_HOST=0.0.0.0
+PULSEGUARD_PORT=`${api_port}
+PULSEGUARD_DATA_DIR=`${remote_root}/data
+PULSEGUARD_REPORTS_DIR=`${remote_root}/reports
+PULSEGUARD_STATIC_DIR=`${remote_root}/frontend/dist
+PULSEGUARD_ALERT_DETAIL_BASE_URL=http://`${public_host}:`${api_port}
+PULSEGUARD_RELAY_ENABLED=true
+PULSEGUARD_RELAY_PUBLIC_HOST=`${public_host}
+PULSEGUARD_RELAY_PUBLIC_PORT=`${relay_port}
+PULSEGUARD_RELAY_INTERNAL_HOST=127.0.0.1
+PULSEGUARD_RELAY_INTERNAL_LISTEN_HOST=127.0.0.1
+PULSEGUARD_RELAY_CONTROL_HOST=127.0.0.1
+PULSEGUARD_RELAY_CONTROL_URL=http://127.0.0.1:18000
+PYTHONPATH=`${remote_root}/backend
+EOF_ENV
+
+cat > /etc/systemd/system/pulseguard.service <<EOF_UNIT
+[Unit]
+Description=PulseGuard API
+After=network.target
+
+[Service]
+WorkingDirectory=`${remote_root}
+EnvironmentFile=`${remote_root}/.env
+Environment=PYTHONPATH=`${remote_root}/backend
+ExecStart=`${remote_root}/.venv/bin/uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port `${api_port}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
+cat > /etc/systemd/system/pulseguard-relay.service <<EOF_UNIT
+[Unit]
+Description=PulseGuard Relay
+After=network.target pulseguard.service
+
+[Service]
+WorkingDirectory=`${remote_root}
+EnvironmentFile=`${remote_root}/.env
+Environment=PYTHONPATH=`${remote_root}/backend
+ExecStart=`${remote_root}/.venv/bin/python -m app.relay_server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
+systemctl daemon-reload
+systemctl enable pulseguard.service pulseguard-relay.service >/dev/null
+systemctl restart pulseguard.service pulseguard-relay.service
+systemctl is-active pulseguard.service pulseguard-relay.service
+rm -rf "`${work}" "`${payload}"
+"@
+    $remoteApplyPath = Join-Path $tempRoot "apply-china-systemd-deploy.sh"
+    $remoteApply | Set-Content -LiteralPath $remoteApplyPath -Encoding ASCII
+
+    Write-Host "Uploading source payload to $target. OpenSSH may prompt for the remote password."
+    Invoke-Native -File "ssh" -Arguments @($target, "mkdir -p '$RemoteRoot'")
+    Invoke-Native -File "scp" -Arguments @($payload, "${target}:$remotePayload")
+    Invoke-Native -File "scp" -Arguments @($remoteApplyPath, "${target}:$remoteScript")
+    Invoke-Native -File "ssh" -Arguments @($target, "bash '$remoteScript'")
+
+    $remoteUrl = "http://$PublicHost`:$ApiPort"
+    $deadline = (Get-Date).AddSeconds(120)
+    do {
+        try {
+            $health = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/health" -TimeoutSec 5
+            $settings = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/settings" -TimeoutSec 10
+            $relay = Invoke-RestMethod -Method GET -Uri "$remoteUrl/api/relay/status" -TimeoutSec 10
+            if ($health.status -eq "ok" -and $settings -and $relay) {
+                Write-Host "PulseGuard is healthy: $remoteUrl"
+                return
+            }
+        }
+        catch {
+            Start-Sleep -Seconds 3
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    throw "PulseGuard did not become healthy within 120 seconds: $remoteUrl"
+}
+finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
