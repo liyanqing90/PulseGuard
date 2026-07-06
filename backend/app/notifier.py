@@ -328,7 +328,10 @@ def _notification_channels(
 def _system_notification_channels(settings: dict[str, Any]) -> list[dict[str, Any]]:
     system_channel_ids = settings.get("system_notification_channel_ids")
     effective = dict(settings)
-    effective["notification_channel_ids"] = system_channel_ids if isinstance(system_channel_ids, list) else []
+    if isinstance(system_channel_ids, list) and system_channel_ids:
+        effective["notification_channel_ids"] = system_channel_ids
+    else:
+        effective.pop("notification_channel_ids", None)
     return _notification_channels(effective, enabled_only=True, require_webhook=True)
 
 

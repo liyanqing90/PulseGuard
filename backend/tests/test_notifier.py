@@ -170,6 +170,35 @@ class DingtalkNotifierTests(unittest.TestCase):
         self.assertIn("系统异常", send_webhook_alert.await_args.args[1])
         self.assertIn("Target crashed", send_webhook_alert.await_args.args[2])
 
+    def test_notify_system_error_defaults_to_all_sendable_channels_without_system_route(self) -> None:
+        settings = {
+            "system_alerts_enabled": True,
+            "alert_delivery_attempts": 1,
+            "system_notification_channel_ids": [],
+            "notification_channels": [
+                {"id": "biz", "name": "业务群", "type": "feishu", "enabled": True, "webhook_url": "https://example.test/biz"},
+                {"id": "disabled", "name": "停用群", "type": "wecom", "enabled": False, "webhook_url": "https://example.test/disabled"},
+                {"id": "missing-url", "name": "未配置群", "type": "dingtalk", "enabled": True, "webhook_url": ""},
+            ],
+        }
+
+        with patch.object(notifier, "send_webhook_alert", new_callable=AsyncMock) as send_webhook_alert:
+            result = self.run_async(
+                notifier.notify_system_error(
+                    {
+                        "source": "runner",
+                        "message": "Page.title: Target crashed",
+                        "check_name": "经销商商详白页监控",
+                        "run_id": 214236,
+                    },
+                    settings=settings,
+                )
+            )
+
+        self.assertTrue(result["sent"])
+        send_webhook_alert.assert_awaited_once()
+        self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "biz")
+
     def test_manual_failure_obeys_continuous_failure_cooldown(self) -> None:
         run = {"id": 45, "status": "failed", "started_at": "2026-06-05T10:05:00+08:00"}
         transition = {

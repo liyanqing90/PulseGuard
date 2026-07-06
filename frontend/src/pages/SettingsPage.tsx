@@ -610,15 +610,20 @@ export function SettingsPage() {
   const activeTabBlockingError = activeTab === "alerts" ? blockingError || alertTagPolicyError : activeTab === "variables" ? variableBlockingError : "";
   const saveDisabledReason = activeTabBlockingError || (!activeTabChanged ? "当前页没有需要保存的更改" : "");
   const previewDisabledReason = settings.notification_channels.length === 0 ? "先添加通知渠道后再预检" : blockingError;
-  const enabledChannelCount = settings.notification_channels.filter((channel) => channel.enabled).length;
+  const sendableChannels = settings.notification_channels.filter(isReadyForSend);
+  const sendableChannelCount = sendableChannels.length;
+  const sendableChannelIds = new Set(sendableChannels.map((channel) => channel.id));
   const channelOptions = settings.notification_channels.map((channel) => ({
     label: channelDisplayName(channel),
     value: channel.id,
-    disabled: !channel.enabled
+    disabled: !isReadyForSend(channel)
   }));
+  const executionSelectedChannelCount = settings.execution_notification_channel_ids.filter((channelId) => sendableChannelIds.has(channelId)).length;
+  const systemSelectedChannelCount = settings.system_notification_channel_ids.filter((channelId) => sendableChannelIds.has(channelId)).length;
   const executionChannelCount =
-    settings.execution_notification_channel_ids.length > 0 ? settings.execution_notification_channel_ids.length : enabledChannelCount;
-  const systemChannelCount = settings.system_notification_channel_ids.length;
+    settings.execution_notification_channel_ids.length > 0 ? executionSelectedChannelCount : sendableChannelCount;
+  const systemUsesDefaultChannels = settings.system_notification_channel_ids.length === 0;
+  const systemChannelCount = systemUsesDefaultChannels ? sendableChannelCount : systemSelectedChannelCount;
   const importApplyDisabledReason = configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
   const readOnlyTokens = settings.read_only_tokens || [];
   const importUploadProps: UploadProps = {
@@ -653,14 +658,27 @@ export function SettingsPage() {
       <section className={`settings-layout settings-layout-${activeTab}`}>
         {activeTab === "alerts" && (
           <>
-        <SettingsPanel title="公共告警策略" icon={<BellRing size={18} />} accent className="settings-panel-wide">
+        <SettingsPanel title="运行告警" icon={<BellRing size={18} />} accent>
+          <div className="alert-route-summary">
+            <div className="alert-route-status">
+              <Space size={8} wrap>
+                <Switch aria-label="启用运行告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
+                <Tag color={enabledTagColor(settings.alerts_enabled)}>{settings.alerts_enabled ? "已启用" : "已停用"}</Tag>
+              </Space>
+              <span>{settings.execution_notification_channel_ids.length > 0 ? `${executionChannelCount} 个指定渠道` : "全部可发送渠道"}</span>
+            </div>
+            <div className="alert-route-facts">
+              <div className="alert-route-fact">
+                <small>覆盖范围</small>
+                <strong>任务失败、恢复、连续失败冷却</strong>
+              </div>
+              <div className="alert-route-fact">
+                <small>当前路由</small>
+                <strong>{executionChannelCount > 0 ? `${executionChannelCount} 个渠道` : "未配置"}</strong>
+              </div>
+            </div>
+          </div>
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <Form.Item label="执行告警">
-              <Switch aria-label="启用执行告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
-            </Form.Item>
-            <Form.Item label="系统告警">
-              <Switch aria-label="启用系统告警" checked={settings.system_alerts_enabled} onChange={(value) => update("system_alerts_enabled", value)} />
-            </Form.Item>
             <Form.Item label="恢复通知">
               <Switch aria-label="恢复通知" checked={settings.recovery_notification} onChange={(value) => update("recovery_notification", value)} />
             </Form.Item>
@@ -671,17 +689,7 @@ export function SettingsPage() {
                 value={settings.execution_notification_channel_ids}
                 onChange={(value) => update("execution_notification_channel_ids", value)}
                 options={channelOptions}
-                placeholder="默认使用全部启用渠道"
-              />
-            </Form.Item>
-            <Form.Item label="系统告警渠道" className="span-2">
-              <Select
-                mode="multiple"
-                allowClear
-                value={settings.system_notification_channel_ids}
-                onChange={(value) => update("system_notification_channel_ids", value)}
-                options={channelOptions}
-                placeholder="选择系统异常告警渠道"
+                placeholder="默认使用全部可发送渠道"
               />
             </Form.Item>
             <NumberItem
@@ -692,6 +700,45 @@ export function SettingsPage() {
               suffix="分钟"
               onChange={(value) => update("alert_cooldown_minutes", value)}
             />
+          </Form>
+        </SettingsPanel>
+
+        <SettingsPanel title="系统告警" icon={<ShieldCheck size={18} />} accent>
+          <div className="alert-route-summary">
+            <div className="alert-route-status">
+              <Space size={8} wrap>
+                <Switch aria-label="启用系统告警" checked={settings.system_alerts_enabled} onChange={(value) => update("system_alerts_enabled", value)} />
+                <Tag color={enabledTagColor(settings.system_alerts_enabled)}>{settings.system_alerts_enabled ? "已启用" : "已停用"}</Tag>
+              </Space>
+              <span>{systemUsesDefaultChannels ? "全部可发送渠道" : systemChannelCount > 0 ? `${systemChannelCount} 个指定渠道` : "未配置可发送渠道"}</span>
+            </div>
+            <div className="alert-route-facts">
+              <div className="alert-route-fact">
+                <small>覆盖范围</small>
+                <strong>浏览器崩溃、节点异常、执行环境异常</strong>
+              </div>
+              <div className="alert-route-fact">
+                <small>当前路由</small>
+                <strong>{systemChannelCount > 0 ? `${systemChannelCount} 个渠道` : "未配置"}</strong>
+              </div>
+            </div>
+          </div>
+          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
+            <Form.Item label="系统告警渠道" className="span-2">
+              <Select
+                mode="multiple"
+                allowClear
+                value={settings.system_notification_channel_ids}
+                onChange={(value) => update("system_notification_channel_ids", value)}
+                options={channelOptions}
+                placeholder="默认使用全部可发送渠道"
+              />
+            </Form.Item>
+          </Form>
+        </SettingsPanel>
+
+        <SettingsPanel title="发送参数" icon={<Send size={18} />} className="settings-panel-wide">
+          <Form layout="vertical" className="settings-form-grid" autoComplete="off">
             <NumberItem
               label="告警发送尝试次数"
               value={settings.alert_delivery_attempts}
@@ -709,9 +756,9 @@ export function SettingsPage() {
                 autoComplete="off"
               />
             </Form.Item>
-            <Form.Item label="启用渠道">
+            <Form.Item label="可发送渠道">
               <div className="setting-inline-metric">
-                <strong>{enabledChannelCount}</strong>
+                <strong>{sendableChannelCount}</strong>
                 <span>个渠道可发送</span>
               </div>
             </Form.Item>
