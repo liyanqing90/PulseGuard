@@ -128,9 +128,10 @@ export function SettingsPage() {
   const [savedSettings, setSavedSettings] = useState<SettingsValues | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
+  const [testingChannelId, setTestingChannelId] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [alertPreview, setAlertPreview] = useState<AlertPreview | null>(null);
+  const [editingChannelIds, setEditingChannelIds] = useState<Set<string>>(() => new Set());
   const [newChannelType, setNewChannelType] = useState<WebhookType>("feishu");
   const [exportingConfig, setExportingConfig] = useState(false);
   const [importDrawerOpen, setImportDrawerOpen] = useState(false);
@@ -225,14 +226,16 @@ export function SettingsPage() {
   }
 
   function addChannel() {
+    const channel = createChannel(newChannelType);
     setAlertPreview(null);
     setSettings((current) => {
       if (!current) return current;
       return {
         ...current,
-        notification_channels: [...current.notification_channels, createChannel(newChannelType)]
+        notification_channels: [...current.notification_channels, channel]
       };
     });
+    setChannelEditing(channel.id, true);
   }
 
   function removeChannel(channelId: string) {
@@ -241,8 +244,27 @@ export function SettingsPage() {
       if (!current) return current;
       return {
         ...current,
-        notification_channels: current.notification_channels.filter((channel) => channel.id !== channelId)
+        notification_channels: current.notification_channels.filter((channel) => channel.id !== channelId),
+        execution_notification_channel_ids: (current.execution_notification_channel_ids || []).filter((id) => id !== channelId),
+        system_notification_channel_ids: (current.system_notification_channel_ids || []).filter((id) => id !== channelId),
+        alert_tag_policies: current.alert_tag_policies.map((policy) => ({
+          ...policy,
+          notification_channel_ids: (policy.notification_channel_ids || []).filter((id) => id !== channelId)
+        }))
       };
+    });
+    setChannelEditing(channelId, false);
+  }
+
+  function setChannelEditing(channelId: string, editing: boolean) {
+    setEditingChannelIds((current) => {
+      const next = new Set(current);
+      if (editing) {
+        next.add(channelId);
+      } else {
+        next.delete(channelId);
+      }
+      return next;
     });
   }
 
@@ -316,10 +338,13 @@ export function SettingsPage() {
     if (scope === "alerts") {
       return {
         alerts_enabled: settings.alerts_enabled,
+        system_alerts_enabled: settings.system_alerts_enabled,
         alert_detail_base_url: settings.alert_detail_base_url.trim(),
         alert_cooldown_minutes: settings.alert_cooldown_minutes,
         alert_delivery_attempts: settings.alert_delivery_attempts,
         recovery_notification: settings.recovery_notification,
+        execution_notification_channel_ids: uniqueIds(settings.execution_notification_channel_ids || []),
+        system_notification_channel_ids: uniqueIds(settings.system_notification_channel_ids || []),
         alert_tag_policies: settings.alert_tag_policies.map(toPayloadAlertTagPolicy),
         notification_channels: settings.notification_channels.map(toPayloadChannel)
       };
@@ -346,6 +371,7 @@ export function SettingsPage() {
           normalizeBrowserTypes(settings.enabled_browser_types).includes(browserType)
         ),
         browser_pool_sizes: normalizeBrowserPoolSizes(settings.browser_pool_sizes),
+        browser_recycle_after_runs: settings.browser_recycle_after_runs,
         browser_proxy: settings.browser_proxy,
         browser_viewport: settings.browser_viewport
       };
@@ -361,6 +387,8 @@ export function SettingsPage() {
         screenshot_retention_days: settings.screenshot_retention_days,
         trace_retention_days: settings.trace_retention_days,
         response_retention_days: settings.response_retention_days,
+        similar_failure_retention_count: settings.similar_failure_retention_count,
+        trace_artifacts_enabled: settings.trace_artifacts_enabled,
         success_response_artifacts_enabled: settings.success_response_artifacts_enabled,
         database_backup_retention: settings.database_backup_retention,
         maintenance_enabled: Boolean(settings.maintenance_enabled),
@@ -440,16 +468,23 @@ export function SettingsPage() {
     }
   }
 
-  async function testAlert() {
+  function buildChannelTestPayload(channel: NotificationChannel): Partial<SettingsValues> {
+    return {
+      alert_delivery_attempts: settings?.alert_delivery_attempts ?? 1,
+      notification_channels: [toPayloadChannel(channel)]
+    };
+  }
+
+  async function testAlert(channel: NotificationChannel) {
     if (!settings) return;
-    setTesting(true);
+    setTestingChannelId(channel.id);
     try {
-      const result = await api.testAlert(buildPayload("alerts"));
-      message.success(result.message);
+      const result = await api.testAlert(buildChannelTestPayload(channel));
+      message.success(`${channelDisplayName(channel)}：${result.message}`);
     } catch (err) {
       message.error((err as Error).message);
     } finally {
-      setTesting(false);
+      setTestingChannelId(null);
     }
   }
 
@@ -568,17 +603,22 @@ export function SettingsPage() {
   const blockingError = firstBlockingError(settings.notification_channels);
   const alertTagPolicyError = firstAlertTagPolicyError(settings.alert_tag_policies);
   const variableBlockingError = firstVariableBlockingError(settings.environment_variables);
-  const readyChannels = readyNotificationChannels(settings.notification_channels);
   const hasUnsavedChanges = Boolean(savedSettings && settingsChanged(settings, savedSettings));
   const settingsTabCanSave = true;
   const activeTabChanged = Boolean(savedSettings && settingsTabCanSave && settingsTabChanged(settings, savedSettings, activeTab));
   const alertSettingsChanged = Boolean(savedSettings && settingsTabChanged(settings, savedSettings, "alerts"));
   const activeTabBlockingError = activeTab === "alerts" ? blockingError || alertTagPolicyError : activeTab === "variables" ? variableBlockingError : "";
   const saveDisabledReason = activeTabBlockingError || (!activeTabChanged ? "当前页没有需要保存的更改" : "");
-  const testDisabledReason =
-    blockingError || (readyChannels.length === 0 ? "至少配置一个启用且填写 URL 的通知渠道后再发送测试" : "");
   const previewDisabledReason = settings.notification_channels.length === 0 ? "先添加通知渠道后再预检" : blockingError;
   const enabledChannelCount = settings.notification_channels.filter((channel) => channel.enabled).length;
+  const channelOptions = settings.notification_channels.map((channel) => ({
+    label: channelDisplayName(channel),
+    value: channel.id,
+    disabled: !channel.enabled
+  }));
+  const executionChannelCount =
+    settings.execution_notification_channel_ids.length > 0 ? settings.execution_notification_channel_ids.length : enabledChannelCount;
+  const systemChannelCount = settings.system_notification_channel_ids.length;
   const importApplyDisabledReason = configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
   const readOnlyTokens = settings.read_only_tokens || [];
   const importUploadProps: UploadProps = {
@@ -606,9 +646,6 @@ export function SettingsPage() {
           <Button icon={<RotateCcw size={16} />} onClick={resetDraft} disabled={!hasUnsavedChanges}>
             撤销更改
           </Button>
-          {activeTab === "alerts" && (
-            <TestAlertButton loading={testing} disabledReason={testDisabledReason} usesDraft={alertSettingsChanged} onClick={testAlert} />
-          )}
           {settingsTabCanSave && <SaveSettingsButton loading={saving} disabledReason={saveDisabledReason} onClick={() => save()} />}
         </Space>
       </section>
@@ -618,11 +655,34 @@ export function SettingsPage() {
           <>
         <SettingsPanel title="公共告警策略" icon={<BellRing size={18} />} accent className="settings-panel-wide">
           <Form layout="vertical" className="settings-form-grid" autoComplete="off">
-            <Form.Item label="启用告警">
-              <Switch aria-label="启用告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
+            <Form.Item label="执行告警">
+              <Switch aria-label="启用执行告警" checked={settings.alerts_enabled} onChange={(value) => update("alerts_enabled", value)} />
+            </Form.Item>
+            <Form.Item label="系统告警">
+              <Switch aria-label="启用系统告警" checked={settings.system_alerts_enabled} onChange={(value) => update("system_alerts_enabled", value)} />
             </Form.Item>
             <Form.Item label="恢复通知">
               <Switch aria-label="恢复通知" checked={settings.recovery_notification} onChange={(value) => update("recovery_notification", value)} />
+            </Form.Item>
+            <Form.Item label="执行告警渠道" className="span-2">
+              <Select
+                mode="multiple"
+                allowClear
+                value={settings.execution_notification_channel_ids}
+                onChange={(value) => update("execution_notification_channel_ids", value)}
+                options={channelOptions}
+                placeholder="默认使用全部启用渠道"
+              />
+            </Form.Item>
+            <Form.Item label="系统告警渠道" className="span-2">
+              <Select
+                mode="multiple"
+                allowClear
+                value={settings.system_notification_channel_ids}
+                onChange={(value) => update("system_notification_channel_ids", value)}
+                options={channelOptions}
+                placeholder="选择系统异常告警渠道"
+              />
             </Form.Item>
             <NumberItem
               label="失败冷却时间"
@@ -652,7 +712,19 @@ export function SettingsPage() {
             <Form.Item label="启用渠道">
               <div className="setting-inline-metric">
                 <strong>{enabledChannelCount}</strong>
-                <span>个渠道参与告警发送</span>
+                <span>个渠道可发送</span>
+              </div>
+            </Form.Item>
+            <Form.Item label="执行路由">
+              <div className="setting-inline-metric">
+                <strong>{executionChannelCount}</strong>
+                <span>个渠道</span>
+              </div>
+            </Form.Item>
+            <Form.Item label="系统路由">
+              <div className="setting-inline-metric">
+                <strong>{systemChannelCount}</strong>
+                <span>个渠道</span>
               </div>
             </Form.Item>
           </Form>
@@ -713,8 +785,15 @@ export function SettingsPage() {
                   key={channel.id}
                   channel={channel}
                   index={index}
+                  editing={editingChannelIds.has(channel.id)}
+                  testing={testingChannelId === channel.id}
+                  testDisabledReason={channelTestDisabledReason(channel)}
+                  usesDraft={alertSettingsChanged}
                   onPatch={(patch) => updateChannel(channel.id, patch)}
                   onRemove={() => removeChannel(channel.id)}
+                  onEdit={() => setChannelEditing(channel.id, true)}
+                  onDone={() => setChannelEditing(channel.id, false)}
+                  onTest={() => testAlert(channel)}
                 />
               ))}
             </div>
@@ -800,6 +879,14 @@ export function SettingsPage() {
                 }
               />
             ))}
+            <NumberItem
+              label="浏览器回收周期"
+              value={settings.browser_recycle_after_runs}
+              min={1}
+              max={1000}
+              suffix="次"
+              onChange={(value) => update("browser_recycle_after_runs", value)}
+            />
             <Form.Item label="代理" className="span-2">
               <Input
                 name="browser-proxy"
@@ -856,7 +943,15 @@ export function SettingsPage() {
             <NumberItem label="截图保留" value={settings.screenshot_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("screenshot_retention_days", value)} />
             <NumberItem label="Trace 保留" value={settings.trace_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("trace_retention_days", value)} />
             <NumberItem label="Response Body 保留" value={settings.response_retention_days} min={1} max={365} suffix="天" onChange={(value) => update("response_retention_days", value)} />
+            <NumberItem label="同错失败保留" value={settings.similar_failure_retention_count} min={1} max={100} suffix="条" onChange={(value) => update("similar_failure_retention_count", value)} />
             <NumberItem label="数据库备份保留" value={settings.database_backup_retention} min={1} max={30} suffix="份" onChange={(value) => update("database_backup_retention", value)} />
+            <Form.Item label="记录失败 Trace">
+              <Switch
+                aria-label="记录失败 Trace"
+                checked={settings.trace_artifacts_enabled}
+                onChange={(value) => update("trace_artifacts_enabled", value)}
+              />
+            </Form.Item>
             <Form.Item label="成功响应产物">
               <Switch
                 aria-label="保存成功响应产物"
@@ -1762,7 +1857,7 @@ function RunnerNodePanel() {
             </div>
           )}
           <pre>{provisionResult?.deployment.command || ""}</pre>
-          <span>命令只显示一次。重新生成会轮换 relay token，旧命令立即失效。</span>
+          <span>命令只显示一次。重新生成会轮换 relay token；在线子节点会在部署窗口内继续使用上一版 token，新版本连接成功后旧 token 自动失效。标准部署命令默认启用 updater。</span>
         </Space>
       </Modal>
 
@@ -1772,7 +1867,7 @@ function RunnerNodePanel() {
           <div className="worker-help-block">
             <strong>Relay 自动接入</strong>
             <pre>{`docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d`}</pre>
-            <span>主节点启用 relay 后，在新增子节点里选择“生成部署命令”，复制命令到 worker 宿主机执行。worker 不需要开放 8788 入站端口。</span>
+            <span>主节点启用 relay 后，在新增子节点里选择“生成部署命令”，复制命令到 worker 宿主机执行。worker 不需要开放 8788 入站端口，部署命令默认启动 updater。</span>
           </div>
           <span>手动添加模式下，先在子节点服务器启动 worker，再回到这里填写子节点地址和日志输出的 token。</span>
           <div className="worker-help-block">
@@ -1782,13 +1877,15 @@ cd PulseGuard
 $env:PULSEGUARD_WORKER_NAME = $env:COMPUTERNAME
 $env:PULSEGUARD_WORKER_REGION = "default"
 $env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
+$env:COMPOSE_PROFILES = "updater"
+$env:PULSEGUARD_WORKER_UPDATER_URL = "http://pulseguard-worker-updater:8790"
 docker compose -f docker-compose.worker.yml -f docker-compose.worker.build.yml up --build -d
-docker update --restart unless-stopped pulseguard-worker
+docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updater
 docker logs --tail 80 pulseguard-worker`}</pre>
-            <span>这条命令会从公司 Git 项目构建 worker，后台启动容器并设置 Docker 自启策略。</span>
+            <span>这条命令会从公司 Git 项目构建 worker 和 updater，后台启动容器并设置 Docker 自启策略。</span>
           </div>
           <div className="worker-help-block">
-            <strong>启用管理平台推送更新（可选）</strong>
+            <strong>管理平台推送更新（默认启用）</strong>
             <pre>{`$env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
 $env:COMPOSE_PROFILES = "updater"
 $env:PULSEGUARD_WORKER_UPDATER_URL = "http://pulseguard-worker-updater:8790"
@@ -2250,19 +2347,34 @@ function AlertTagPolicyEditor({
 function NotificationChannelEditor({
   channel,
   index,
+  editing,
+  testing,
+  testDisabledReason,
+  usesDraft,
   onPatch,
-  onRemove
+  onRemove,
+  onEdit,
+  onDone,
+  onTest
 }: {
   channel: NotificationChannel;
   index: number;
+  editing: boolean;
+  testing: boolean;
+  testDisabledReason: string;
+  usesDraft: boolean;
   onPatch: (patch: Partial<NotificationChannel>) => void;
   onRemove: () => void;
+  onEdit: () => void;
+  onDone: () => void;
+  onTest: () => void;
 }) {
   const guide = CHANNEL_GUIDES[channel.type];
   const urlError = channelUrlError(channel);
   const hostHint = channelHostHint(channel);
   const secretError = channelSecretError(channel);
   const ready = isReadyForSend(channel);
+  const displayName = channelDisplayName(channel, index);
 
   function changeType(type: WebhookType) {
     onPatch({
@@ -2273,94 +2385,128 @@ function NotificationChannelEditor({
     });
   }
 
+  const menuItems: MenuProps["items"] = [
+    ...(!editing ? [{ key: "edit", icon: <Pencil size={15} />, label: "编辑" }] : []),
+    ...(!editing ? [{ type: "divider" as const }] : []),
+    { key: "delete", icon: <Trash2 size={15} />, label: "删除", danger: true }
+  ];
+
+  const onMenuClick: MenuProps["onClick"] = ({ key }) => {
+    if (key === "edit") {
+      onEdit();
+      return;
+    }
+    if (key === "delete") {
+      Modal.confirm({
+        title: "删除通知渠道",
+        content: "删除后保存设置才会生效。",
+        okText: "删除",
+        cancelText: "取消",
+        okButtonProps: { danger: true },
+        onOk: onRemove
+      });
+    }
+  };
+
   return (
-    <section className={`notification-channel-card ${ready ? "notification-channel-ready" : ""}`}>
+    <section className={`notification-channel-card ${ready ? "notification-channel-ready" : ""} ${editing ? "notification-channel-editing" : "notification-channel-compact"}`}>
       <div className="notification-channel-header">
         <div className="notification-channel-title">
-          <Switch aria-label={`${channel.name.trim() || CHANNEL_GUIDES[channel.type].label} 渠道启用状态`} checked={channel.enabled} onChange={(value) => onPatch({ enabled: value })} />
-          <div>
-            <strong>{channel.name.trim() || `${guide.label}渠道 ${index + 1}`}</strong>
-            <span>{channel.enabled ? channelStatusText(channel, ready) : "已停用"}</span>
-          </div>
+          <strong>{displayName}</strong>
         </div>
-        <Space size={8} wrap>
-          <Tag color={ready ? "success" : channel.enabled ? "warning" : "default"}>{ready ? "可发送" : channel.enabled ? "待配置" : "停用"}</Tag>
-          <Popconfirm title="删除通知渠道" description="删除后保存设置才会生效。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={onRemove}>
-            <Tooltip title="删除渠道">
-              <Button danger aria-label="删除通知渠道" icon={<Trash2 size={15} />} />
-            </Tooltip>
-          </Popconfirm>
+        <Space size={8} wrap className="notification-channel-actions">
+          <Tag>{guide.label}</Tag>
+          <span className="notification-channel-enable">
+            <Switch aria-label={`${displayName} 渠道启用状态`} checked={channel.enabled} onChange={(value) => onPatch({ enabled: value })} />
+          </span>
+          <Tooltip title={testDisabledReason || (usesDraft ? "使用当前渠道草稿发送测试，不会保存设置" : "发送一条测试告警到当前渠道")}>
+            <span className="tooltip-button-wrapper">
+              <Button size="small" icon={<Send size={15} />} loading={testing} disabled={Boolean(testDisabledReason)} onClick={onTest}>
+                发送测试
+              </Button>
+            </span>
+          </Tooltip>
+          {editing && (
+            <Button size="small" icon={<CheckCircle2 size={15} />} onClick={onDone}>
+              完成
+            </Button>
+          )}
+          <Dropdown menu={{ items: menuItems, onClick: onMenuClick }} trigger={["click"]}>
+            <Button size="small" aria-label={`${displayName} 更多操作`} icon={<MoreHorizontal size={15} />} />
+          </Dropdown>
         </Space>
       </div>
 
-      <Form layout="vertical" className="notification-channel-grid" autoComplete="off">
-        <Form.Item label="渠道名称">
-          <Input
-            name={`notification-channel-name-${channel.id}`}
-            value={channel.name}
-            onChange={(event) => onPatch({ name: event.target.value })}
-            placeholder="例如：值班群"
-            autoComplete="off"
-          />
-        </Form.Item>
-        <Form.Item label="渠道类型">
-          <Select value={channel.type} onChange={(value) => changeType(value)} options={CHANNEL_OPTIONS} />
-        </Form.Item>
-        <Form.Item label="Webhook URL" className="span-2" validateStatus={urlError ? "error" : hostHint ? "warning" : undefined} help={urlError || hostHint || guide.webhookHint}>
-          <Input.Password
-            name={`notification-channel-webhook-${channel.id}`}
-            value={channel.webhook_url}
-            onChange={(event) => onPatch({ webhook_url: event.target.value })}
-            placeholder="https://…"
-            status={urlError ? "error" : hostHint ? "warning" : undefined}
-            autoComplete="new-password"
-          />
-        </Form.Item>
-        {channel.type === "dingtalk" && (
-          <Form.Item
-            label={
-              <Space size={8}>
-                <span>钉钉加签密钥</span>
-                {channel.dingtalk_secret_set && !channel.dingtalk_secret_clear && !channel.dingtalk_secret && <Tag color="success">已配置</Tag>}
-                {channel.dingtalk_secret_clear && <Tag color="warning">待清除</Tag>}
-              </Space>
-            }
-            className="span-2"
-            validateStatus={secretError ? "warning" : undefined}
-            help={secretError || guide.secretHint}
-          >
-            <Space.Compact className="secret-input-row">
-              <Input.Password
-                name={`notification-channel-secret-${channel.id}`}
-                value={channel.dingtalk_secret || ""}
-                onChange={(event) => onPatch({ dingtalk_secret: event.target.value, dingtalk_secret_clear: false })}
-                autoComplete="new-password"
-                placeholder={channel.dingtalk_secret_set ? "输入新密钥可替换现有密钥" : "SEC 开头的加签密钥"}
-                prefix={<KeyRound size={15} />}
-              />
-              {channel.dingtalk_secret_set && !channel.dingtalk_secret_clear && (
-                <Popconfirm
-                  title="清除钉钉加签密钥"
-                  description="保存设置后，该渠道将不再携带钉钉签名参数。"
-                  okText="清除"
-                  cancelText="取消"
-                  okButtonProps={{ danger: true }}
-                  onConfirm={() => onPatch({ dingtalk_secret: "", dingtalk_secret_set: false, dingtalk_secret_clear: true })}
-                >
-                  <Tooltip title="清除已保存密钥">
-                    <Button danger aria-label="清除已保存密钥" icon={<Trash2 size={15} />} />
-                  </Tooltip>
-                </Popconfirm>
-              )}
-              {channel.dingtalk_secret_clear && (
-                <Tooltip title="撤销清除密钥">
-                  <Button aria-label="撤销清除密钥" icon={<RotateCcw size={15} />} onClick={() => onPatch({ dingtalk_secret_clear: false, dingtalk_secret_set: true })} />
-                </Tooltip>
-              )}
-            </Space.Compact>
+      {editing ? (
+        <Form layout="vertical" className="notification-channel-grid" autoComplete="off">
+          <Form.Item label="渠道名称">
+            <Input
+              name={`notification-channel-name-${channel.id}`}
+              value={channel.name}
+              onChange={(event) => onPatch({ name: event.target.value })}
+              placeholder="例如：值班群"
+              autoComplete="off"
+            />
           </Form.Item>
-        )}
-      </Form>
+          <Form.Item label="渠道类型">
+            <Select value={channel.type} onChange={(value) => changeType(value)} options={CHANNEL_OPTIONS} />
+          </Form.Item>
+          <Form.Item label="Webhook URL" className="span-2" validateStatus={urlError ? "error" : hostHint ? "warning" : undefined} help={urlError || hostHint || guide.webhookHint}>
+            <Input.Password
+              name={`notification-channel-webhook-${channel.id}`}
+              value={channel.webhook_url}
+              onChange={(event) => onPatch({ webhook_url: event.target.value })}
+              placeholder="https://…"
+              status={urlError ? "error" : hostHint ? "warning" : undefined}
+              autoComplete="new-password"
+            />
+          </Form.Item>
+          {channel.type === "dingtalk" && (
+            <Form.Item
+              label={
+                <Space size={8}>
+                  <span>钉钉加签密钥</span>
+                  {channel.dingtalk_secret_set && !channel.dingtalk_secret_clear && !channel.dingtalk_secret && <Tag color="success">已配置</Tag>}
+                  {channel.dingtalk_secret_clear && <Tag color="warning">待清除</Tag>}
+                </Space>
+              }
+              className="span-2"
+              validateStatus={secretError ? "warning" : undefined}
+              help={secretError || guide.secretHint}
+            >
+              <Space.Compact className="secret-input-row">
+                <Input.Password
+                  name={`notification-channel-secret-${channel.id}`}
+                  value={channel.dingtalk_secret || ""}
+                  onChange={(event) => onPatch({ dingtalk_secret: event.target.value, dingtalk_secret_clear: false })}
+                  autoComplete="new-password"
+                  placeholder={channel.dingtalk_secret_set ? "输入新密钥可替换现有密钥" : "SEC 开头的加签密钥"}
+                  prefix={<KeyRound size={15} />}
+                />
+                {channel.dingtalk_secret_set && !channel.dingtalk_secret_clear && (
+                  <Popconfirm
+                    title="清除钉钉加签密钥"
+                    description="保存设置后，该渠道将不再携带钉钉签名参数。"
+                    okText="清除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => onPatch({ dingtalk_secret: "", dingtalk_secret_set: false, dingtalk_secret_clear: true })}
+                  >
+                    <Tooltip title="清除已保存密钥">
+                      <Button danger aria-label="清除已保存密钥" icon={<Trash2 size={15} />} />
+                    </Tooltip>
+                  </Popconfirm>
+                )}
+                {channel.dingtalk_secret_clear && (
+                  <Tooltip title="撤销清除密钥">
+                    <Button aria-label="撤销清除密钥" icon={<RotateCcw size={15} />} onClick={() => onPatch({ dingtalk_secret_clear: false, dingtalk_secret_set: true })} />
+                  </Tooltip>
+                )}
+              </Space.Compact>
+            </Form.Item>
+          )}
+        </Form>
+      ) : null}
     </section>
   );
 }
@@ -2465,29 +2611,6 @@ function SettingsPanel({
       </div>
       {children}
     </section>
-  );
-}
-
-function TestAlertButton({
-  loading,
-  disabledReason,
-  usesDraft,
-  onClick
-}: {
-  loading: boolean;
-  disabledReason: string;
-  usesDraft: boolean;
-  onClick: () => void;
-}) {
-  const disabled = Boolean(disabledReason);
-  return (
-    <Tooltip title={disabledReason || (usesDraft ? "发送测试会使用当前页面草稿，不会自动保存设置" : "发送一条测试告警，校验当前通知渠道")}>
-      <span className="tooltip-button-wrapper">
-        <Button icon={<Send size={16} />} onClick={onClick} loading={loading} disabled={disabled}>
-          发送测试
-        </Button>
-      </span>
-    </Tooltip>
   );
 }
 
@@ -2694,6 +2817,10 @@ function toPayloadEnvironmentVariable(variable: EnvironmentVariable): Environmen
   return payload;
 }
 
+function uniqueIds(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
 function firstBlockingError(channels: NotificationChannel[]): string {
   for (const channel of channels) {
     const error = channelUrlError(channel) || channelSecretError(channel);
@@ -2757,18 +2884,21 @@ function environmentVariableValueHelp(variable: EnvironmentVariable): string {
   return `使用 \${${placeholder}} 引用该变量`;
 }
 
-function readyNotificationChannels(channels: NotificationChannel[]) {
-  return channels.filter(isReadyForSend);
-}
-
 function isReadyForSend(channel: NotificationChannel): boolean {
   return channel.enabled && Boolean(channel.webhook_url.trim()) && !channelUrlError(channel) && !channelSecretError(channel);
 }
 
-function channelStatusText(channel: NotificationChannel, ready: boolean): string {
-  if (ready) return "Webhook 格式正常";
-  if (!channel.webhook_url.trim()) return "等待填写 Webhook URL";
-  return channelUrlError(channel) || channelSecretError(channel) || "建议核对渠道地址";
+function channelDisplayName(channel: NotificationChannel, index?: number): string {
+  const name = channel.name.trim();
+  if (name) return name;
+  const suffix = typeof index === "number" ? ` ${index + 1}` : "";
+  return `${channelTypeLabel(channel.type)}渠道${suffix}`;
+}
+
+function channelTestDisabledReason(channel: NotificationChannel): string {
+  if (!channel.enabled) return "启用渠道后再发送测试";
+  if (!channel.webhook_url.trim()) return "填写 Webhook URL 后再发送测试";
+  return channelUrlError(channel) || channelSecretError(channel);
 }
 
 function channelUrlError(channel: NotificationChannel): string {
@@ -2854,10 +2984,13 @@ function settingsTabChanged(current: SettingsValues, saved: SettingsValues, tab:
 function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
   const alerts = {
     alerts_enabled: values.alerts_enabled,
+    system_alerts_enabled: values.system_alerts_enabled,
     alert_detail_base_url: values.alert_detail_base_url,
     alert_cooldown_minutes: values.alert_cooldown_minutes,
     alert_delivery_attempts: values.alert_delivery_attempts,
     recovery_notification: values.recovery_notification,
+    execution_notification_channel_ids: values.execution_notification_channel_ids || [],
+    system_notification_channel_ids: values.system_notification_channel_ids || [],
     alert_tag_policies: (values.alert_tag_policies || []).map((policy) => ({
       id: policy.id,
       name: policy.name,
@@ -2899,6 +3032,7 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     enabled_browser_types: normalizeBrowserTypes(values.enabled_browser_types),
     prewarmed_browser_types: normalizeBrowserTypes(values.prewarmed_browser_types, true),
     browser_pool_sizes: normalizeBrowserPoolSizes(values.browser_pool_sizes),
+    browser_recycle_after_runs: values.browser_recycle_after_runs,
     browser_proxy: values.browser_proxy,
     browser_viewport: values.browser_viewport
   };
@@ -2917,6 +3051,8 @@ function comparableSettings(values: SettingsValues, tab?: SettingsTab) {
     screenshot_retention_days: values.screenshot_retention_days,
     trace_retention_days: values.trace_retention_days,
     response_retention_days: values.response_retention_days,
+    similar_failure_retention_count: values.similar_failure_retention_count,
+    trace_artifacts_enabled: values.trace_artifacts_enabled,
     success_response_artifacts_enabled: values.success_response_artifacts_enabled,
     database_backup_retention: values.database_backup_retention
   };
@@ -2965,6 +3101,9 @@ function cloneSettings(values: SettingsValues): SettingsValues {
     maintenance_starts_at: cloned.maintenance_starts_at || "",
     maintenance_ends_at: cloned.maintenance_ends_at || "",
     notification_channels: cloned.notification_channels || [],
+    execution_notification_channel_ids: cloned.execution_notification_channel_ids || [],
+    system_notification_channel_ids: cloned.system_notification_channel_ids || [],
+    system_alerts_enabled: cloned.system_alerts_enabled ?? true,
     members: cloned.members || [],
     alert_tag_policies: (cloned.alert_tag_policies || []).map((policy) => ({
       id: policy.id,

@@ -118,6 +118,58 @@ class DingtalkNotifierTests(unittest.TestCase):
         )
         update_last_notified.assert_called_once_with(11, "2026-06-05T10:00:01+08:00")
 
+    def test_maybe_notify_uses_execution_channel_selection(self) -> None:
+        run = {"id": 55, "status": "failed", "started_at": "2026-06-05T10:00:00+08:00"}
+        transition = {"current_status": "failing", "previous_status": "healthy", "consecutive_failures": 1}
+        settings = {
+            "alerts_enabled": True,
+            "execution_notification_channel_ids": ["biz"],
+            "notification_channels": [
+                {"id": "biz", "name": "业务群", "type": "feishu", "enabled": True, "webhook_url": "https://example.test/biz"},
+                {"id": "infra", "name": "系统群", "type": "wecom", "enabled": True, "webhook_url": "https://example.test/infra"},
+            ],
+        }
+
+        with patch.object(notifier.storage, "get_settings", return_value=settings), patch.object(
+            notifier, "send_webhook_alert", new_callable=AsyncMock
+        ) as send_webhook_alert, patch.object(notifier.storage, "now_iso", return_value="2026-06-05T10:00:01+08:00"), patch.object(
+            notifier.storage, "update_run_notification"
+        ), patch.object(notifier.storage, "update_last_notified"):
+            self.run_async(notifier.maybe_notify({"id": 11, "type": "api", "name": "接口"}, run, transition))
+
+        send_webhook_alert.assert_awaited_once()
+        self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "biz")
+
+    def test_notify_system_error_uses_only_system_channels(self) -> None:
+        settings = {
+            "system_alerts_enabled": True,
+            "alert_delivery_attempts": 1,
+            "system_notification_channel_ids": ["infra"],
+            "notification_channels": [
+                {"id": "biz", "name": "业务群", "type": "feishu", "enabled": True, "webhook_url": "https://example.test/biz"},
+                {"id": "infra", "name": "系统群", "type": "wecom", "enabled": True, "webhook_url": "https://example.test/infra"},
+            ],
+        }
+
+        with patch.object(notifier, "send_webhook_alert", new_callable=AsyncMock) as send_webhook_alert:
+            result = self.run_async(
+                notifier.notify_system_error(
+                    {
+                        "source": "runner",
+                        "message": "Page.title: Target crashed",
+                        "check_name": "经销商商详白页监控",
+                        "run_id": 214236,
+                    },
+                    settings=settings,
+                )
+            )
+
+        self.assertTrue(result["sent"])
+        send_webhook_alert.assert_awaited_once()
+        self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "infra")
+        self.assertIn("系统异常", send_webhook_alert.await_args.args[1])
+        self.assertIn("Target crashed", send_webhook_alert.await_args.args[2])
+
     def test_manual_failure_obeys_continuous_failure_cooldown(self) -> None:
         run = {"id": 45, "status": "failed", "started_at": "2026-06-05T10:05:00+08:00"}
         transition = {

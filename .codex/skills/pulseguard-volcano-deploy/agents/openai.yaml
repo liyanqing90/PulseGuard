@@ -1,0 +1,4 @@
+interface:
+  display_name: "PulseGuard Volcano Deploy"
+  short_description: "Deploy PulseGuard to Volcano safely"
+  default_prompt: "Use $pulseguard-volcano-deploy to deploy PulseGuard to the Volcano server and verify health."

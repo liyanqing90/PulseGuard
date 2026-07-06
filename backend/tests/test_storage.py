@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.app import storage
+from backend.app import artifacts, storage
 
 
 class OverviewStorageTests(unittest.TestCase):
@@ -527,6 +527,72 @@ class RunArchiveStorageTests(unittest.TestCase):
         self.assertEqual(archive_by_status["ok"]["duration_sum_ms"], 100)
         self.assertEqual(archive_by_status["failed"]["duration_sample_count"], 1)
         self.assertEqual([run["status"] for run in remaining], ["ok"])
+
+
+class RepeatedFailureCompactionTests(unittest.TestCase):
+    def test_delete_artifact_paths_ignores_locked_files(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            artifacts, "SCREENSHOTS_DIR", Path(temp_dir) / "screenshots"
+        ):
+            screenshots_dir = Path(temp_dir) / "screenshots"
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            locked_file = screenshots_dir / "locked.png"
+            locked_file.write_text("artifact", encoding="utf-8")
+
+            with patch.object(Path, "unlink", side_effect=PermissionError("locked")):
+                removed = artifacts.delete_artifact_paths(["screenshots/locked.png"])
+
+            self.assertEqual(removed, [])
+            self.assertTrue(locked_file.exists())
+
+    def test_finish_run_compacts_repeated_failures_and_deletes_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch("backend.app.artifacts.SCREENSHOTS_DIR", Path(temp_dir) / "screenshots"), patch(
+            "backend.app.artifacts.TRACES_DIR", Path(temp_dir) / "traces"
+        ), patch("backend.app.artifacts.RESPONSES_DIR", Path(temp_dir) / "responses"):
+            screenshots_dir = Path(temp_dir) / "screenshots"
+            traces_dir = Path(temp_dir) / "traces"
+            responses_dir = Path(temp_dir) / "responses"
+            for directory in (screenshots_dir, traces_dir, responses_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            storage.init_db()
+            storage.update_settings({"similar_failure_retention_count": 3})
+            check = storage.create_check(api_check_data("Repeated Failure API"))
+            created_ids: list[int] = []
+            artifact_paths: dict[int, list[Path]] = {}
+
+            for index in range(5):
+                run = storage.create_run(check)
+                run_id = int(run["id"])
+                created_ids.append(run_id)
+                screenshot = screenshots_dir / f"failure-{index}.png"
+                trace = traces_dir / f"trace-{index}.zip"
+                response = responses_dir / f"response-{index}.json"
+                for path in (screenshot, trace, response):
+                    path.write_text("artifact", encoding="utf-8")
+                artifact_paths[run_id] = [screenshot, trace, response]
+                storage.finish_run(
+                    run_id,
+                    {
+                        **run_payload("failed", "same target failure"),
+                        "screenshot_path": f"screenshots/{screenshot.name}",
+                        "trace_path": f"traces/{trace.name}",
+                        "response_path": f"responses/{response.name}",
+                    },
+                )
+
+            runs = storage.list_runs({"check_id": int(check["id"])}, limit=10)
+            latest = storage.get_run(created_ids[-1])
+
+            self.assertEqual([run["id"] for run in runs], list(reversed(created_ids[-3:])))
+            assert latest is not None
+            self.assertEqual(latest["deduplicated_count"], 2)
+            for run_id in created_ids[:2]:
+                self.assertTrue(all(not path.exists() for path in artifact_paths[run_id]))
+            for run_id in created_ids[-3:]:
+                self.assertTrue(all(path.exists() for path in artifact_paths[run_id]))
 
 
 class MonitoringTrendStorageTests(unittest.TestCase):
@@ -1233,7 +1299,7 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertFalse(storage.can_schedule_runner(health_stale))
         self.assertTrue(storage.should_notify_probe_runner_unavailable(health_stale))
 
-    def test_relay_regenerate_invalidates_old_relay_token_without_rotating_worker_token(self) -> None:
+    def test_relay_regenerate_keeps_pending_old_relay_token_invalid_without_rotating_worker_token(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
         ):
@@ -1262,6 +1328,78 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertNotIn(old_worker_token, str(raw_worker_token_value))
         self.assertEqual(regenerated["worker_token"], old_worker_token)
         self.assertEqual(int(regenerated["relay_token_version"]), old_version + 1)
+
+    def test_relay_regenerate_keeps_available_runner_on_previous_token_until_new_token_connects(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            old_relay_token = str(provisioned["relay_token"])
+            old_worker_token = str(provisioned["worker_token"])
+            old_version = int(provisioned["relay_token_version"])
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=old_version)
+            storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+
+            regenerated = storage.regenerate_probe_runner_provision(runner_id)
+            old_verified = storage.verify_probe_runner_relay_token(runner_id, old_relay_token, old_version)
+            new_verified = storage.verify_probe_runner_relay_token(
+                runner_id,
+                str(regenerated["relay_token"]),
+                int(regenerated["relay_token_version"]),
+            )
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=int(regenerated["relay_token_version"]))
+            old_after_new_connection = storage.verify_probe_runner_relay_token(runner_id, old_relay_token, old_version)
+
+        self.assertEqual(regenerated["status"], "available")
+        self.assertTrue(regenerated["available"])
+        self.assertTrue(regenerated["relay_token_rotation_pending"])
+        self.assertIsNotNone(old_verified)
+        self.assertIsNotNone(new_verified)
+        self.assertIsNone(old_after_new_connection)
+        self.assertEqual(regenerated["worker_token"], old_worker_token)
+        self.assertEqual(int(regenerated["relay_token_version"]), old_version + 1)
+
+    def test_expired_relay_rotation_invalidates_unused_current_token(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            old_relay_token = str(provisioned["relay_token"])
+            old_version = int(provisioned["relay_token_version"])
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=old_version)
+            storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+
+            regenerated = storage.regenerate_probe_runner_provision(runner_id)
+            expired_at = (datetime.now().astimezone() - timedelta(seconds=1)).isoformat(timespec="seconds")
+            with storage._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE probe_runners
+                    SET relay_previous_token_expires_at = ?,
+                        deploy_command_expires_at = ?
+                    WHERE runner_id = ?
+                    """,
+                    (expired_at, expired_at, runner_id),
+                )
+            old_verified = storage.verify_probe_runner_relay_token(runner_id, old_relay_token, old_version)
+            new_verified = storage.verify_probe_runner_relay_token(
+                runner_id,
+                str(regenerated["relay_token"]),
+                int(regenerated["relay_token_version"]),
+            )
+            expired_runner = storage.get_probe_runner(runner_id)
+
+        self.assertIsNone(old_verified)
+        self.assertIsNone(new_verified)
+        self.assertIsNotNone(expired_runner)
+        assert expired_runner is not None
+        self.assertEqual(expired_runner["status"], "expired")
+        self.assertFalse(expired_runner["relay_token_set"])
+        self.assertFalse(expired_runner["relay_token_rotation_pending"])
 
     def test_deleted_relay_runner_port_is_quarantined_until_cutoff(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
@@ -1324,22 +1462,23 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertEqual(restarted["last_disconnect_reason"], "relay server restarted")
         self.assertFalse(storage.can_schedule_runner(restarted))
 
-    def test_relay_regeneration_keeps_old_session_failures_pre_activation(self) -> None:
+    def test_relay_regeneration_suppresses_old_session_failures_during_rotation(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
         ):
             storage.init_db()
             provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
             runner_id = provisioned["runner_id"]
-            storage.mark_probe_runner_relay_connected(runner_id)
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=int(provisioned["relay_token_version"]))
             storage.mark_probe_runner_available(runner_id, {"status": "ok"})
             regenerated = storage.regenerate_probe_runner_provision(runner_id)
             disconnected = storage.mark_probe_runner_relay_disconnected(runner_id, "old session closed")
             auth_failed = storage.mark_probe_runner_relay_auth_failed(runner_id)
 
-        self.assertEqual(regenerated["status"], "pending_deployment")
-        self.assertEqual(disconnected["status"], "pending_deployment")
-        self.assertEqual(auth_failed["status"], "pending_deployment")
+        self.assertEqual(regenerated["status"], "available")
+        self.assertTrue(regenerated["relay_token_rotation_pending"])
+        self.assertEqual(disconnected["status"], "connecting")
+        self.assertEqual(auth_failed["status"], "connecting")
         self.assertFalse(storage.should_notify_probe_runner_unavailable(disconnected or {}))
         self.assertFalse(storage.should_notify_probe_runner_unavailable(auth_failed or {}))
 

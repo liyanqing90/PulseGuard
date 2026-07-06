@@ -62,8 +62,9 @@ if ([string]::IsNullOrWhiteSpace($PublicHost)) {
 $target = "$($remote.user)@$($remote.ip)"
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("pulseguard-deploy-" + [guid]::NewGuid().ToString("N"))
 $payload = Join-Path $tempRoot "pulseguard-source.tar.gz"
-$remotePayload = "$RemoteRoot/pulseguard-source.tar.gz"
-$remoteScript = "$RemoteRoot/apply-china-systemd-deploy.sh"
+$remoteDeployId = [guid]::NewGuid().ToString("N")
+$remotePayload = "/tmp/pulseguard-source-$remoteDeployId.tar.gz"
+$remoteScript = "/tmp/apply-china-systemd-deploy-$remoteDeployId.sh"
 
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 try {
@@ -126,6 +127,7 @@ try {
 set -euo pipefail
 remote_root="$RemoteRoot"
 payload="$remotePayload"
+remote_script="$remoteScript"
 public_host="$PublicHost"
 api_port="$ApiPort"
 relay_port="$RelayPort"
@@ -219,7 +221,7 @@ systemctl daemon-reload
 systemctl enable pulseguard.service pulseguard-relay.service >/dev/null
 systemctl restart pulseguard.service pulseguard-relay.service
 systemctl is-active pulseguard.service pulseguard-relay.service
-rm -rf "`${work}" "`${payload}"
+rm -rf "`${work}" "`${payload}" "`${remote_script}"
 "@
     $remoteApplyPath = Join-Path $tempRoot "apply-china-systemd-deploy.sh"
     $remoteApply | Set-Content -LiteralPath $remoteApplyPath -Encoding ASCII

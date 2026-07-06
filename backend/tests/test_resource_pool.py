@@ -58,6 +58,34 @@ class BrowserPoolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_context_release_recycles_browser_after_configured_run_count(self) -> None:
+        async def scenario() -> None:
+            fake = FakePlaywright()
+            pool = browser_pool(fake, size=1)
+            pool_settings = {**settings(), "browser_recycle_after_runs": 2}
+            context_options = {"viewport": {"width": 1366, "height": 768}}
+
+            await pool.start(pool_settings)
+            first_browser = fake.chromium.launches[0]
+
+            first_lease = await pool.acquire_context(pool_settings, context_options)
+            await pool.release_context(first_lease)
+            self.assertFalse(first_browser.closed)
+            self.assertEqual(len(fake.chromium.launches), 1)
+            self.assertEqual(pool.snapshot()["completed_contexts"], 1)
+
+            second_lease = await pool.acquire_context(pool_settings, context_options)
+            await pool.release_context(second_lease)
+
+            self.assertTrue(first_browser.closed)
+            self.assertEqual(len(fake.chromium.launches), 2)
+            self.assertEqual(pool.snapshot()["completed_contexts"], 0)
+            self.assertEqual(pool.snapshot()["recycle_after_runs"], 2)
+
+            await pool.shutdown()
+
+        asyncio.run(scenario())
+
     def test_h5_context_uses_matching_options_without_launching_second_browser(self) -> None:
         async def scenario() -> None:
             fake = FakePlaywright()

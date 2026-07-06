@@ -354,6 +354,7 @@ export interface ProbeRunner {
   relay_token_set?: boolean;
   relay_token_hint?: string;
   relay_token_version?: number;
+  relay_token_rotation_pending?: boolean;
   allocated_internal_port?: number | null;
   deploy_command_expires_at?: string | null;
   relay_last_seen_at?: string | null;
@@ -492,6 +493,7 @@ export interface Run {
   screenshot_path?: string | null;
   trace_path?: string | null;
   response_path?: string | null;
+  deduplicated_count?: number;
   request_snapshot?: string | null;
   response_snapshot?: string | null;
   runner_id?: string | null;
@@ -613,8 +615,11 @@ export interface SettingsValues {
   max_queue_size: number;
   max_task_runtime_seconds: number;
   alerts_enabled: boolean;
+  system_alerts_enabled: boolean;
   alert_detail_base_url: string;
   notification_channels: NotificationChannel[];
+  execution_notification_channel_ids: string[];
+  system_notification_channel_ids: string[];
   members: Member[];
   alert_tag_policies: AlertTagPolicy[];
   environment_variables: EnvironmentVariable[];
@@ -632,12 +637,15 @@ export interface SettingsValues {
   enabled_browser_types: BrowserType[];
   prewarmed_browser_types: BrowserType[];
   browser_pool_sizes: Record<BrowserType, number>;
+  browser_recycle_after_runs: number;
   browser_proxy: string;
   browser_viewport: string;
   run_retention_days: number;
   screenshot_retention_days: number;
   trace_retention_days: number;
   response_retention_days: number;
+  similar_failure_retention_count: number;
+  trace_artifacts_enabled: boolean;
   success_response_artifacts_enabled: boolean;
   database_backup_retention: number;
   read_only_token?: string;

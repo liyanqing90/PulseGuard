@@ -508,6 +508,7 @@ function CompactRunList({ hasFilters, loading, page, total, rerunningId, runs, o
               {run.check_type === "ui" && run.browser_type && <HistoryMeta label="Browser Type" value={run.browser_type} />}
               <HistoryMeta label="告警渠道" value={notificationChannelLabel(run.notification_channel, run.notification_status)} />
               <HistoryMeta label="连续失败" value={run.consecutive_failures || "-"} />
+              {Boolean(run.deduplicated_count) && <HistoryMeta label="同错压缩" value={`${run.deduplicated_count} 条`} />}
             </div>
 
             <Space className="history-card-actions">
@@ -557,6 +558,7 @@ function RunIssueSummary({ compact = false, run }: { compact?: boolean; run: Run
   return (
     <div className={compact ? "history-issue-summary history-issue-summary-compact" : "history-issue-summary"}>
       <span>{run.error_message}</span>
+      {Boolean(run.deduplicated_count) && <Tag>已压缩 {run.deduplicated_count} 条同错</Tag>}
     </div>
   );
 }

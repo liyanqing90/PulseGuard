@@ -4707,8 +4707,16 @@ tr:last-child td {
   padding: var(--space-surface);
 }
 
+.notification-channel-compact {
+  padding: 10px 12px;
+}
+
 .notification-channel-ready {
   border-color: color-mix(in srgb, var(--pg-accent) 36%, var(--line));
+}
+
+.notification-channel-editing {
+  background: color-mix(in srgb, var(--panel) 88%, var(--panel-strong));
 }
 
 .environment-variable-list {
@@ -4890,10 +4898,14 @@ tr:last-child td {
 
 .notification-channel-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: var(--space-field);
   margin-bottom: var(--space-field);
+}
+
+.notification-channel-compact .notification-channel-header {
+  margin-bottom: 0;
 }
 
 .environment-variable-header {
@@ -4907,9 +4919,7 @@ tr:last-child td {
 .notification-channel-title {
   min-width: 0;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: var(--space-sm);
+  gap: 2px;
 }
 
 .environment-variable-title {
@@ -4950,6 +4960,21 @@ tr:last-child td {
   font-size: 12px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.notification-channel-actions {
+  min-width: max-content;
+  justify-content: flex-end;
+}
+
+.notification-channel-enable {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--pg-muted);
+  font-size: var(--type-caption);
+  white-space: nowrap;
 }
 
 .environment-variable-title span {
@@ -6125,6 +6150,41 @@ tr:last-child td {
   .alert-preview-channel-header {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .notification-channel-actions,
+  .notification-channel-actions .ant-btn,
+  .notification-channel-actions .tooltip-button-wrapper {
+    width: 100%;
+  }
+
+  .notification-channel-compact .notification-channel-header {
+    align-items: center;
+    flex-direction: row;
+    gap: var(--space-sm);
+  }
+
+  .notification-channel-compact .notification-channel-actions {
+    width: auto;
+    flex-wrap: nowrap;
+  }
+
+  .notification-channel-compact .notification-channel-actions .ant-btn,
+  .notification-channel-compact .notification-channel-actions .tooltip-button-wrapper {
+    width: auto;
+  }
+
+  .notification-channel-actions .ant-space-item {
+    min-width: 0;
+  }
+
+  .notification-channel-enable {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .notification-channel-compact .notification-channel-enable {
+    width: auto;
   }
 
   .channel-toolbar,

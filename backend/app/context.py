@@ -118,6 +118,7 @@ class RunContext:
         self.request_snapshot: dict[str, Any] | None = None
         self.response_snapshot: dict[str, Any] | None = None
         self.browser_version: str | None = None
+        self.trace_artifacts_enabled = bool(settings.get("trace_artifacts_enabled", False))
         self.http = PulseHttpClient(self, resources)
         if str(check.get("type") or "") == "ui":
             self.request_snapshot = {
@@ -235,8 +236,9 @@ class RunContext:
                         part for part in (browser_type_name, str(raw_version or "").strip()) if part
                     )
                     self._browser_context = await self._browser.new_context(**self._browser_context_options())
-                await self._browser_context.tracing.start(screenshots=True, snapshots=True, sources=True)
-                self._trace_started = True
+                if self.trace_artifacts_enabled:
+                    await self._browser_context.tracing.start(screenshots=True, snapshots=True, sources=True)
+                    self._trace_started = True
             except RunnerEnvironmentFailure:
                 await self._release_pooled_browser_context(False)
                 raise

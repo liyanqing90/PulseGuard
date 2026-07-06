@@ -122,6 +122,8 @@ class HttpClientPool:
 class BrowserPool:
     def __init__(self, size: int) -> None:
         self._target_size = max(1, int(size))
+        self._recycle_after_runs = 20
+        self._completed_contexts_since_launch = 0
         self._browser_lease: BrowserLease | None = None
         self._ready_contexts: list[BrowserContextLease] = []
         self._active_contexts: set[BrowserContextLease] = set()
@@ -141,6 +143,7 @@ class BrowserPool:
         default_context_options = default_context_options_from_settings(settings)
         async with self._condition:
             self._target_size = max(1, int(size))
+            self._recycle_after_runs = _recycle_after_runs_from_settings(settings)
             self._closing = False
             self._default_context_options = default_context_options
             if self._config != config:
@@ -155,6 +158,7 @@ class BrowserPool:
         default_context_options = default_context_options_from_settings(settings)
         async with self._condition:
             self._closing = False
+            self._recycle_after_runs = _recycle_after_runs_from_settings(settings)
             self._default_context_options = default_context_options
             if self._config != config:
                 self._config = config
@@ -172,6 +176,7 @@ class BrowserPool:
         requested_options = dict(context_options)
         async with self._condition:
             self._closing = False
+            self._recycle_after_runs = _recycle_after_runs_from_settings(settings)
             self._default_context_options = default_context_options
             if self._config != config:
                 self._config = config
@@ -209,9 +214,14 @@ class BrowserPool:
     async def release_context(self, lease: BrowserContextLease, *, healthy: bool = True) -> None:
         async with self._condition:
             self._active_contexts.discard(lease)
+            released_current_browser = self._browser_lease is not None and lease.browser is self._browser_lease.browser
             await self._close_context(lease)
             if not healthy:
                 self._retire_browser_when_idle = True
+            elif released_current_browser:
+                self._completed_contexts_since_launch += 1
+                if self._completed_contexts_since_launch >= self._recycle_after_runs:
+                    self._retire_browser_when_idle = True
             try:
                 if healthy and not self._closing and not self._retire_browser_when_idle and self._browser_lease is not None:
                     await self._fill_contexts_locked(lease.context_options)
@@ -237,6 +247,9 @@ class BrowserPool:
             "in_use": active,
             "total": ready + active,
             "browser_processes": int(self._browser_lease is not None and self._browser_connected(self._browser_lease.browser)),
+            "completed_contexts": self._completed_contexts_since_launch,
+            "recycle_after_runs": self._recycle_after_runs,
+            "retiring": self._retire_browser_when_idle,
             "error": self._last_error,
         }
 
@@ -261,6 +274,7 @@ class BrowserPool:
             if self._config is None:
                 return
             self._browser_lease = await self._launch_locked(self._config)
+            self._completed_contexts_since_launch = 0
 
         await self._trim_ready_contexts_locked()
         await self._fill_contexts_locked(self._default_context_options)
@@ -346,6 +360,7 @@ class BrowserPool:
                 pass
             finally:
                 self._browser_lease = None
+                self._completed_contexts_since_launch = 0
 
     async def _close_context(self, lease: BrowserContextLease) -> None:
         try:
@@ -487,3 +502,10 @@ def _coerce_pool_sizes(value: dict[str, int] | int) -> dict[str, int]:
         return {str(key): max(1, int(size)) for key, size in value.items()}
     size = max(1, int(value))
     return dict.fromkeys(("chromium", "firefox", "webkit"), size)
+
+
+def _recycle_after_runs_from_settings(settings: dict[str, Any]) -> int:
+    try:
+        return max(1, int(settings.get("browser_recycle_after_runs", 20)))
+    except (TypeError, ValueError):
+        return 20

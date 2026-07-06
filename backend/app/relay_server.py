@@ -332,7 +332,7 @@ async def relay_connect(websocket: WebSocket) -> None:
         if session is None:
             return
         session_holder["session"] = session
-        storage.mark_probe_runner_relay_connected(runner_id)
+        storage.mark_probe_runner_relay_connected(runner_id, token_version=token_version)
         await session.send_json({"type": "ready"})
         while True:
             try:

@@ -21,10 +21,10 @@ PulseGuard 不是 SaaS、公开状态页、完整 E2E 测试管理平台或 inci
 - 运行记录：已保存任务的定时、手动、批量和重跑均属于正式执行，会影响健康状态、成功率与告警；只有编辑器配置试运行不影响状态且不触发告警。
 - 监控趋势：独立趋势页展示整体 UI/API 和分页任务趋势，按 24 小时、7 天、30 天或自定义时间段查看平均响应、P95、P99 和失败次数。
 - 可信健康状态：支持健康、疑似故障、故障、疑似恢复、未知、观测陈旧、停用，Runner 异常不会误报为目标故障。
-- 证据保留：失败时保存错误摘要、截图、Trace 和 Response Body；成功 API 响应默认只保留摘要。
+- 证据保留：失败时保存错误摘要、截图和 Response Body；Trace 可在系统设置中开启，默认关闭。
 - 执行节点打通：支持本机、手动直连子节点和 Relay 自动接入，适配无法开放入站端口的内网/跨网络节点，统一调度、健康检查和证据回传。
 - 失败归因：区分被探测目标失败和 Runner 执行环境失败，便于判断是业务/断言问题还是探针环境问题。
-- 告警策略：支持全局、标签级、任务级告警策略，覆盖冷却、恢复通知和通知渠道。
+- 告警策略：执行告警和系统告警分开配置渠道；执行告警支持全局、标签级、任务级策略，覆盖冷却、恢复通知和通知渠道。
 - 运维审计：记录任务、设置、批量操作、配置导入和版本恢复等关键操作。
 - 任务版本：保存任务变更快照，支持查看和恢复历史版本。
 - 只读出口：提供只读快照、JSON 指标和 Prometheus 指标。
@@ -39,7 +39,8 @@ PulseGuard 不是 SaaS、公开状态页、完整 E2E 测试管理平台或 inci
 - 趋势响应时间只基于成功执行记录计算，失败和 Runner 异常不参与平均、P95、P99。
 - 趋势聚合由新运行增量写入 `trend_rollups`；历史趋势回填不是启动必选项，默认不会回填旧运行。
 - Relay 自动接入支持生成和重新生成子节点部署命令，worker 只需出站连接主节点 relay，不需要开放 `8788` 入站端口。
-- 子节点支持上报版本、构建 SHA、当前镜像和 browser type 安装状态；启用 updater profile 后，主节点可以发起受控更新。
+- 子节点支持上报版本、构建 SHA、当前镜像和 browser type 安装状态；标准部署命令默认启用 updater，主节点可以发起受控更新。
+- 浏览器崩溃、浏览器依赖缺失、节点不可用、分布式节点系统失败、SQLite operational error 和单任务硬超时等系统异常会走系统告警，不再落成普通目标失败运行记录。
 
 ## 技术栈
 
@@ -112,6 +113,9 @@ UI 任务支持 `chromium`、`firefox`、`webkit` 三类 Playwright browser type
 - `enabled_browser_types`：允许任务选择和执行的 browser type。
 - `prewarmed_browser_types`：后端启动或设置变更时自动预热的 browser type，必须是已启用类型，可以多选或为空。
 - `browser_pool_sizes`：每个 browser type 独立的空 `BrowserContext` 储备数量，单类默认 5。
+- `browser_recycle_after_runs`：同一个预热浏览器完成多少个 UI Context 后自动回收，默认 20。失败截图仍会在回收前写入 `reports/`；Trace 仅在系统设置启用后记录，回收用于释放 Playwright 在 `/tmp/playwright-artifacts-*` 下的临时资源。
+- `similar_failure_retention_count`：同一任务连续出现相同失败/超时时，明细记录按滚动窗口保留，默认只保留最新 10 条，并清理被淘汰记录关联的截图、Trace 和 Response Body。
+- `trace_artifacts_enabled`：是否记录失败 Trace，默认关闭。关闭后仍保留失败截图和可用的 Response Body，避免 Trace zip 持续放大磁盘占用。
 
 每个预热的 browser type 会保留 1 个 Playwright browser 进程，并按该 type 的 pool size 预创建空 `BrowserContext`。UI 任务会独占租用 1 个 context/page；任务结束只关闭 context，不关闭 browser，资源池随后补齐空 context。Web 与 H5 尺寸通过 context options 区分，同一个 browser 进程下可以并发运行不同 viewport 的任务。
 
@@ -236,8 +240,10 @@ cd PulseGuard
 export PULSEGUARD_WORKER_NAME="$(hostname)"
 export PULSEGUARD_WORKER_REGION="default"
 export COMPOSE_PROJECT_NAME="pulseguard-worker"
+export COMPOSE_PROFILES="updater"
+export PULSEGUARD_WORKER_UPDATER_URL="http://pulseguard-worker-updater:8790"
 docker compose -f docker-compose.worker.yml -f docker-compose.worker.build.yml up --build -d
-docker update --restart unless-stopped pulseguard-worker
+docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updater
 docker logs --tail 80 pulseguard-worker
 ```
 
@@ -245,7 +251,7 @@ docker logs --tail 80 pulseguard-worker
 
 worker 会在 `/api/worker/health` 上报版本、构建 SHA、当前镜像和是否启用平台更新。管理平台“执行节点”列表会展示这些信息。
 
-如果希望管理平台可以主动向子节点推送更新，需要显式启用 updater profile。updater 会挂载宿主机 Docker socket，因此只允许更新当前 `pulseguard-worker` 服务，不支持任意命令：
+标准子节点部署默认启用 updater。updater 会挂载宿主机 Docker socket，因此只允许更新当前 `pulseguard-worker` 服务，不支持任意命令：
 
 ```powershell
 $env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
@@ -311,7 +317,7 @@ uv run python -m backend.app.worker --rotate-token --token-file data/worker-toke
 - Relay 自动模式下，公网只需要开放主节点 relay TCP 端口，默认 `9443`；worker 不开放入站端口。
 - 子节点接口使用 `Authorization: Bearer <token>` 认证。
 - 手动模式子节点不需要配置主节点地址，也不会主动访问主节点；Relay 自动模式由 relay-client 主动出站连接主节点。
-- 远程截图、Trace 和 Response Body 通过 JSON base64 回传主节点，单个文件超过大小上限会记录日志但不会伪造成功。
+- 远程截图、已启用的 Trace 和 Response Body 通过 JSON base64 回传主节点，单个文件超过大小上限会记录日志但不会伪造成功。
 - 手动停用的节点不会触发不可用告警；启用节点健康检查失败或派发失败时，同一节点只告警一次，恢复可用后重置。
 
 常见排障：
@@ -376,7 +382,7 @@ async def setup(ctx):
 - 默认使用 SQLite，数据库文件位于 `data/`。
 - SQLite 支持在线备份和恢复，备份位于 `data/backups/`。
 - 趋势数据写入 SQLite `trend_rollups` 轻量聚合表，长期保存响应时间 histogram 和汇总指标，不永久保存完整运行证据。新运行会自动写入趋势；旧运行的历史趋势回填默认关闭，如确需补齐旧数据，可临时设置 `PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true` 后启动一次。
-- 截图、Trace、Response Body 和归档摘要位于 `reports/`。
+- 截图、已启用的 Trace、Response Body 和归档摘要位于 `reports/`。
 - 环境变量、Webhook、钉钉密钥、只读令牌、常见认证 Header 和 Cookie 会在公开设置、运行记录和只读出口中脱敏。
 - 用户自定义 Python 探活脚本是可信本地工具能力，不是安全沙箱。
 - 录制器不是当前主线；多步骤探活优先使用模板、前置脚本和结构化规则。
@@ -390,12 +396,12 @@ async def setup(ctx):
 - `GET /api/runners` / `POST /api/runners`：执行节点列表和手动创建
 - `GET /api/relay/status`：Relay 启用状态、公网地址和 server fingerprint
 - `POST /api/runners/provision`：生成 Relay 自动接入子节点和一次性部署命令
-- `POST /api/runners/{runner_id}/provision/regenerate`：保留 runner ID 和内部端口，重新生成 Relay 部署命令
+- `POST /api/runners/{runner_id}/provision/regenerate`：保留 runner ID 和内部端口，重新生成 Relay 部署命令；在线子节点会在部署窗口内继续使用上一版 relay token，新 token 连接成功后旧 token 自动失效
 - `POST /api/runners/{runner_id}/update` / `GET /api/runners/{runner_id}/update-status`：主节点向子节点推送受控镜像更新和查询更新状态
 - `POST /api/runners/heartbeat`：旧版 Runner 主动心跳兼容接口，新子节点默认不需要配置
 - `GET /api/worker/health` / `POST /api/worker/run`：子节点健康检查和执行入口
 - `POST /api/worker/browser-types/install`：主节点请求子节点安装已启用的 Playwright browser type
-- `POST /api/worker/update` / `GET /api/worker/update-status`：子节点受控更新入口，需要启用 updater profile
+- `POST /api/worker/update` / `GET /api/worker/update-status`：子节点受控更新入口，标准子节点部署默认启用 updater profile
 - `GET /api/runs?runner_id=...`：按执行节点筛选运行记录
 - `GET /api/runs?run_group_id=...`：按一次多节点触发分组查看所有节点运行结果
 - `GET /api/runs-page?run_group_id=...`：分页查看同组运行结果

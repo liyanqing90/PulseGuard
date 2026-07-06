@@ -262,6 +262,11 @@ class ValidationMessageTests(unittest.TestCase):
         self.assertEqual(normalized["environment_variables"][1]["value"], "token-secret-123")
         self.assertTrue(normalized["environment_variables"][1]["secret"])
 
+    def test_settings_accept_browser_recycle_after_runs(self) -> None:
+        normalized = normalize_settings_values({"browser_recycle_after_runs": "12"})
+
+        self.assertEqual(normalized["browser_recycle_after_runs"], 12)
+
     def test_environment_variable_name_validation_uses_user_facing_rule_message(self) -> None:
         with self.assertRaisesRegex(ValueError, "NAME.*SERVICE_TOKEN"):
             normalize_settings_values(
@@ -328,6 +333,19 @@ class ValidationMessageTests(unittest.TestCase):
         self.assertEqual(policy["notification_channel_ids"], ["ops", "backup"])
         self.assertNotIn("webhook_url", policy)
         self.assertNotIn("dingtalk_secret", policy)
+
+    def test_settings_accept_separate_execution_and_system_alert_channels(self) -> None:
+        normalized = normalize_settings_values(
+            {
+                "system_alerts_enabled": True,
+                "execution_notification_channel_ids": ["ops", "", "biz"],
+                "system_notification_channel_ids": ["infra", "ops"],
+            }
+        )
+
+        self.assertTrue(normalized["system_alerts_enabled"])
+        self.assertEqual(normalized["execution_notification_channel_ids"], ["ops", "biz"])
+        self.assertEqual(normalized["system_notification_channel_ids"], ["infra", "ops"])
 
     def test_settings_reject_duplicate_alert_tag_policy_ids(self) -> None:
         with self.assertRaises(ValueError):

@@ -97,10 +97,10 @@ async def maybe_notify(check: dict[str, Any], run: dict[str, Any], transition: d
 
 async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[str, Any]]) -> None:
     settings = storage.get_settings()
-    if not settings.get("alerts_enabled"):
+    if not settings.get("system_alerts_enabled"):
         storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
         return
-    channels = _notification_channels(settings, enabled_only=True, require_webhook=True)
+    channels = _system_notification_channels(settings)
     if not channels:
         storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
         return
@@ -116,6 +116,39 @@ async def notify_runner_unavailable(runner: dict[str, Any], checks: list[dict[st
         else:
             sent_channels.append(channel)
     storage.mark_probe_runner_unavailable_notified(str(runner.get("runner_id") or ""))
+
+
+async def notify_system_error(event: dict[str, Any], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        effective_settings = dict(settings or storage.get_settings())
+    except Exception:
+        return {"sent": False, "reason": "settings_unavailable"}
+    if not effective_settings.get("system_alerts_enabled"):
+        return {"sent": False, "reason": "disabled"}
+
+    channels = _system_notification_channels(effective_settings)
+    if not channels:
+        return {"sent": False, "reason": "no_channels"}
+
+    title, text = _format_system_error_message(event, effective_settings)
+    failures: list[tuple[str, Exception]] = []
+    sent_channels: list[dict[str, Any]] = []
+    for channel in channels:
+        try:
+            await _send_with_retry(channel, title, text, int(effective_settings.get("alert_delivery_attempts", 1)))
+        except Exception as exc:
+            failures.append((_channel_display_name(channel), exc))
+        else:
+            sent_channels.append(channel)
+
+    if failures:
+        return {
+            "sent": bool(sent_channels),
+            "status": "failed",
+            "channel": _channels_summary(channels),
+            "error": _delivery_error_summary(failures, effective_settings),
+        }
+    return {"sent": bool(sent_channels), "status": "sent", "channel": _channels_summary(sent_channels)}
 
 
 def _record_notification(
@@ -175,6 +208,9 @@ async def _send_with_retry(channel: dict[str, Any], title: str, text: str, attem
 
 def _resolve_alert_settings(check: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     effective = dict(settings)
+    execution_channel_ids = settings.get("execution_notification_channel_ids")
+    if isinstance(execution_channel_ids, list) and execution_channel_ids:
+        effective["notification_channel_ids"] = execution_channel_ids
     tag_policy = _matching_tag_policy(check, settings)
     if tag_policy:
         _apply_alert_policy(effective, tag_policy)
@@ -287,6 +323,13 @@ def _notification_channels(
     if selected_ids is not None and missing_ids:
         settings["_alert_policy_error"] = f"告警策略引用的通知渠道不存在或不可用：{'、'.join(sorted(missing_ids))}"
     return channels
+
+
+def _system_notification_channels(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    system_channel_ids = settings.get("system_notification_channel_ids")
+    effective = dict(settings)
+    effective["notification_channel_ids"] = system_channel_ids if isinstance(system_channel_ids, list) else []
+    return _notification_channels(effective, enabled_only=True, require_webhook=True)
 
 
 def _selected_members(settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -582,6 +625,35 @@ def _format_runner_unavailable_message(runner: dict[str, Any], checks: list[dict
     if affected:
         lines.append(f"- 影响任务：{'、'.join(affected)}")
     return "\n".join(lines)
+
+
+def _format_system_error_message(event: dict[str, Any], settings: dict[str, Any]) -> tuple[str, str]:
+    title = "PulseGuard 系统异常"
+    message = mask_text(str(event.get("message") or "系统异常"), settings)
+    source = str(event.get("source") or "system")
+    severity = str(event.get("severity") or "error")
+    lines = [
+        f"#### {title}",
+        "",
+        f"- 来源：{source}",
+        f"- 级别：{severity}",
+        f"- 时间：{event.get('time') or storage.now_iso()}",
+        f"- 错误：{message}",
+    ]
+    check_name = str(event.get("check_name") or "").strip()
+    if check_name:
+        lines.append(f"- 任务：{mask_text(check_name, settings)}")
+    if event.get("check_id") is not None:
+        lines.append(f"- 任务 ID：{event.get('check_id')}")
+    if event.get("run_id") is not None:
+        lines.append(f"- 运行占位 ID：{event.get('run_id')}")
+    runner_name = str(event.get("runner_name") or "").strip()
+    if runner_name:
+        lines.append(f"- 节点：{mask_text(runner_name, settings)}")
+    trigger = str(event.get("trigger") or "").strip()
+    if trigger:
+        lines.append(f"- 触发：{trigger}")
+    return title, "\n".join(lines)
 
 
 def _webhook_payload(

@@ -279,6 +279,7 @@ function OverviewRunIssueSummary({ run }: { run: Run }) {
   return (
     <div className="history-issue-summary">
       <span>{run.error_message}</span>
+      {Boolean(run.deduplicated_count) && <Tag>已压缩 {run.deduplicated_count} 条同错</Tag>}
     </div>
   );
 }

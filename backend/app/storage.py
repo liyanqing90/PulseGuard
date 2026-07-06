@@ -18,7 +18,7 @@ from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from .artifacts import cleanup_old_artifacts
+from .artifacts import cleanup_old_artifacts, delete_artifact_paths
 from .browser_types import (
     DEFAULT_BROWSER_TYPE,
     browser_type_status,
@@ -67,6 +67,8 @@ RUN_SUMMARY_COLUMNS = (
     "screenshot_path",
     "trace_path",
     "response_path",
+    "failure_fingerprint",
+    "deduplicated_count",
     "runner_id",
     "runner_name",
     "runner_address",
@@ -169,6 +171,8 @@ def init_db() -> None:
                 screenshot_path TEXT,
                 trace_path TEXT,
                 response_path TEXT,
+                failure_fingerprint TEXT,
+                deduplicated_count INTEGER NOT NULL DEFAULT 0,
                 request_snapshot TEXT,
                 response_snapshot TEXT,
                 runner_id TEXT,
@@ -297,6 +301,10 @@ def init_db() -> None:
                 relay_token_hash TEXT NOT NULL DEFAULT '',
                 relay_token_hint TEXT NOT NULL DEFAULT '',
                 relay_token_version INTEGER NOT NULL DEFAULT 0,
+                relay_previous_token_hash TEXT NOT NULL DEFAULT '',
+                relay_previous_token_hint TEXT NOT NULL DEFAULT '',
+                relay_previous_token_version INTEGER NOT NULL DEFAULT 0,
+                relay_previous_token_expires_at TEXT,
                 allocated_internal_port INTEGER,
                 deploy_command_expires_at TEXT,
                 relay_last_seen_at TEXT,
@@ -381,6 +389,8 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_runner_id ON runs(runner_id, started_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(run_group_id, started_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_check_id_desc ON runs(check_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_failure_fingerprint ON runs(check_id, failure_fingerprint, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_observation_kind_started ON runs(observation_kind, started_at DESC, id DESC)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_observation_kind_check_started ON runs(observation_kind, check_id, started_at DESC, id DESC)"
@@ -958,6 +968,12 @@ def start_run(run_id: int) -> dict[str, Any] | None:
 def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
     affects_health = data.get("affects_health")
     affects_health_value = None if affects_health is None else (1 if affects_health else 0)
+    failure_fingerprint = _failure_fingerprint_for_values(
+        str(data.get("status") or ""),
+        data.get("failure_kind"),
+        data.get("error_message"),
+    )
+    removed_artifact_paths: list[str] = []
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
@@ -967,7 +983,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 response_path = ?, request_snapshot = ?, response_snapshot = ?,
                 runner_id = ?, runner_name = ?, runner_address = ?, runner_region = ?,
                 runner_browser_version = ?, browser_type = CASE WHEN check_type = 'ui' THEN ? ELSE '' END,
-                failure_kind = ?, affects_health = COALESCE(?, affects_health)
+                failure_kind = ?, failure_fingerprint = ?, affects_health = COALESCE(?, affects_health)
             WHERE id = ?
             """,
             (
@@ -989,6 +1005,7 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
                 data.get("runner_browser_version"),
                 data.get("browser_type"),
                 data.get("failure_kind"),
+                failure_fingerprint,
                 affects_health_value,
                 run_id,
             ),
@@ -1000,7 +1017,138 @@ def finish_run(run_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
             recorded = _record_trend_rollups(conn, row)
             if recorded:
                 conn.execute("UPDATE runs SET trend_recorded_at = ? WHERE id = ?", (now_iso(), run_id))
+            removed_artifact_paths = _compact_repeated_failure_runs(conn, row)
+    if removed_artifact_paths:
+        delete_artifact_paths(removed_artifact_paths)
     return get_run(run_id)
+
+
+def _compact_repeated_failure_runs(conn: sqlite3.Connection, current: sqlite3.Row) -> list[str]:
+    current_id = int(current["id"] or 0)
+    check_id = int(current["check_id"] or 0)
+    status = str(current["status"] or "")
+    if current_id <= 0 or check_id <= 0 or status not in {"failed", "timeout"}:
+        return []
+    if str(current["observation_kind"] or "observation") != "observation" or not bool(current["affects_health"]):
+        return []
+
+    fingerprint = _failure_fingerprint_for_row(current)
+    if not fingerprint:
+        return []
+
+    retention = _similar_failure_retention_count(conn)
+    rows = conn.execute(
+        """
+        SELECT id, status, error_message, failure_kind, failure_fingerprint,
+               deduplicated_count, screenshot_path, trace_path, response_path
+        FROM runs INDEXED BY idx_runs_check_id_desc
+        WHERE check_id = ?
+          AND id <= ?
+          AND observation_kind = 'observation'
+          AND affects_health = 1
+        ORDER BY id DESC
+        """,
+        (check_id, current_id),
+    ).fetchall()
+
+    matching_tail: list[sqlite3.Row] = []
+    for row in rows:
+        if _failure_fingerprint_for_row(row) != fingerprint:
+            break
+        matching_tail.append(row)
+    if len(matching_tail) <= retention:
+        return []
+
+    victims = matching_tail[retention:]
+    victim_ids = [int(row["id"]) for row in victims]
+    rolled_deduplicated_count = sum(int(row["deduplicated_count"] or 0) for row in matching_tail[1:])
+    removed_count = len(victims) + rolled_deduplicated_count
+    artifact_paths = [
+        path
+        for row in victims
+        for path in (row["screenshot_path"], row["trace_path"], row["response_path"])
+        if path
+    ]
+    placeholders = ", ".join("?" for _ in victim_ids)
+    conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", victim_ids)
+    conn.execute(
+        f"""
+        UPDATE check_status
+        SET last_run_id = CASE WHEN last_run_id IN ({placeholders}) THEN NULL ELSE last_run_id END,
+            last_scheduled_run_id = CASE WHEN last_scheduled_run_id IN ({placeholders}) THEN NULL ELSE last_scheduled_run_id END
+        WHERE last_run_id IN ({placeholders}) OR last_scheduled_run_id IN ({placeholders})
+        """,
+        [*victim_ids, *victim_ids, *victim_ids, *victim_ids],
+    )
+    kept_ids = [int(row["id"]) for row in matching_tail[:retention]]
+    if kept_ids:
+        oldest_kept_id = kept_ids[-1]
+        newest_kept_id = kept_ids[0]
+        conn.execute(
+            f"""
+            UPDATE anomaly_cycles
+            SET first_run_id = CASE WHEN first_run_id IN ({placeholders}) THEN ? ELSE first_run_id END,
+                last_run_id = CASE WHEN last_run_id IN ({placeholders}) THEN ? ELSE last_run_id END
+            WHERE first_run_id IN ({placeholders}) OR last_run_id IN ({placeholders})
+            """,
+            [*victim_ids, oldest_kept_id, *victim_ids, newest_kept_id, *victim_ids, *victim_ids],
+        )
+    previous_deduplicated_ids = [
+        int(row["id"])
+        for row in matching_tail[1:retention]
+        if int(row["deduplicated_count"] or 0) > 0
+    ]
+    if previous_deduplicated_ids:
+        previous_placeholders = ", ".join("?" for _ in previous_deduplicated_ids)
+        conn.execute(
+            f"UPDATE runs SET deduplicated_count = 0 WHERE id IN ({previous_placeholders})",
+            previous_deduplicated_ids,
+        )
+    if removed_count:
+        conn.execute(
+            "UPDATE runs SET deduplicated_count = COALESCE(deduplicated_count, 0) + ? WHERE id = ?",
+            (removed_count, current_id),
+        )
+    return artifact_paths
+
+
+def _similar_failure_retention_count(conn: sqlite3.Connection) -> int:
+    raw_value = _read_setting_value(conn, "similar_failure_retention_count")
+    try:
+        value = int(raw_value if raw_value is not None else DEFAULT_SETTINGS["similar_failure_retention_count"])
+    except (TypeError, ValueError):
+        value = int(DEFAULT_SETTINGS["similar_failure_retention_count"])
+    return max(1, min(100, value))
+
+
+def _failure_fingerprint_for_row(row: sqlite3.Row) -> str:
+    existing = ""
+    try:
+        existing = str(row["failure_fingerprint"] or "")
+    except (IndexError, KeyError):
+        existing = ""
+    if existing:
+        return existing
+    return _failure_fingerprint_for_values(str(row["status"] or ""), row["failure_kind"], row["error_message"])
+
+
+def _failure_fingerprint_for_values(status: str, failure_kind: Any, error_message: Any) -> str:
+    normalized_status = str(status or "")
+    if normalized_status not in {"failed", "timeout"}:
+        return ""
+    payload = {
+        "status": normalized_status,
+        "failure_kind": _normalize_failure_kind(failure_kind, normalized_status),
+        "message": _normalize_failure_message(error_message),
+    }
+    if not payload["message"]:
+        return ""
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _normalize_failure_message(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:1000]
 
 
 def upsert_probe_runner(data: dict[str, Any]) -> dict[str, Any]:
@@ -1158,27 +1306,56 @@ def regenerate_probe_runner_provision(runner_id: str) -> dict[str, Any] | None:
     timestamp = now_iso()
     expires_at = (datetime.now().astimezone() + timedelta(hours=RELAY_DEPLOY_COMMAND_TTL_HOURS)).isoformat(timespec="seconds")
     with _LOCK, _connect() as conn:
+        _expire_probe_runner_provisions(conn)
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         if not row:
             return None
         current = _normalize_probe_runner(row)
         if current.get("connection_mode") != "relay":
             raise ValueError("手动添加的 Runner 不能重新生成 relay 部署命令")
+        current_hash = str(row["relay_token_hash"] or "")
+        current_hint = str(row["relay_token_hint"] or "")
+        current_version = int(row["relay_token_version"] or 0)
+        keep_previous = bool(current.get("available") and current_hash and current_version > 0)
+        next_version = current_version + 1
+        next_status = "available" if keep_previous else "pending_deployment"
+        next_relay_seen_at = row["relay_last_seen_at"] if keep_previous else None
+        next_worker_health_at = row["worker_health_last_success_at"] if keep_previous else None
+        next_disconnect_reason = str(row["last_disconnect_reason"] or "") if keep_previous else "deployment command regenerated"
         conn.execute(
             """
             UPDATE probe_runners
-            SET relay_token_hash = ?,
+            SET relay_previous_token_hash = ?,
+                relay_previous_token_hint = ?,
+                relay_previous_token_version = ?,
+                relay_previous_token_expires_at = ?,
+                relay_token_hash = ?,
                 relay_token_hint = ?,
-                relay_token_version = COALESCE(relay_token_version, 0) + 1,
+                relay_token_version = ?,
                 deploy_command_expires_at = ?,
-                status = 'pending_deployment',
-                relay_last_seen_at = NULL,
-                worker_health_last_success_at = NULL,
-                last_disconnect_reason = 'deployment command regenerated',
+                status = ?,
+                relay_last_seen_at = ?,
+                worker_health_last_success_at = ?,
+                last_disconnect_reason = ?,
                 updated_at = ?
             WHERE runner_id = ?
             """,
-            (relay_token_hash(relay_token), _token_hint(relay_token), expires_at, timestamp, runner_id),
+            (
+                current_hash if keep_previous else "",
+                current_hint if keep_previous else "",
+                current_version if keep_previous else 0,
+                expires_at if keep_previous else None,
+                relay_token_hash(relay_token),
+                _token_hint(relay_token),
+                next_version,
+                expires_at,
+                next_status,
+                next_relay_seen_at,
+                next_worker_health_at,
+                next_disconnect_reason,
+                timestamp,
+                runner_id,
+            ),
         )
     runner = get_probe_runner(runner_id) or {}
     runner["relay_token"] = relay_token
@@ -1495,15 +1672,16 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
         row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
     if not row:
         return None
+    token_digest = relay_token_hash(token)
     expected_hash = str(row["relay_token_hash"] or "")
     expected_version = int(row["relay_token_version"] or 0)
     if str(row["connection_mode"] or "") != "relay":
         return None
     if not int(row["enabled"] or 0):
         return None
-    if int(version or 0) != expected_version:
-        return None
-    if not secrets.compare_digest(expected_hash, relay_token_hash(token)):
+    matched_current = int(version or 0) == expected_version and secrets.compare_digest(expected_hash, token_digest)
+    matched_previous = _previous_relay_token_matches(row, token_digest, int(version or 0))
+    if not matched_current and not matched_previous:
         return None
     expires_at = str(row["deploy_command_expires_at"] or "")
     try:
@@ -1511,14 +1689,15 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
     except ValueError:
         expired = False
     status = str(row["status"] or "")
-    if expired and status in RELAY_PRE_ACTIVATION_STATUSES:
+    if matched_current and expired and status in RELAY_PRE_ACTIVATION_STATUSES:
         return None
     return _normalize_probe_runner(row)
 
 
-def mark_probe_runner_relay_connected(runner_id: str) -> dict[str, Any] | None:
+def mark_probe_runner_relay_connected(runner_id: str, token_version: int | None = None) -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
+    connected_version = int(token_version or 0)
     with _LOCK, _connect() as conn:
         cursor = conn.execute(
             """
@@ -1527,10 +1706,27 @@ def mark_probe_runner_relay_connected(runner_id: str) -> dict[str, Any] | None:
                 relay_last_seen_at = ?,
                 last_disconnect_reason = '',
                 last_seen_at = ?,
+                relay_previous_token_hash = CASE WHEN ? > 0 AND relay_token_version = ? THEN '' ELSE relay_previous_token_hash END,
+                relay_previous_token_hint = CASE WHEN ? > 0 AND relay_token_version = ? THEN '' ELSE relay_previous_token_hint END,
+                relay_previous_token_version = CASE WHEN ? > 0 AND relay_token_version = ? THEN 0 ELSE relay_previous_token_version END,
+                relay_previous_token_expires_at = CASE WHEN ? > 0 AND relay_token_version = ? THEN NULL ELSE relay_previous_token_expires_at END,
                 updated_at = ?
             WHERE runner_id = ? AND connection_mode = 'relay'
             """,
-            (timestamp, timestamp, timestamp, runner_id),
+            (
+                timestamp,
+                timestamp,
+                connected_version,
+                connected_version,
+                connected_version,
+                connected_version,
+                connected_version,
+                connected_version,
+                connected_version,
+                connected_version,
+                timestamp,
+                runner_id,
+            ),
         )
         if cursor.rowcount == 0:
             return None
@@ -1560,9 +1756,11 @@ def mark_probe_runner_relay_disconnected(runner_id: str, reason: str = "") -> di
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
     with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT status, was_available FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         current_status = str(row["status"] or "") if row else ""
-        if current_status in RELAY_PRE_ACTIVATION_STATUSES:
+        if row and _relay_token_rotation_pending(row):
+            status = "connecting"
+        elif current_status in RELAY_PRE_ACTIVATION_STATUSES:
             status = current_status
         else:
             status = "unavailable" if row and int(row["was_available"] or 0) else "connecting"
@@ -1616,9 +1814,11 @@ def mark_probe_runner_relay_auth_failed(runner_id: str) -> dict[str, Any] | None
         return None
     timestamp = now_iso()
     with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT status, was_available FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
+        row = conn.execute("SELECT * FROM probe_runners WHERE runner_id = ?", (runner_id,)).fetchone()
         current_status = str(row["status"] or "") if row else ""
-        if current_status in RELAY_PRE_ACTIVATION_STATUSES:
+        if row and _relay_token_rotation_pending(row):
+            status = "connecting"
+        elif current_status in RELAY_PRE_ACTIVATION_STATUSES:
             status = current_status
         else:
             status = "auth_failed" if row and int(row["was_available"] or 0) else "pending_deployment"
@@ -2241,6 +2441,13 @@ def update_settings(values: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(member, dict) and member.get("id")
             }
             _prune_unknown_member_references(conn, member_ids, timestamp)
+        if "notification_channels" in normalized_values:
+            channel_ids = {
+                str(channel.get("id") or "")
+                for channel in normalized_values["notification_channels"]
+                if isinstance(channel, dict) and channel.get("id")
+            }
+            _prune_unknown_channel_references(conn, channel_ids, timestamp)
     return get_settings()
 
 
@@ -2319,6 +2526,68 @@ def _prune_unknown_member_references(conn: sqlite3.Connection, member_ids: set[s
         conn.execute(
             "UPDATE checks SET alert_policy_json = ?, updated_at = ? WHERE id = ?",
             (json.dumps(policy, ensure_ascii=False), timestamp, int(row["id"])),
+        )
+
+
+def _prune_unknown_channel_references(conn: sqlite3.Connection, channel_ids: set[str], timestamp: str) -> None:
+    for key in ("execution_notification_channel_ids", "system_notification_channel_ids"):
+        raw_value = _read_setting_value(conn, key)
+        selected = raw_value if isinstance(raw_value, list) else []
+        if not isinstance(selected, list):
+            continue
+        next_selected = [str(channel_id) for channel_id in selected if str(channel_id) in channel_ids]
+        if next_selected == selected:
+            continue
+        conn.execute(
+            """
+            INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, json.dumps(next_selected, ensure_ascii=False), timestamp),
+        )
+
+    for row in conn.execute("SELECT id, alert_policy_json FROM checks").fetchall():
+        try:
+            policy = json.loads(row["alert_policy_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(policy, dict) or not isinstance(policy.get("notification_channel_ids"), list):
+            continue
+        selected = [str(channel_id) for channel_id in policy["notification_channel_ids"] if str(channel_id) in channel_ids]
+        if selected == policy["notification_channel_ids"]:
+            continue
+        if selected:
+            policy["notification_channel_ids"] = selected
+        else:
+            policy.pop("notification_channel_ids", None)
+        conn.execute(
+            "UPDATE checks SET alert_policy_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(policy, ensure_ascii=False), timestamp, int(row["id"])),
+        )
+
+    raw_policies = _read_setting_value(conn, "alert_tag_policies")
+    policies = raw_policies if isinstance(raw_policies, list) else []
+    if not isinstance(policies, list):
+        return
+    changed = False
+    for policy in policies:
+        if not isinstance(policy, dict) or not isinstance(policy.get("notification_channel_ids"), list):
+            continue
+        selected = [str(channel_id) for channel_id in policy["notification_channel_ids"] if str(channel_id) in channel_ids]
+        if selected == policy["notification_channel_ids"]:
+            continue
+        changed = True
+        if selected:
+            policy["notification_channel_ids"] = selected
+        else:
+            policy.pop("notification_channel_ids", None)
+    if changed:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value, updated_at) VALUES ('alert_tag_policies', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (json.dumps(policies, ensure_ascii=False), timestamp),
         )
 
 
@@ -3116,6 +3385,8 @@ def _ensure_run_columns(conn: sqlite3.Connection) -> None:
         "runner_browser_version": "TEXT",
         "browser_type": "TEXT",
         "failure_kind": "TEXT",
+        "failure_fingerprint": "TEXT",
+        "deduplicated_count": "INTEGER NOT NULL DEFAULT 0",
         "notification_status": "TEXT",
         "notification_channel": "TEXT",
         "notification_error": "TEXT",
@@ -3190,6 +3461,10 @@ def _ensure_probe_runner_columns(conn: sqlite3.Connection) -> None:
         "relay_token_hash": "TEXT NOT NULL DEFAULT ''",
         "relay_token_hint": "TEXT NOT NULL DEFAULT ''",
         "relay_token_version": "INTEGER NOT NULL DEFAULT 0",
+        "relay_previous_token_hash": "TEXT NOT NULL DEFAULT ''",
+        "relay_previous_token_hint": "TEXT NOT NULL DEFAULT ''",
+        "relay_previous_token_version": "INTEGER NOT NULL DEFAULT 0",
+        "relay_previous_token_expires_at": "TEXT",
         "allocated_internal_port": "INTEGER",
         "deploy_command_expires_at": "TEXT",
         "relay_last_seen_at": "TEXT",
@@ -3476,6 +3751,7 @@ def _normalize_run(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["duration_ms"] = data.get("duration_ms")
     data["consecutive_failures"] = int(data.get("consecutive_failures") or 0)
+    data["deduplicated_count"] = int(data.get("deduplicated_count") or 0)
     data["failure_kind"] = _normalize_failure_kind(data.get("failure_kind"), str(data.get("status") or ""))
     data["runner_id"] = data.get("runner_id") or (LOCAL_RUNNER_ID if data.get("runner_name") else "")
     data["browser_type"] = (data.get("browser_type") or DEFAULT_BROWSER_TYPE) if data.get("check_type") == "ui" else ""
@@ -3553,10 +3829,14 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     data["browser_type_status"] = browser_type_status(data["installed_browser_types"], get_settings())
     data["connection_mode"] = _normalize_runner_connection_mode(data.get("connection_mode"))
     data["relay_token_version"] = int(data.get("relay_token_version") or 0)
+    data["relay_previous_token_version"] = int(data.get("relay_previous_token_version") or 0)
     data["allocated_internal_port"] = data.get("allocated_internal_port")
     data["was_available"] = bool(data.get("was_available"))
     data["token_set"] = bool(data.get("token_hash"))
     data["relay_token_set"] = bool(data.get("relay_token_hash"))
+    data["relay_token_rotation_pending"] = bool(data.get("relay_previous_token_hash")) and not _timestamp_is_past(
+        data.get("relay_previous_token_expires_at")
+    )
     if not data["enabled"]:
         data["status"] = "disabled"
     elif data["connection_mode"] == "relay":
@@ -3567,6 +3847,10 @@ def _normalize_probe_runner(row: sqlite3.Row) -> dict[str, Any]:
     data.pop("installed_browser_types_json", None)
     data.pop("available_browser_types_json", None)
     data.pop("relay_token_hash", None)
+    data.pop("relay_previous_token_hash", None)
+    data.pop("relay_previous_token_hint", None)
+    data.pop("relay_previous_token_version", None)
+    data.pop("relay_previous_token_expires_at", None)
     return data
 
 
@@ -3676,6 +3960,28 @@ def _timestamp_is_fresh(value: Any, timeout_seconds: int) -> bool:
     return age.total_seconds() <= timeout_seconds
 
 
+def _timestamp_is_past(value: Any) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return False
+    return parsed < datetime.now(parsed.tzinfo)
+
+
+def _previous_relay_token_matches(row: sqlite3.Row, token_hash_value: str, version: int) -> bool:
+    previous_hash = str(row["relay_previous_token_hash"] or "")
+    previous_version = int(row["relay_previous_token_version"] or 0)
+    if not previous_hash or previous_version <= 0:
+        return False
+    if _timestamp_is_past(row["relay_previous_token_expires_at"]):
+        return False
+    return int(version or 0) == previous_version and secrets.compare_digest(previous_hash, token_hash_value)
+
+
+def _relay_token_rotation_pending(row: sqlite3.Row) -> bool:
+    return bool(str(row["relay_previous_token_hash"] or "")) and not _timestamp_is_past(row["relay_previous_token_expires_at"])
+
+
 def _allocate_relay_internal_port(conn: sqlite3.Connection) -> int:
     now = datetime.now().astimezone()
     cutoff = (now - timedelta(seconds=RELAY_PORT_QUARANTINE_SECONDS)).isoformat(timespec="seconds")
@@ -3702,6 +4008,39 @@ def _expire_probe_runner_provisions(conn: sqlite3.Connection) -> None:
           AND status IN ('pending_deployment', 'connecting')
           AND deploy_command_expires_at IS NOT NULL
           AND deploy_command_expires_at < ?
+        """,
+        (timestamp, timestamp),
+    )
+    conn.execute(
+        """
+        UPDATE probe_runners
+        SET relay_token_hash = CASE
+                WHEN relay_previous_token_hash <> '' THEN ''
+                ELSE relay_token_hash
+            END,
+            relay_token_hint = CASE
+                WHEN relay_previous_token_hash <> '' THEN ''
+                ELSE relay_token_hint
+            END,
+            relay_token_version = CASE
+                WHEN relay_previous_token_hash <> '' THEN 0
+                ELSE relay_token_version
+            END,
+            status = CASE
+                WHEN relay_previous_token_hash <> '' THEN 'expired'
+                ELSE status
+            END,
+            last_disconnect_reason = CASE
+                WHEN relay_previous_token_hash <> '' THEN 'relay token rotation expired'
+                ELSE last_disconnect_reason
+            END,
+            relay_previous_token_hash = '',
+            relay_previous_token_hint = '',
+            relay_previous_token_version = 0,
+            relay_previous_token_expires_at = NULL,
+            updated_at = ?
+        WHERE relay_previous_token_expires_at IS NOT NULL
+          AND relay_previous_token_expires_at < ?
         """,
         (timestamp, timestamp),
     )

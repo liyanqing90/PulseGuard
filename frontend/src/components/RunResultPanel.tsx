@@ -210,6 +210,7 @@ export function RunResultPanel({ run, mode = "detail", showGroupResults = true, 
             </Descriptions.Item>
           ))}
           {!compactNodeDetail && Boolean(run.consecutive_failures) && <Descriptions.Item label="连续失败">{run.consecutive_failures}</Descriptions.Item>}
+          {!compactNodeDetail && Boolean(run.deduplicated_count) && <Descriptions.Item label="同错压缩">{run.deduplicated_count} 条</Descriptions.Item>}
           {hasFailureKind(run.failure_kind) && <Descriptions.Item label="失败来源">{failureKindTag(run.failure_kind)}</Descriptions.Item>}
           <Descriptions.Item label="执行节点">{runnerSummary(run)}</Descriptions.Item>
           {!compactNodeDetail && <Descriptions.Item label="节点 ID">{run.runner_id || "local"}</Descriptions.Item>}

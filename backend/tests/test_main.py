@@ -598,6 +598,9 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertNotIn("codex/github-publish", payload["deployment"]["command"])
         self.assertIn("pgrl_relay-token", payload["deployment"]["command"])
         self.assertIn("pgrn_worker-token", payload["deployment"]["command"])
+        self.assertIn("COMPOSE_PROFILES='updater'", payload["deployment"]["command"])
+        self.assertIn("PULSEGUARD_WORKER_UPDATER_URL='http://pulseguard-worker-updater:8790'", payload["deployment"]["command"])
+        self.assertIn("pulseguard-worker-updater", payload["deployment"]["command"])
         self.assertNotIn("relay_token", payload)
         self.assertNotIn("worker_token", payload)
         provision_probe_runner.assert_called_once()
@@ -665,9 +668,9 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(payload["deployment"]["compose_url"], "https://deploy.example.com/custom-relay-worker.yml")
         self.assertIn("https://deploy.example.com/custom-relay-worker.yml", payload["deployment"]["command"])
         self.assertNotIn("codex/github-publish", payload["deployment"]["command"])
-        revoke_relay_session.assert_called_once_with("edge-1", "deployment command regenerated")
+        revoke_relay_session.assert_not_called()
 
-    def test_regenerate_runner_provision_succeeds_when_relay_control_is_unreachable(self) -> None:
+    def test_regenerate_runner_provision_does_not_revoke_existing_relay_session(self) -> None:
         runner = {
             "runner_id": "edge-1",
             "name": "Edge Runner",
@@ -686,25 +689,13 @@ class RunnerRouteTests(unittest.TestCase):
             "deploy_command_expires_at": "2026-06-19T00:00:00+08:00",
         }
 
-        class FailingClient:
-            def __enter__(self) -> "FailingClient":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def post(self, *args: object, **kwargs: object) -> object:
-                raise main_module.httpx.ConnectError("relay control down")
-
         with patch("backend.app.main.RELAY_ENABLED", True), patch(
             "backend.app.main.RELAY_CONTROL_URL", "http://pulseguard-relay:18000"
         ), patch("backend.app.main.RELAY_PUBLIC_HOST", "203.0.113.10"), patch(
             "backend.app.main.RELAY_PUBLIC_PORT", 9443
         ), patch("backend.app.main.relay_fingerprint", return_value="abc" * 21 + "a"), patch(
             "backend.app.main.relay_control_token", return_value="pgrc_secret"
-        ), patch(
-            "backend.app.main.httpx.Client", return_value=FailingClient()
-        ), patch(
+        ), patch("backend.app.main.httpx.Client") as httpx_client, patch(
             "backend.app.main.storage.regenerate_probe_runner_provision", return_value=runner
         ), patch(
             "backend.app.main.storage.record_audit_event"
@@ -724,6 +715,7 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["relay_token_version"], 2)
         self.assertEqual(record_audit_event.call_args.args[5], {"relay_control_revoked": False})
+        httpx_client.assert_not_called()
 
     def test_update_child_runner_normalizes_bare_address(self) -> None:
         current = {"runner_id": "office-1", "name": "Office Runner", "role": "child"}

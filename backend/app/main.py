@@ -367,14 +367,13 @@ def regenerate_runner_provision(runner_id: str, payload: RunnerProvisionRequest,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not runner:
         raise HTTPException(status_code=404, detail="Runner 不存在")
-    revoked = _revoke_relay_session(runner_id, "deployment command regenerated")
     storage.record_audit_event(
         "updated",
         "runner",
         runner.get("runner_id"),
         runner.get("name", ""),
         "重新生成 relay 子节点部署命令",
-        {"relay_control_revoked": revoked},
+        {"relay_control_revoked": False},
     )
     return _runner_provision_response(runner, status, payload.target_platform, payload.compose_url)
 
@@ -1267,6 +1266,8 @@ def _runner_deploy_command(runner: dict[str, Any], relay_status: dict[str, Any],
         "PULSEGUARD_RELAY_TOKEN": runner.get("relay_token"),
         "PULSEGUARD_RELAY_TOKEN_VERSION": runner.get("relay_token_version") or 1,
         "COMPOSE_PROJECT_NAME": "pulseguard-worker",
+        "COMPOSE_PROFILES": "updater",
+        "PULSEGUARD_WORKER_UPDATER_URL": "http://pulseguard-worker-updater:8790",
     }
     if target_platform == "powershell":
         lines = [
@@ -1275,7 +1276,7 @@ def _runner_deploy_command(runner: dict[str, Any], relay_status: dict[str, Any],
             *[f"$env:{key} = {_ps_quote(value)}" for key, value in env.items()],
             "docker compose -f docker-compose.relay-worker.yml pull",
             "docker compose -f docker-compose.relay-worker.yml up -d",
-            "docker update --restart unless-stopped pulseguard-worker pulseguard-relay-client",
+            "docker update --restart unless-stopped pulseguard-worker pulseguard-relay-client pulseguard-worker-updater",
             "docker logs --tail 80 pulseguard-relay-client",
         ]
         return "\n".join(lines)
@@ -1285,7 +1286,7 @@ def _runner_deploy_command(runner: dict[str, Any], relay_status: dict[str, Any],
         *[f"export {key}={_shell_quote(value)}" for key, value in env.items()],
         "docker compose -f docker-compose.relay-worker.yml pull",
         "docker compose -f docker-compose.relay-worker.yml up -d",
-        "docker update --restart unless-stopped pulseguard-worker pulseguard-relay-client",
+        "docker update --restart unless-stopped pulseguard-worker pulseguard-relay-client pulseguard-worker-updater",
         "docker logs --tail 80 pulseguard-relay-client",
     ]
     return "\n".join(lines)
@@ -1659,6 +1660,15 @@ async def validation_exception_handler(_: Request, exc: ValidationError) -> JSON
 @app.exception_handler(sqlite3.OperationalError)
 async def sqlite_operational_error_handler(_: Request, exc: sqlite3.OperationalError) -> JSONResponse:
     message = str(exc).lower()
+    asyncio.create_task(
+        notifier.notify_system_error(
+            {
+                "source": "sqlite",
+                "severity": "error",
+                "message": str(exc) or exc.__class__.__name__,
+            }
+        )
+    )
     if "locked" in message:
         detail = "数据库暂时被占用，请稍后重试"
     elif "unable to open" in message:

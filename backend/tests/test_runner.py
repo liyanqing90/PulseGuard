@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
-from backend.app.runner import CheckRunner, RunFailure, RunnerEnvironmentFailure, _TASK_DURATION_ATTR
+from backend.app.runner import BrowserRunTarget, CheckRunner, RunFailure, RunnerEnvironmentFailure, _TASK_DURATION_ATTR
 
 
 class DraftRunnerTests(unittest.TestCase):
@@ -414,6 +414,8 @@ class DraftRunnerTests(unittest.TestCase):
         ) as update_check_status, patch(
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
         ) as maybe_notify, patch(
+            "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+        ) as notify_system_error, patch(
             "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RunnerEnvironmentFailure("browser failed")
         ):
             runner = CheckRunner()
@@ -427,6 +429,64 @@ class DraftRunnerTests(unittest.TestCase):
         discard_incomplete_run.assert_called_once_with(180)
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
+        notify_system_error.assert_awaited_once()
+
+    def test_playwright_target_crash_is_system_alert_not_run_failure(self) -> None:
+        check = {
+            "id": 19,
+            "name": "浏览器崩溃",
+            "type": "ui",
+            "enabled": True,
+            "interval_seconds": 300,
+            "timeout_ms": 10000,
+            "entry_url": "https://example.com",
+            "method": "",
+            "headers_json": "{}",
+            "body": "",
+            "assertions_json": '[{"type":"title_contains","expected_text":"Example"}]',
+            "script": "",
+            "tags": "",
+        }
+        settings = {
+            "max_task_runtime_seconds": 60,
+            "browser_type": "chromium",
+            "browser_headless": True,
+            "local_runner_name": "office-runner",
+            "local_runner_address": "10.0.0.8",
+            "local_runner_region": "office-lan",
+        }
+        created_run = {"id": 181, "status": "running"}
+
+        with patch.object(CheckRunner, "_max_concurrency", return_value=2), patch(
+            "backend.app.runner.storage.get_settings",
+            return_value=settings,
+        ), patch("backend.app.runner.storage.get_check", return_value=check), patch(
+            "backend.app.runner.storage.create_run", return_value=created_run
+        ), patch(
+            "backend.app.runner.storage.finish_run"
+        ) as finish_run, patch(
+            "backend.app.runner.storage.discard_incomplete_run", return_value=True
+        ) as discard_incomplete_run, patch(
+            "backend.app.runner.storage.update_check_status"
+        ) as update_check_status, patch(
+            "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
+        ) as maybe_notify, patch(
+            "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+        ) as notify_system_error, patch(
+            "backend.app.runner.run_structured_ui_check", new_callable=AsyncMock, side_effect=RuntimeError("Page.title: Target crashed")
+        ):
+            runner = CheckRunner()
+            result = asyncio.run(runner.run_check(19))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "runner")
+        self.assertFalse(result["affects_health"])
+        self.assertEqual(result["observation_kind"], "runner")
+        finish_run.assert_not_called()
+        discard_incomplete_run.assert_called_once_with(181)
+        update_check_status.assert_not_called()
+        maybe_notify.assert_not_called()
+        notify_system_error.assert_awaited_once()
 
     def test_structured_ui_check_runs_without_loading_user_script(self) -> None:
         check = {
@@ -610,6 +670,228 @@ class RunnerQueueTests(unittest.TestCase):
         skipped = next(result for result in results if result["status"] == "skipped")
         self.assertIn("执行队列已满", str(skipped["error_message"]))
 
+    def test_job_watchdog_timeout_releases_same_check_slot(self) -> None:
+        async def scenario() -> tuple[
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            int,
+            int,
+        ]:
+            execute_calls = 0
+
+            async def execute(
+                check: dict[str, object],
+                trigger: str,
+                run_id: int,
+                record_status: bool = True,
+                notify: bool = True,
+                runner_metadata: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                nonlocal execute_calls
+                execute_calls += 1
+                if execute_calls == 1:
+                    await asyncio.Event().wait()
+                return {"id": run_id, "check_id": check["id"], "status": "ok", "trigger": trigger}
+
+            def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+                return {"id": run_id, "check_id": 1, **data}
+
+            with runner_patches(max_concurrency=1, max_queue_size=1), patch(
+                "backend.app.runner.storage.finish_run", side_effect=finish_run
+            ), patch("backend.app.runner.storage.get_run", return_value=None), patch(
+                "backend.app.runner.storage.update_run_notification"
+            ) as update_run_notification, patch(
+                "backend.app.runner.storage.update_check_status"
+            ) as update_check_status, patch(
+                "backend.app.runner.storage.discard_incomplete_run", return_value=True
+            ) as discard_incomplete_run, patch(
+                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            ) as notify_system_error:
+                runner = CheckRunner()
+                runner._execute = execute  # type: ignore[method-assign]
+                with patch.object(runner, "_job_timeout_seconds", return_value=0.05):
+                    first = await runner.run_check(1)
+                    after_timeout = runner.runtime_status()
+                    second = await runner.run_check(1)
+                    after_second = runner.runtime_status()
+                await runner.shutdown()
+                return (
+                    first,
+                    second,
+                    after_timeout,
+                    after_second,
+                    update_run_notification.call_count,
+                    update_check_status.call_count,
+                    discard_incomplete_run.call_count,
+                    notify_system_error.await_count,
+                )
+
+        first, second, after_timeout, after_second, notification_count, status_update_count, discard_count, system_alert_count = asyncio.run(
+            scenario()
+        )
+
+        self.assertEqual(first["status"], "timeout")
+        self.assertEqual(first["failure_kind"], "runner")
+        self.assertFalse(first["affects_health"])
+        self.assertIn("单任务总时长限制", str(first["error_message"]))
+        self.assertEqual(after_timeout["active_checks"], 0)
+        self.assertEqual(after_timeout["workers"]["running"], 0)
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(after_second["active_checks"], 0)
+        self.assertEqual(notification_count, 0)
+        self.assertEqual(status_update_count, 0)
+        self.assertEqual(discard_count, 1)
+        self.assertEqual(system_alert_count, 1)
+
+    def test_job_watchdog_does_not_count_queue_wait_time(self) -> None:
+        async def scenario() -> tuple[list[dict[str, object]], list[int], int]:
+            started_ids: list[int] = []
+            first_started = asyncio.Event()
+
+            async def execute(
+                check: dict[str, object],
+                trigger: str,
+                run_id: int,
+                record_status: bool = True,
+                notify: bool = True,
+                runner_metadata: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                check_id = int(check["id"])
+                started_ids.append(check_id)
+                if check_id == 1:
+                    first_started.set()
+                    await asyncio.sleep(0.08)
+                return {"id": run_id, "check_id": check_id, "status": "ok", "trigger": trigger}
+
+            with runner_patches(max_concurrency=1, max_queue_size=1), patch(
+                "backend.app.runner.storage.get_run", return_value=None
+            ), patch(
+                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            ) as notify_system_error:
+                runner = CheckRunner()
+                runner._execute = execute  # type: ignore[method-assign]
+
+                def timeout_for(check: dict[str, object], _settings: dict[str, object]) -> float:
+                    return 1.0 if int(check["id"]) == 1 else 0.05
+
+                with patch.object(runner, "_job_timeout_seconds", side_effect=timeout_for):
+                    first = asyncio.create_task(runner.run_check(1))
+                    await first_started.wait()
+                    second = asyncio.create_task(runner.run_check(2))
+                    results = [await first, await second]
+                await runner.shutdown()
+                return results, started_ids, notify_system_error.await_count
+
+        results, started_ids, system_alert_count = asyncio.run(scenario())
+
+        self.assertEqual([result["status"] for result in results], ["ok", "ok"])
+        self.assertEqual(started_ids, [1, 2])
+        self.assertEqual(system_alert_count, 0)
+
+    def test_job_watchdog_does_not_overwrite_completed_run(self) -> None:
+        async def scenario() -> tuple[dict[str, object], int, dict[str, object]]:
+            completed_run: dict[str, object] = {}
+            finish_run_mock: Mock | None = None
+
+            async def execute(
+                check: dict[str, object],
+                trigger: str,
+                run_id: int,
+                record_status: bool = True,
+                notify: bool = True,
+                runner_metadata: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                if finish_run_mock is None:
+                    raise AssertionError("finish_run mock is not ready")
+                finish_run_mock(
+                    run_id,
+                    {
+                        "status": "failed",
+                        "failure_kind": "target",
+                        "affects_health": True,
+                        "error_message": "target failed before notifier",
+                    },
+                )
+                await asyncio.Event().wait()
+                return {"id": run_id, "check_id": check["id"], "status": "ok", "trigger": trigger}
+
+            def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
+                completed_run.clear()
+                completed_run.update({"id": run_id, "check_id": 1, **data})
+                return dict(completed_run)
+
+            def get_run(_run_id: int) -> dict[str, object] | None:
+                return dict(completed_run) if completed_run else None
+
+            with runner_patches(max_concurrency=1, max_queue_size=1), patch(
+                "backend.app.runner.storage.finish_run", side_effect=finish_run
+            ) as patched_finish_run, patch(
+                "backend.app.runner.storage.get_run", side_effect=get_run
+            ), patch(
+                "backend.app.runner.storage.update_run_notification"
+            ), patch(
+                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            ) as notify_system_error:
+                finish_run_mock = patched_finish_run
+                runner = CheckRunner()
+                runner._execute = execute  # type: ignore[method-assign]
+                with patch.object(runner, "_job_timeout_seconds", return_value=0.05):
+                    result = await runner.run_check(1)
+                    after_timeout = runner.runtime_status()
+                await runner.shutdown()
+                return result, patched_finish_run.call_count, after_timeout, notify_system_error.await_count
+
+        result, finish_run_count, after_timeout, system_alert_count = asyncio.run(scenario())
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "target")
+        self.assertEqual(result["error_message"], "target failed before notifier")
+        self.assertEqual(finish_run_count, 1)
+        self.assertEqual(after_timeout["active_checks"], 0)
+        self.assertEqual(system_alert_count, 1)
+
+    def test_job_watchdog_returns_when_timeout_record_cannot_be_written(self) -> None:
+        async def scenario() -> tuple[dict[str, object], dict[str, object]]:
+            async def execute(
+                check: dict[str, object],
+                trigger: str,
+                run_id: int,
+                record_status: bool = True,
+                notify: bool = True,
+                runner_metadata: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                await asyncio.Event().wait()
+                return {"id": run_id, "check_id": check["id"], "status": "ok", "trigger": trigger}
+
+            with runner_patches(max_concurrency=1, max_queue_size=1), patch(
+                "backend.app.runner.storage.finish_run", side_effect=OSError("disk I/O error")
+            ), patch("backend.app.runner.storage.get_run", return_value=None), patch(
+                "backend.app.runner.storage.update_run_notification"
+            ), patch(
+                "backend.app.runner.storage.discard_incomplete_run", return_value=True
+            ) as discard_incomplete_run, patch(
+                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            ) as notify_system_error:
+                runner = CheckRunner()
+                runner._execute = execute  # type: ignore[method-assign]
+                with patch.object(runner, "_job_timeout_seconds", return_value=0.05):
+                    result = await asyncio.wait_for(runner.run_check(1), timeout=1.0)
+                    after_timeout = runner.runtime_status()
+                await runner.shutdown()
+                return result, after_timeout, discard_incomplete_run.call_count, notify_system_error.await_count
+
+        result, after_timeout, discard_count, system_alert_count = asyncio.run(scenario())
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["failure_kind"], "runner")
+        self.assertFalse(result["affects_health"])
+        self.assertIn("单任务总时长限制", str(result["error_message"]))
+        self.assertEqual(after_timeout["active_checks"], 0)
+        self.assertEqual(discard_count, 1)
+        self.assertEqual(system_alert_count, 1)
+
     def test_ui_jobs_are_capped_independently_from_global_concurrency(self) -> None:
         active_ui = 0
         max_active_ui = 0
@@ -656,6 +938,7 @@ class DistributedRunnerTests(unittest.TestCase):
             "enabled_browser_types": ["chromium", "firefox"],
             "prewarmed_browser_types": ["chromium"],
             "browser_pool_sizes": {"chromium": 3, "firefox": 1, "webkit": 1},
+            "browser_recycle_after_runs": 12,
             "browser_proxy": "",
             "browser_viewport": "1440x900",
             "success_response_artifacts_enabled": True,
@@ -669,6 +952,7 @@ class DistributedRunnerTests(unittest.TestCase):
 
         self.assertEqual(payload["prewarmed_browser_types"], ["chromium"])
         self.assertEqual(payload["browser_pool_sizes"]["chromium"], 3)
+        self.assertEqual(payload["browser_recycle_after_runs"], 12)
         self.assertEqual(payload["api_pool_size"], 4)
 
     def test_worker_run_reloads_resource_pool_from_main_settings(self) -> None:
@@ -848,7 +1132,9 @@ class DistributedRunnerTests(unittest.TestCase):
             "backend.app.runner.storage.get_probe_runner", return_value=local_runner
         ), patch(
             "backend.app.runner.notifier.maybe_notify", new_callable=AsyncMock
-        ) as maybe_notify, patch.object(
+        ) as maybe_notify, patch(
+            "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+        ) as notify_system_error, patch.object(
             CheckRunner, "_execute", new_callable=AsyncMock, side_effect=AssertionError("disabled local runner should not execute")
         ) as execute:
             result = asyncio.run(CheckRunner().run_check(31, trigger="manual"))
@@ -859,11 +1145,71 @@ class DistributedRunnerTests(unittest.TestCase):
         execute.assert_not_awaited()
         created_payload = create_run.call_args.args[0]
         self.assertFalse(created_payload["_run"]["affects_health"])
-        finish_run_mock.assert_called_once()
-        discard_incomplete_run.assert_not_called()
-        update_run_notification.assert_called_once_with(310, "not_required", channel=None, error=None, sent_at=None)
+        finish_run_mock.assert_not_called()
+        discard_incomplete_run.assert_called_once_with(310)
+        update_run_notification.assert_not_called()
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
+        notify_system_error.assert_awaited_once()
+
+    def test_local_distributed_runner_system_failure_sends_system_alert(self) -> None:
+        async def scenario() -> tuple[dict[str, object], int]:
+            check = {"id": 32, "name": "Local distributed", "type": "api"}
+            target = BrowserRunTarget(
+                runner={
+                    "runner_id": "local",
+                    "name": "local",
+                    "address": "127.0.0.1",
+                    "network_region": "local",
+                    "available": True,
+                    "enabled": True,
+                    "role": "local",
+                },
+                browser_type="",
+            )
+            settings = {
+                "max_task_runtime_seconds": 60,
+                "browser_type": "chromium",
+                "browser_headless": True,
+            }
+            system_payload = {
+                "status": "failed",
+                "finished_at": "2026-01-01T00:00:01+08:00",
+                "duration_ms": 0,
+                "error_message": "Page.title: Target crashed",
+                "error_stack": None,
+                "logs": "Page.title: Target crashed",
+                "screenshot_path": None,
+                "trace_path": None,
+                "response_path": None,
+                "request_snapshot": None,
+                "response_snapshot": None,
+                "failure_kind": "runner",
+                "affects_health": False,
+            }
+
+            with patch("backend.app.runner.storage.get_settings", return_value=settings), patch(
+                "backend.app.runner.storage.create_run", return_value={"id": 320, "check_id": 32, "status": "pending"}
+            ), patch("backend.app.runner.storage.start_run"), patch(
+                "backend.app.runner.storage.discard_incomplete_run", return_value=True
+            ), patch.object(
+                CheckRunner,
+                "_execute_core",
+                new_callable=AsyncMock,
+                return_value=system_payload,
+            ), patch(
+                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            ) as notify_system_error:
+                result = await CheckRunner()._dispatch_runner(check, target, "manual", "rg-local", capacity_managed=True)
+                return result, notify_system_error.await_count
+
+        result, system_alert_count = asyncio.run(scenario())
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "runner")
+        self.assertFalse(result["affects_health"])
+        self.assertEqual(result["observation_kind"], "runner")
+        self.assertEqual(system_alert_count, 1)
 
     def test_runner_only_distributed_group_does_not_update_target_health(self) -> None:
         check = {"id": 32, "name": "Runner only", "type": "api"}

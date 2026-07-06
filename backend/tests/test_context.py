@@ -59,6 +59,26 @@ class RunContextViewportTests(unittest.TestCase):
 
         self.assertEqual(options, {"viewport": {"width": 1366, "height": 768}})
 
+    def test_trace_artifacts_are_disabled_by_default_and_configurable(self) -> None:
+        base_check = {
+            "name": "UI",
+            "type": "ui",
+            "entry_url": "https://example.com",
+            "viewport_mode": "web",
+            "method": "",
+            "headers_json": "{}",
+            "body": "",
+            "timeout_ms": 15000,
+        }
+        disabled = RunContext(base_check, 1, {}, artifacts=None)  # type: ignore[arg-type]
+        enabled = RunContext(base_check, 2, {"trace_artifacts_enabled": True}, artifacts=None)  # type: ignore[arg-type]
+        try:
+            self.assertFalse(disabled.trace_artifacts_enabled)
+            self.assertTrue(enabled.trace_artifacts_enabled)
+        finally:
+            asyncio.run(disabled.close(False))
+            asyncio.run(enabled.close(False))
+
 
 class RunContextVariableTests(unittest.TestCase):
     def test_resolves_placeholders_for_entry_url_headers_and_body(self) -> None:

@@ -241,6 +241,7 @@ SETTING_RANGES: dict[str, tuple[int, int]] = {
     "max_queue_size": (1, 1000),
     "api_pool_size": (1, 20),
     "browser_pool_size": (1, 5),
+    "browser_recycle_after_runs": (1, 1000),
     "max_task_runtime_seconds": (1, 600),
     "alert_cooldown_minutes": (1, 1440),
     "alert_delivery_attempts": (1, 5),
@@ -254,6 +255,7 @@ SETTING_RANGES: dict[str, tuple[int, int]] = {
     "screenshot_retention_days": (1, 365),
     "trace_retention_days": (1, 365),
     "response_retention_days": (1, 365),
+    "similar_failure_retention_count": (1, 100),
     "database_backup_retention": (1, 30),
 }
 
@@ -277,8 +279,12 @@ SETTING_LABELS = {
     "screenshot_retention_days": "截图保留",
     "trace_retention_days": "Trace 保留",
     "response_retention_days": "Response Body 保留",
+    "similar_failure_retention_count": "同错失败保留",
     "alerts_enabled": "启用告警",
+    "system_alerts_enabled": "启用系统告警",
     "notification_channels": "通知渠道",
+    "execution_notification_channel_ids": "执行告警渠道",
+    "system_notification_channel_ids": "系统告警渠道",
     "members": "成员",
     "member_name": "成员名称",
     "member_ids": "关联成员",
@@ -299,6 +305,7 @@ SETTING_LABELS = {
     "browser_headless": "Headless",
     "webhook_type": "通知渠道类型",
     "browser_type": "浏览器类型",
+    "browser_recycle_after_runs": "浏览器回收周期",
     "webhook_url": "Webhook URL",
     "browser_proxy": "浏览器代理",
     "browser_viewport": "浏览器 Viewport",
@@ -320,10 +327,12 @@ SETTING_LABELS = {
 
 BOOLEAN_SETTINGS = {
     "alerts_enabled",
+    "system_alerts_enabled",
     "recovery_notification",
     "browser_headless",
     "maintenance_enabled",
     "success_response_artifacts_enabled",
+    "trace_artifacts_enabled",
 }
 
 WEBHOOK_TYPES = {"feishu", "wecom", "dingtalk"}
@@ -339,6 +348,8 @@ def normalize_settings_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = _coerce_bool(key, value)
         elif key == "notification_channels":
             normalized[key] = _notification_channels(value)
+        elif key in {"execution_notification_channel_ids", "system_notification_channel_ids"}:
+            normalized[key] = _string_list(key, value, max_length=80)
         elif key == "members":
             normalized[key] = _members(value)
         elif key == "alert_tag_policies":

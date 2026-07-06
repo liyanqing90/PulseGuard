@@ -18,11 +18,11 @@ PulseGuard is not a SaaS product, public status page, full E2E test management p
 - UI setup scripts: scan, draft debug, and formal runs all execute `setup_script` first to prepare login state, page prerequisites, and business context.
 - Rule maintenance: UI selector stability hints, rule invalidation checks, API response field preview, and one-click basic assertion generation.
 - Batch operations: run, enable, disable, and reschedule tasks by type, tag, and enabled state, with matched counts to prevent accidental bulk actions.
-- Run history: status, duration, error summary, screenshots, Trace, Response Body, recent-success comparison, and failure summary.
+- Run history: status, duration, error summary, screenshots, optional Trace, Response Body, recent-success comparison, and failure summary.
 - Monitoring trends: a dedicated trends page for overall UI/API and paginated task cards, with 24-hour, 7-day, 30-day, custom range, average latency, P95, P99, and failure counts.
 - Runner tracking: local Runner name, address, network zone, browser version, Runner heartbeat, and Runner status list.
 - Failure attribution: separates target failures from Runner execution environment failures.
-- Alert policies: global, tag-level, and task-level alert policies with cooldown, recovery notification, and notification channel controls.
+- Alert policies: execution alerts and system alerts use separate channel selections. Execution alerts support global, tag-level, and task-level policies with cooldown, recovery notification, and notification channel controls.
 - Operations audit: records task changes, settings changes, batch operations, config import, and version restoration.
 - Task versions: stores task definition snapshots and supports viewing and restoring historical versions.
 - Internal status page: shows sanitized task status, recent incidents, run metrics, and maintenance announcements.
@@ -37,7 +37,8 @@ PulseGuard is not a SaaS product, public status page, full E2E test management p
 - The monitoring trends page supports overall UI/API cards, paginated task cards, a detail drawer, per-card dimensions, and 24-hour, 7-day, 30-day, custom range, and daily-hour filters.
 - Trend rollups are written incrementally from new runs into `trend_rollups`; historical trend backfill is not required on startup and is disabled by default.
 - Relay onboarding can generate and regenerate child-runner deployment commands. Workers connect outbound to the main relay and do not need to expose inbound `8788`.
-- Child runners report version, build SHA, current image, and browser-type installation status. With the updater profile enabled, the main node can request controlled worker updates.
+- Child runners report version, build SHA, current image, and browser-type installation status. Standard deployment commands enable the updater profile by default so the main node can request controlled worker updates.
+- Browser crashes, missing browser dependencies, unavailable runners, distributed runner system failures, SQLite operational errors, and hard task-runtime timeouts are routed to system alerts instead of being stored as ordinary target-failure run records.
 
 ## Tech Stack
 
@@ -110,6 +111,9 @@ UI tasks support the Playwright browser types `chromium`, `firefox`, and `webkit
 - `enabled_browser_types`: browser types that tasks are allowed to select and run.
 - `prewarmed_browser_types`: browser types that are warmed automatically on backend startup or settings reload. They must also be enabled and may be empty.
 - `browser_pool_sizes`: the empty `BrowserContext` reserve size for each browser type. Each type defaults to 5.
+- `browser_recycle_after_runs`: how many UI contexts a warmed browser can complete before it is recycled. The default is 20. Failure screenshots are still written to `reports/` before recycling; Trace is recorded only when enabled in system settings, and recycling releases Playwright temporary resources under `/tmp/playwright-artifacts-*`.
+- `similar_failure_retention_count`: when the same task keeps failing or timing out with the same error, detailed run records use a rolling window. The default keeps the latest 10 records and deletes artifacts attached to older compacted records.
+- `trace_artifacts_enabled`: whether failed UI runs record Playwright Trace zip files. The default is off. Failure screenshots and available Response Body evidence remain available when Trace is off.
 
 Each prewarmed browser type keeps one Playwright browser process alive and pre-creates empty `BrowserContext` instances according to that type's pool size. Each UI task leases one exclusive context/page. When the task ends, only that context is closed; the browser process stays alive and the pool refills an empty context. Web and H5 sizing are separated by context options, so different viewport tasks can run concurrently under the same browser process.
 
@@ -195,7 +199,7 @@ Structured UI/API assertions do not require an advanced script. Complex login, m
 
 - SQLite is the default persistence layer. The database file lives in `data/`.
 - Trend data is stored in the SQLite `trend_rollups` table with latency histograms and summary metrics. New runs write trends automatically. Historical trend backfill is disabled by default; if old data must be backfilled, start once with `PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true`.
-- Screenshots, Trace files, Response Body artifacts, and archived summaries live in `reports/`.
+- Screenshots, enabled Trace files, Response Body artifacts, and archived summaries live in `reports/`.
 - Environment variables, webhooks, DingTalk secrets, read-only tokens, common auth headers, and cookies are redacted in public settings, run records, read-only outputs, and the status page.
 - User-defined Python probe scripts are a trusted local tool capability, not a security sandbox.
 - The internal status page only shows sanitized summaries. It does not expose scripts, headers, webhooks, environment variables, response bodies, error stacks, or Runner topology.
@@ -224,7 +228,7 @@ Structured UI/API assertions do not require an advanced script. Complex login, m
 backend/                 FastAPI backend, storage, runner, alerts, tests
 frontend/                React frontend, pages, workflow components, design styles
 data/                    SQLite data directory
-reports/                 Screenshots, Trace files, Response Body artifacts, archived summaries
+reports/                 Screenshots, enabled Trace files, Response Body artifacts, archived summaries
 docs/                    Roadmap, design, and feature documents
 Dockerfile               Production image build
 docker-compose.yml       Single-instance deployment

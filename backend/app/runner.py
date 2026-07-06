@@ -34,6 +34,14 @@ from .resource_pool import ProbeResourcePool
 from .variables import mask_data, mask_text
 
 _TASK_DURATION_ATTR = "_pulseguard_task_duration_ms"
+SYSTEM_ERROR_PATTERNS = (
+    "Target crashed",
+    "ERR_INSUFFICIENT_RESOURCES",
+    "Host system is missing dependencies",
+    "BrowserType.launch",
+    "Executable doesn't exist",
+    "browser executable",
+)
 
 
 @dataclass
@@ -435,22 +443,50 @@ class CheckRunner:
     async def _run_job(self, job: RunJob) -> None:
         result: dict[str, Any] | None = None
         try:
-            if not job.manage_capacity:
-                storage.start_run(job.run_id)
-                result = await self._execute(job.check, job.trigger, job.run_id, job.record_status, job.notify, job.runner_metadata)
-            elif self._uses_browser(job.check):
-                async with self._ui_limiter.slot():
-                    async with self._global_limiter.slot():
-                        result = await self._start_and_execute(job)
-            else:
-                async with self._global_limiter.slot():
-                    result = await self._start_and_execute(job)
+            result = await self._run_job_body(job)
+        except asyncio.TimeoutError:
+            try:
+                result = self._finish_watchdog_timeout(job)
+            except Exception as finish_exc:
+                result = self._ephemeral_job_error(
+                    job,
+                    "执行总时长超时后的状态写入失败",
+                    finish_exc,
+                    status="timeout",
+                )
+            await self._notify_system_result(
+                job.check,
+                job.trigger,
+                job.run_id,
+                result,
+                self._settings_for_system_alert(),
+                source="watchdog",
+            )
         except asyncio.CancelledError:
             result = self._finish_cancelled_job(job)
         except Exception as exc:
             result = self._finish_internal_error(job, exc)
+            await self._notify_system_result(
+                job.check,
+                job.trigger,
+                job.run_id,
+                result,
+                self._settings_for_system_alert(),
+                source="runner",
+            )
         finally:
             await self._complete_job(job, result)
+
+    async def _run_job_body(self, job: RunJob) -> dict[str, Any]:
+        if not job.manage_capacity:
+            storage.start_run(job.run_id)
+            return await self._execute_started_job(job)
+        if self._uses_browser(job.check):
+            async with self._ui_limiter.slot():
+                async with self._global_limiter.slot():
+                    return await self._start_and_execute(job)
+        async with self._global_limiter.slot():
+            return await self._start_and_execute(job)
 
     async def _start_and_execute(self, job: RunJob) -> dict[str, Any]:
         async with self._lock:
@@ -458,7 +494,20 @@ class CheckRunner:
             self._queued_jobs = max(0, self._queued_jobs - 1)
             self._running_jobs += 1
         storage.start_run(job.run_id)
-        return await self._execute(job.check, job.trigger, job.run_id, job.record_status, job.notify, job.runner_metadata)
+        return await self._execute_started_job(job)
+
+    async def _execute_started_job(self, job: RunJob) -> dict[str, Any]:
+        return await asyncio.wait_for(
+            self._execute(
+                job.check,
+                job.trigger,
+                job.run_id,
+                job.record_status,
+                job.notify,
+                job.runner_metadata,
+            ),
+            timeout=self._job_timeout_seconds(job.check, storage.get_settings()),
+        )
 
     async def _complete_job(self, job: RunJob, result: dict[str, Any] | None) -> None:
         check_id = int(job.check.get("id") or 0)
@@ -471,7 +520,10 @@ class CheckRunner:
             if job.manage_active and check_id > 0:
                 self._active_checks.discard(check_id)
         if result is None:
-            result = storage.get_run(job.run_id) or {}
+            try:
+                result = storage.get_run(job.run_id) or {}
+            except Exception as exc:
+                result = self._ephemeral_job_error(job, "执行器完成状态读取失败", exc)
         if not job.future.done():
             job.future.set_result(result)
 
@@ -499,7 +551,10 @@ class CheckRunner:
             )
         if self._is_runner_system_result(result_data):
             storage.discard_incomplete_run(run_id)
-            return self._ephemeral_runner_result(check, trigger, run_id, result_data)
+            result = self._ephemeral_runner_result(check, trigger, run_id, result_data)
+            if notify:
+                await self._notify_system_result(check, trigger, run_id, result, settings, source="runner")
+            return result
         finished_run = storage.finish_run(run_id, result_data)
 
         if finished_run is None:
@@ -545,14 +600,8 @@ class CheckRunner:
                 error_message = None
                 error_stack = None
                 failure_kind = "none"
-            except asyncio.CancelledError as exc:
-                if self._suppress_shutdown_records:
-                    raise
-                duration_ms = self._task_duration_from_exception(exc)
-                status = "skipped"
-                error_message = "执行被取消，可能是服务关闭或运行设置刷新"
-                error_stack = None
-                failure_kind = "runner"
+            except asyncio.CancelledError:
+                raise
             except asyncio.TimeoutError as exc:
                 duration_ms = self._task_duration_from_exception(exc)
                 status = "timeout"
@@ -582,7 +631,7 @@ class CheckRunner:
                 status = "failed"
                 error_message = str(exc) or exc.__class__.__name__
                 error_stack = traceback.format_exc()
-                failure_kind = "target"
+                failure_kind = "runner" if self._is_system_exception(exc) else "target"
             finally:
                 failed = status in {"failed", "timeout"}
                 retrying = failed and failure_kind == "target" and attempt < max_attempts
@@ -590,7 +639,7 @@ class CheckRunner:
                     if retrying and error_message:
                         ctx.log(f"本次尝试失败，立即重试：{error_message}")
                     try:
-                        await ctx.close(failed and not retrying)
+                        await ctx.close(failed and not retrying and failure_kind == "target")
                     except Exception as exc:
                         if status == "ok":
                             status = "failed"
@@ -712,6 +761,54 @@ class CheckRunner:
         message = str(exc) or exc.__class__.__name__
         return self._finish_without_context(job, "failed", f"执行器内部错误：{message}", traceback.format_exc())
 
+    def _ephemeral_job_error(self, job: RunJob, message: str, exc: Exception, status: str = "failed") -> dict[str, Any]:
+        detail = str(exc).strip() or exc.__class__.__name__
+        error_message = f"{message}：{detail}"
+        finished = datetime.now().astimezone().isoformat(timespec="seconds")
+        payload = {
+            "status": status,
+            "finished_at": finished,
+            "duration_ms": 0,
+            "error_message": error_message,
+            "error_stack": traceback.format_exc(),
+            "logs": error_message,
+            "screenshot_path": None,
+            "trace_path": None,
+            "response_path": None,
+            "request_snapshot": None,
+            "response_snapshot": None,
+            **({**(job.runner_metadata or {}), "failure_kind": "runner"}),
+            "affects_health": False,
+        }
+        return self._ephemeral_runner_result(job.check, job.trigger, job.run_id, payload)
+
+    def _finish_watchdog_timeout(self, job: RunJob) -> dict[str, Any]:
+        settings = storage.get_settings()
+        timeout_seconds = self._job_timeout_seconds(job.check, settings)
+        message = f"执行超过单任务总时长限制：{int(timeout_seconds)} 秒，已强制释放调度槽"
+        safe_message = mask_text(message, settings)
+        finished = datetime.now().astimezone()
+        existing_run = storage.get_run(job.run_id)
+        if existing_run and str(existing_run.get("status") or "") not in {"pending", "running"}:
+            return existing_run
+        payload = {
+            "status": "timeout",
+            "finished_at": finished.isoformat(timespec="seconds"),
+            "duration_ms": int(timeout_seconds * 1000),
+            "error_message": safe_message,
+            "error_stack": None,
+            "logs": safe_message,
+            "screenshot_path": None,
+            "trace_path": None,
+            "response_path": None,
+            "request_snapshot": None,
+            "response_snapshot": None,
+            **({**(job.runner_metadata or self._runner_metadata(settings)), "failure_kind": "runner"}),
+            "affects_health": False,
+        }
+        storage.discard_incomplete_run(job.run_id)
+        return self._ephemeral_runner_result(job.check, job.trigger, job.run_id, payload)
+
     def _finish_without_context(
         self,
         job: RunJob,
@@ -744,6 +841,48 @@ class CheckRunner:
     def _is_runner_system_result(data: dict[str, Any]) -> bool:
         status = str(data.get("status") or "")
         return status in {"failed", "timeout", "skipped"} and str(data.get("failure_kind") or "") == "runner"
+
+    @staticmethod
+    def _is_system_exception(exc: Exception) -> bool:
+        text = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}"
+        return any(pattern in text for pattern in SYSTEM_ERROR_PATTERNS)
+
+    @staticmethod
+    def _settings_for_system_alert() -> dict[str, Any]:
+        try:
+            return storage.get_settings()
+        except Exception:
+            return {}
+
+    async def _notify_system_result(
+        self,
+        check: dict[str, Any],
+        trigger: str,
+        run_id: int,
+        result: dict[str, Any],
+        settings: dict[str, Any],
+        *,
+        source: str,
+    ) -> None:
+        try:
+            await notifier.notify_system_error(
+                {
+                    "source": source,
+                    "severity": "error",
+                    "time": result.get("finished_at") or result.get("started_at") or storage.now_iso(),
+                    "message": result.get("error_message") or result.get("logs") or "系统异常",
+                    "check_id": int(check.get("id") or 0),
+                    "check_name": str(check.get("name") or ""),
+                    "run_id": run_id,
+                    "trigger": trigger,
+                    "runner_id": result.get("runner_id"),
+                    "runner_name": result.get("runner_name"),
+                    "runner_region": result.get("runner_region"),
+                },
+                settings=settings,
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _ephemeral_runner_result(
@@ -985,13 +1124,16 @@ class CheckRunner:
                 self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
             )
-            return self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
+            unavailable = self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
+            await self._notify_system_result(check_payload, trigger, int(run["id"]), unavailable, self._settings_for_system_alert(), source="runner")
+            return unavailable
         if not runner.get("available"):
             run = storage.create_run(
                 self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
             )
             unavailable = self._finish_runner_unavailable(int(run["id"]), check, trigger, runner, "执行节点不可用")
+            await self._notify_system_result(check_payload, trigger, int(run["id"]), unavailable, self._settings_for_system_alert(), source="runner")
             await self._notify_runner_unavailable_if_needed(runner, check)
             return unavailable
         if runner_id == storage.LOCAL_RUNNER_ID:
@@ -999,7 +1141,7 @@ class CheckRunner:
                 check_payload,
                 trigger,
                 record_status=False,
-                notify=False,
+                notify=True,
                 runner_metadata=runner_payload,
                 manage_active=False,
                 manage_capacity=not capacity_managed,
@@ -1015,10 +1157,16 @@ class CheckRunner:
         except Exception as exc:
             storage.mark_probe_runner_unavailable(runner_id)
             unavailable = self._finish_runner_unavailable(run_id, check, trigger, runner, f"执行节点调用失败：{exc}")
+            await self._notify_system_result(check_payload, trigger, run_id, unavailable, self._settings_for_system_alert(), source="runner")
             latest_runner = storage.get_probe_runner(runner_id) or runner
             await self._notify_runner_unavailable_if_needed(latest_runner, check)
             return unavailable
         data = self._remote_result_to_finish_payload(result, run_id, runner)
+        if self._is_runner_system_result(data):
+            storage.discard_incomplete_run(run_id)
+            system_result = self._ephemeral_runner_result(check_payload, trigger, run_id, data)
+            await self._notify_system_result(check_payload, trigger, run_id, system_result, self._settings_for_system_alert(), source="runner")
+            return system_result
         finished = storage.finish_run(run_id, data)
         return storage.get_run(run_id) or finished or run
 
@@ -1057,13 +1205,16 @@ class CheckRunner:
         return data
 
     def _remote_runner_timeout_seconds(self, check: dict[str, Any], settings: dict[str, Any]) -> float:
+        return min(3600.0, max(30.0, self._job_timeout_seconds(check, settings)))
+
+    def _job_timeout_seconds(self, check: dict[str, Any], settings: dict[str, Any]) -> float:
         check_timeout = max(0.5, float(check.get("timeout_ms") or 15000) / 1000)
         try:
             max_runtime = max(check_timeout, float(settings.get("max_task_runtime_seconds") or 60))
         except (TypeError, ValueError):
             max_runtime = max(check_timeout, 60.0)
         attempts = self._max_attempts(check, settings)
-        return min(3600.0, max(30.0, max_runtime * attempts + 15.0))
+        return min(3600.0, max_runtime * attempts + 15.0)
 
     @staticmethod
     def _response_error_detail(response: httpx.Response) -> str:
@@ -1137,9 +1288,8 @@ class CheckRunner:
             **storage.runner_metadata(runner, failure_kind="runner", browser_type=str(check.get("_browser_type") or "")),
             "affects_health": False,
         }
-        finished = storage.finish_run(run_id, payload)
-        storage.update_run_notification(run_id, "not_required", channel=None, error=None, sent_at=None)
-        return storage.get_run(run_id) or finished or self._ephemeral_runner_result(check, trigger, run_id, payload)
+        storage.discard_incomplete_run(run_id)
+        return self._ephemeral_runner_result(check, trigger, run_id, payload)
 
     async def _finish_distributed_group(self, check: dict[str, Any], runs: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
         if not runs:
@@ -1199,8 +1349,10 @@ class CheckRunner:
             "enabled_browser_types",
             "prewarmed_browser_types",
             "browser_pool_sizes",
+            "browser_recycle_after_runs",
             "browser_proxy",
             "browser_viewport",
+            "trace_artifacts_enabled",
             "success_response_artifacts_enabled",
             "api_pool_size",
             "api_retry_attempts",

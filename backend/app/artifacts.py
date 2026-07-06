@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import base64
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,34 @@ def cleanup_old_artifacts(settings: dict[str, Any]) -> dict[str, list[str]]:
             int(settings.get("response_retention_days", 30)),
         ),
     }
+
+
+def delete_artifact_paths(relative_paths: Iterable[str | None]) -> list[str]:
+    removed: list[str] = []
+    roots = {
+        "screenshots": SCREENSHOTS_DIR,
+        "traces": TRACES_DIR,
+        "responses": RESPONSES_DIR,
+    }
+    for raw_path in relative_paths:
+        if not raw_path:
+            continue
+        clean_path = str(raw_path).replace("\\", "/").lstrip("/")
+        prefix, _, filename = clean_path.partition("/")
+        root = roots.get(prefix)
+        if root is None or not filename or "/" in filename:
+            continue
+        path = (root / filename).resolve()
+        try:
+            if path.parent != root.resolve() or not path.is_file():
+                continue
+            path.unlink()
+            removed.append(f"{prefix}/{filename}")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return removed
 
 
 def _cleanup_directory(directory: Path, relative_prefix: str, retention_days: int) -> list[str]:
