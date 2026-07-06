@@ -115,7 +115,7 @@ class Handler(BaseHTTPRequestHandler):
 def _run_update(update_id: str, target_image: str, force: bool) -> None:
     previous_image = _current_container_image()
     try:
-        _run(["docker", "pull", target_image])
+        _ensure_image_available(target_image)
         _compose_up(target_image)
         _wait_for_health()
     except Exception as exc:
@@ -190,7 +190,27 @@ def _target_image(payload: dict[str, Any]) -> str:
     return image
 
 
+def _ensure_image_available(image: str) -> None:
+    try:
+        _run(["docker", "pull", image])
+    except Exception:
+        if _image_exists(image):
+            return
+        raise
+
+
+def _image_exists(image: str) -> bool:
+    try:
+        _run(["docker", "image", "inspect", image])
+    except Exception:
+        return False
+    return True
+
+
 def _current_token() -> str:
+    env_token = os.getenv("PULSEGUARD_WORKER_TOKEN", "").strip()
+    if env_token:
+        return env_token
     try:
         return TOKEN_FILE.read_text(encoding="utf-8").strip()
     except OSError:

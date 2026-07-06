@@ -262,7 +262,7 @@ docker compose -f docker-compose.worker.yml -f docker-compose.worker.build.yml u
 docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updater
 ```
 
-启用后，主节点“执行节点”列表会显示“支持平台更新”，可以点击“更新节点”。更新过程由子节点 updater 执行：拉取目标镜像、重建 worker、检查 `/api/worker/health`，失败时尝试回滚到旧镜像。
+启用后，主节点“执行节点”列表会显示“支持平台更新”，可以点击“更新节点”。更新过程由子节点 updater 执行：优先拉取目标镜像；如果镜像仓库不可达但本地已经存在目标镜像（例如 `pulseguard-worker:local`），会直接使用本地镜像继续重建 worker；随后检查 `/api/worker/health`，失败时尝试回滚到旧镜像。
 
 如果子节点服务器不能直接访问公司 Git 项目，建议先在可访问环境构建并推送到内网镜像仓库，再让子节点 compose 指向内网镜像：
 
