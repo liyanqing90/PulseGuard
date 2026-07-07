@@ -738,9 +738,11 @@ class CheckRunner:
     def _create_skipped_run(self, check: dict[str, Any], message: str, trigger: str, record_status: bool = True) -> dict[str, Any]:
         settings = self._settings_for_check(check, storage.get_settings())
         metadata = run_metadata(trigger)
+        if not record_status:
+            metadata = {**metadata, "affects_health": False}
         runner_payload = self._runner_metadata(settings, failure_kind="runner")
         run = storage.create_run(
-            self._with_runner_metadata(check, settings, runner_payload, trigger=trigger),
+            self._with_runner_metadata(check, settings, runner_payload, trigger=trigger, run_metadata_payload=metadata),
             "skipped",
             message,
         )
@@ -984,26 +986,23 @@ class CheckRunner:
     def _resolve_check_runners(self, check: dict[str, Any]) -> list[dict[str, Any]]:
         mode = str(check.get("runner_selection_mode") or "selected_parallel")
         if mode != "round_robin_all" and not check.get("runner_ids"):
-            return [self._local_runner_from_settings(storage.get_settings())]
+            local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())
+            return [local] if storage.can_schedule_runner(local) else []
         if mode == "round_robin_all":
             candidates = storage.list_schedulable_probe_runners()
             if not candidates:
-                local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())
-                return [local]
+                return []
             index = storage.next_runner_cursor(f"check:{int(check.get('id') or 0)}", len(candidates))
             return [candidates[index]]
         runners = storage.list_probe_runners_by_ids(check.get("runner_ids") or [storage.LOCAL_RUNNER_ID])
         schedulable = [runner for runner in runners if storage.can_schedule_runner(runner)]
-        if schedulable:
-            return schedulable
-        if runners:
-            return runners
-        local = storage.get_probe_runner(storage.LOCAL_RUNNER_ID) or self._local_runner_from_settings(storage.get_settings())
-        return [local]
+        return schedulable
 
     def _resolve_browser_targets(self, check: dict[str, Any], runners: list[dict[str, Any]]) -> list[BrowserRunTarget]:
         if not self._uses_browser(check):
             return [BrowserRunTarget(runner=runner, browser_type="") for runner in runners]
+        if not runners:
+            return []
         settings = storage.get_settings()
         targets: list[BrowserRunTarget] = []
         for runner in runners:
@@ -1115,6 +1114,10 @@ class CheckRunner:
     ) -> dict[str, Any]:
         runner = target.runner
         runner_id = str(runner.get("runner_id") or storage.LOCAL_RUNNER_ID)
+        if runner_id != storage.LOCAL_RUNNER_ID:
+            latest_runner = storage.get_probe_runner(runner_id)
+            if latest_runner:
+                runner = latest_runner
         check_payload = self._with_browser_type({**check, "_run_group_id": run_group_id}, target.browser_type)
         runner_payload = storage.runner_metadata(runner, browser_type=target.browser_type)
         metadata = {**run_metadata(trigger), "run_group_id": run_group_id}
@@ -1127,7 +1130,7 @@ class CheckRunner:
             unavailable = self._finish_runner_unavailable(int(run["id"]), check_payload, trigger, runner, target.skip_reason)
             await self._notify_system_result(check_payload, trigger, int(run["id"]), unavailable, self._settings_for_system_alert(), source="runner")
             return unavailable
-        if not runner.get("available"):
+        if not storage.can_schedule_runner(runner):
             run = storage.create_run(
                 self._with_runner_metadata(check_payload, storage.get_settings(), runner_payload, trigger=trigger, run_metadata_payload=runner_system_metadata),
                 "pending",
@@ -1163,9 +1166,11 @@ class CheckRunner:
             return unavailable
         data = self._remote_result_to_finish_payload(result, run_id, runner)
         if self._is_runner_system_result(data):
+            latest_runner = storage.mark_probe_runner_unavailable(runner_id, status="unhealthy") or storage.get_probe_runner(runner_id) or runner
             storage.discard_incomplete_run(run_id)
             system_result = self._ephemeral_runner_result(check_payload, trigger, run_id, data)
             await self._notify_system_result(check_payload, trigger, run_id, system_result, self._settings_for_system_alert(), source="runner")
+            await self._notify_runner_unavailable_if_needed(latest_runner, check)
             return system_result
         finished = storage.finish_run(run_id, data)
         return storage.get_run(run_id) or finished or run
@@ -1293,7 +1298,7 @@ class CheckRunner:
 
     async def _finish_distributed_group(self, check: dict[str, Any], runs: list[dict[str, Any]], trigger: str) -> dict[str, Any]:
         if not runs:
-            return self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger)
+            return self._create_skipped_run(check, "没有可执行节点，本次已跳过", trigger, record_status=False)
         status_run = self._aggregate_group_run(runs)
         if status_run.get("affects_health") and status_run.get("failure_kind") != "runner":
             transition = storage.update_check_status(int(check["id"]), status_run)

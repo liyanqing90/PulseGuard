@@ -251,7 +251,7 @@ export const api = {
       { method: "POST" }
     ),
   updateRunnerNode: (runnerId: string, payload: RunnerUpdateRequest = {}) =>
-    request<{ ok: boolean; message: string; worker?: unknown }>(`/api/runners/${encodeURIComponent(runnerId)}/update`, {
+    request<{ ok: boolean; message: string; worker?: { update?: RunnerUpdateStatus } }>(`/api/runners/${encodeURIComponent(runnerId)}/update`, {
       method: "POST",
       body: JSON.stringify(payload)
     }),

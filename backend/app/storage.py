@@ -1429,6 +1429,7 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
                 installed_browser_types_json = ?,
                 available_browser_types_json = ?,
                 metadata_json = ?,
+                deploy_command_expires_at = CASE WHEN ? = 'relay' THEN NULL ELSE deploy_command_expires_at END,
                 unavailable_since = NULL,
                 unavailable_notified_at = NULL,
                 worker_health_last_success_at = ?,
@@ -1443,6 +1444,7 @@ def mark_probe_runner_available(runner_id: str, health: dict[str, Any] | None = 
                 json.dumps(installed_browser_types, ensure_ascii=False),
                 json.dumps(available_browser_types, ensure_ascii=False),
                 json.dumps(metadata, ensure_ascii=False),
+                str(current["connection_mode"] or "") if current else "",
                 timestamp,
                 timestamp,
                 timestamp,
@@ -1689,7 +1691,8 @@ def verify_probe_runner_relay_token(runner_id: str, token: str, version: int) ->
     except ValueError:
         expired = False
     status = str(row["status"] or "")
-    if matched_current and expired and status in RELAY_PRE_ACTIVATION_STATUSES:
+    was_available = bool(int(row["was_available"] or 0))
+    if matched_current and expired and status in RELAY_PRE_ACTIVATION_STATUSES and not was_available:
         return None
     return _normalize_probe_runner(row)
 
@@ -1854,6 +1857,46 @@ def can_schedule_runner(runner_or_id: dict[str, Any] | str) -> bool:
     )
 
 
+def mark_probe_runner_updating(runner_id: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = 'updating',
+                last_disconnect_reason = '',
+                updated_at = ?
+            WHERE runner_id = ?
+            """,
+            (timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_probe_runner(runner_id)
+
+
+def restore_probe_runner_status(runner_id: str, status: str) -> dict[str, Any] | None:
+    runner_id = _normalize_runner_id(runner_id)
+    status = str(status or "").strip().lower()
+    if not status:
+        return get_probe_runner(runner_id)
+    timestamp = now_iso()
+    with _LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = ?,
+                updated_at = ?
+            WHERE runner_id = ? AND status = 'updating'
+            """,
+            (status, timestamp, runner_id),
+        )
+        if cursor.rowcount == 0:
+            return get_probe_runner(runner_id)
+    return get_probe_runner(runner_id)
+
+
 def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> dict[str, Any] | None:
     runner_id = _normalize_runner_id(runner_id)
     timestamp = now_iso()
@@ -1862,7 +1905,9 @@ def mark_probe_runner_unavailable(runner_id: str, status: str = "offline") -> di
         next_status = status
         if row and str(row["connection_mode"] or "") == "relay":
             current_status = str(row["status"] or "")
-            if current_status in RELAY_PRE_ACTIVATION_STATUSES:
+            if current_status == "updating":
+                next_status = current_status
+            elif current_status in RELAY_PRE_ACTIVATION_STATUSES:
                 next_status = current_status
             else:
                 next_status = "unavailable" if int(row["was_available"] or 0) else "connecting"
@@ -3938,6 +3983,8 @@ def _token_hint(token: str) -> str:
 def _runner_available(data: dict[str, Any]) -> bool:
     if not data.get("enabled"):
         return False
+    if str(data.get("status") or "") == "updating":
+        return False
     if str(data.get("role") or "") == "local":
         return str(data.get("status") or "ok") != "offline"
     if str(data.get("connection_mode") or "manual") == "relay":
@@ -3998,52 +4045,71 @@ def _allocate_relay_internal_port(conn: sqlite3.Connection) -> int:
 
 
 def _expire_probe_runner_provisions(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(probe_runners)").fetchall()}
+    if not columns:
+        return
     timestamp = now_iso()
-    conn.execute(
-        """
-        UPDATE probe_runners
-        SET status = 'expired',
-            updated_at = ?
-        WHERE connection_mode = 'relay'
-          AND status IN ('pending_deployment', 'connecting')
-          AND deploy_command_expires_at IS NOT NULL
-          AND deploy_command_expires_at < ?
-        """,
-        (timestamp, timestamp),
-    )
-    conn.execute(
-        """
-        UPDATE probe_runners
-        SET relay_token_hash = CASE
-                WHEN relay_previous_token_hash <> '' THEN ''
-                ELSE relay_token_hash
-            END,
-            relay_token_hint = CASE
-                WHEN relay_previous_token_hash <> '' THEN ''
-                ELSE relay_token_hint
-            END,
-            relay_token_version = CASE
-                WHEN relay_previous_token_hash <> '' THEN 0
-                ELSE relay_token_version
-            END,
-            status = CASE
-                WHEN relay_previous_token_hash <> '' THEN 'expired'
-                ELSE status
-            END,
-            last_disconnect_reason = CASE
-                WHEN relay_previous_token_hash <> '' THEN 'relay token rotation expired'
-                ELSE last_disconnect_reason
-            END,
-            relay_previous_token_hash = '',
-            relay_previous_token_hint = '',
-            relay_previous_token_version = 0,
-            relay_previous_token_expires_at = NULL,
-            updated_at = ?
-        WHERE relay_previous_token_expires_at IS NOT NULL
-          AND relay_previous_token_expires_at < ?
-        """,
-        (timestamp, timestamp),
-    )
+    deploy_expiry_columns = {"connection_mode", "status", "was_available", "deploy_command_expires_at", "updated_at"}
+    if deploy_expiry_columns <= columns:
+        conn.execute(
+            """
+            UPDATE probe_runners
+            SET status = 'expired',
+                updated_at = ?
+            WHERE connection_mode = 'relay'
+              AND status IN ('pending_deployment', 'connecting')
+              AND COALESCE(was_available, 0) = 0
+              AND deploy_command_expires_at IS NOT NULL
+              AND deploy_command_expires_at < ?
+            """,
+            (timestamp, timestamp),
+        )
+    rotation_expiry_columns = {
+        "relay_token_hash",
+        "relay_token_hint",
+        "relay_token_version",
+        "relay_previous_token_hash",
+        "relay_previous_token_hint",
+        "relay_previous_token_version",
+        "relay_previous_token_expires_at",
+        "status",
+        "last_disconnect_reason",
+        "updated_at",
+    }
+    if rotation_expiry_columns <= columns:
+        conn.execute(
+            """
+            UPDATE probe_runners
+            SET relay_token_hash = CASE
+                    WHEN relay_previous_token_hash <> '' THEN ''
+                    ELSE relay_token_hash
+                END,
+                relay_token_hint = CASE
+                    WHEN relay_previous_token_hash <> '' THEN ''
+                    ELSE relay_token_hint
+                END,
+                relay_token_version = CASE
+                    WHEN relay_previous_token_hash <> '' THEN 0
+                    ELSE relay_token_version
+                END,
+                status = CASE
+                    WHEN relay_previous_token_hash <> '' THEN 'expired'
+                    ELSE status
+                END,
+                last_disconnect_reason = CASE
+                    WHEN relay_previous_token_hash <> '' THEN 'relay token rotation expired'
+                    ELSE last_disconnect_reason
+                END,
+                relay_previous_token_hash = '',
+                relay_previous_token_hint = '',
+                relay_previous_token_version = 0,
+                relay_previous_token_expires_at = NULL,
+                updated_at = ?
+            WHERE relay_previous_token_expires_at IS NOT NULL
+              AND relay_previous_token_expires_at < ?
+            """,
+            (timestamp, timestamp),
+        )
 
 
 def _check_snapshot(check: dict[str, Any]) -> dict[str, Any]:

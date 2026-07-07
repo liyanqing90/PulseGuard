@@ -622,8 +622,7 @@ export function SettingsPage() {
   const systemSelectedChannelCount = settings.system_notification_channel_ids.filter((channelId) => sendableChannelIds.has(channelId)).length;
   const executionChannelCount =
     settings.execution_notification_channel_ids.length > 0 ? executionSelectedChannelCount : sendableChannelCount;
-  const systemUsesDefaultChannels = settings.system_notification_channel_ids.length === 0;
-  const systemChannelCount = systemUsesDefaultChannels ? sendableChannelCount : systemSelectedChannelCount;
+  const systemChannelCount = systemSelectedChannelCount;
   const importApplyDisabledReason = configImportApplyDisabledReason(importBundle, importPreview, hasUnsavedChanges);
   const readOnlyTokens = settings.read_only_tokens || [];
   const importUploadProps: UploadProps = {
@@ -710,7 +709,7 @@ export function SettingsPage() {
                 <Switch aria-label="启用系统告警" checked={settings.system_alerts_enabled} onChange={(value) => update("system_alerts_enabled", value)} />
                 <Tag color={enabledTagColor(settings.system_alerts_enabled)}>{settings.system_alerts_enabled ? "已启用" : "已停用"}</Tag>
               </Space>
-              <span>{systemUsesDefaultChannels ? "全部可发送渠道" : systemChannelCount > 0 ? `${systemChannelCount} 个指定渠道` : "未配置可发送渠道"}</span>
+              <span>{settings.system_notification_channel_ids.length === 0 ? "未选择渠道" : systemChannelCount > 0 ? `${systemChannelCount} 个指定渠道` : "未配置可发送渠道"}</span>
             </div>
             <div className="alert-route-facts">
               <div className="alert-route-fact">
@@ -719,7 +718,7 @@ export function SettingsPage() {
               </div>
               <div className="alert-route-fact">
                 <small>当前路由</small>
-                <strong>{systemChannelCount > 0 ? `${systemChannelCount} 个渠道` : "未配置"}</strong>
+                <strong>{systemChannelCount > 0 ? `${systemChannelCount} 个渠道` : "不会推送"}</strong>
               </div>
             </div>
           </div>
@@ -731,7 +730,7 @@ export function SettingsPage() {
                 value={settings.system_notification_channel_ids}
                 onChange={(value) => update("system_notification_channel_ids", value)}
                 options={channelOptions}
-                placeholder="默认使用全部可发送渠道"
+                placeholder="选择系统告警渠道"
               />
             </Form.Item>
           </Form>
@@ -770,8 +769,8 @@ export function SettingsPage() {
             </Form.Item>
             <Form.Item label="系统路由">
               <div className="setting-inline-metric">
-                <strong>{systemChannelCount}</strong>
-                <span>个渠道</span>
+                <strong>{systemChannelCount > 0 ? systemChannelCount : "未选择"}</strong>
+                <span>{systemChannelCount > 0 ? "个渠道" : "不会推送"}</span>
               </div>
             </Form.Item>
           </Form>
@@ -1254,6 +1253,7 @@ function runnerStatusLabel(runner: ProbeRunner): string {
     pending_deployment: "待部署",
     expired: "已过期",
     connecting: "连接中",
+    updating: "更新中",
     available: "可用",
     unhealthy: "异常",
     unavailable: "异常",
@@ -1269,7 +1269,7 @@ function runnerStatusLabel(runner: ProbeRunner): string {
 function runnerStatusColor(runner: ProbeRunner): "default" | "processing" | "success" | "warning" | "error" {
   if (!runner.enabled) return "default";
   if (runner.available || runner.status === "available" || runner.status === "ok") return "success";
-  if (runner.status === "pending_deployment" || runner.status === "connecting") return "processing";
+  if (runner.status === "pending_deployment" || runner.status === "connecting" || runner.status === "updating") return "processing";
   if (runner.status === "expired" || runner.status === "auth_failed") return "warning";
   return "error";
 }
@@ -1291,12 +1291,33 @@ function runnerImageSummary(image: string): string {
   return parts[parts.length - 1] || image;
 }
 
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function waitForRunnerUpdateStatus(runnerId: string, updateId?: string): Promise<RunnerUpdateStatus | undefined> {
+  let latest: RunnerUpdateStatus | undefined;
+  for (let attempt = 0; attempt < 75; attempt += 1) {
+    await wait(attempt === 0 ? 1000 : 2000);
+    const result = await api.runnerUpdateStatus(runnerId);
+    const update = result.worker?.update;
+    if (!update) continue;
+    if (updateId && update.update_id && update.update_id !== updateId) continue;
+    latest = update;
+    if (latest.status === "succeeded" || latest.status === "failed") return latest;
+  }
+  return latest;
+}
+
 function updateStatusLines(status?: RunnerUpdateStatus): Record<string, unknown> {
   if (!status) return { 状态: "暂无状态" };
   return {
     状态: status.status || "-",
+    当前镜像: status.current_image || "-",
     目标镜像: status.target_image || "-",
     原镜像: status.previous_image || "-",
+    更新服务: status.update_services?.join(", ") || "-",
+    是否可更新: typeof status.update_available === "boolean" ? (status.update_available ? "是" : "否") : "-",
     开始时间: status.started_at || "-",
     完成时间: status.finished_at || "-",
     更新时间: status.updated_at || "-",
@@ -1561,7 +1582,16 @@ function RunnerNodePanel() {
         setBusyId(runner.runner_id);
         try {
           const result = await api.updateRunnerNode(runner.runner_id, targetImage ? { target_image: targetImage } : {});
-          message.success(result.message || "节点更新任务已下发");
+          const updateId = result.worker?.update?.update_id;
+          message.success(result.message || "节点更新任务已下发，正在等待结果");
+          const finalStatus = await waitForRunnerUpdateStatus(runner.runner_id, updateId);
+          if (finalStatus?.status === "succeeded") {
+            message.success("节点更新成功");
+          } else if (finalStatus?.status === "failed") {
+            message.error(finalStatus.message || "节点更新失败");
+          } else {
+            message.warning("节点更新仍在执行，请稍后查看更新状态");
+          }
           await loadRunners();
         } catch (err) {
           message.error((err as Error).message);
@@ -1622,6 +1652,15 @@ function RunnerNodePanel() {
               const targetImage = runnerMetaText(runner, "update_target_image");
               const updateSupported = runnerMetaBool(runner, "update_supported");
               const updateAvailable = runnerMetaBool(runner, "update_available");
+              const updateActionEnabled = updateSupported && updateAvailable && runner.available;
+              const updateActionLabel = updateAvailable ? (
+                <Space size={6}>
+                  <span>更新节点</span>
+                  <Tag color="warning">可更新</Tag>
+                </Space>
+              ) : (
+                "更新节点"
+              );
               const isBusy = busyId === runner.runner_id;
               const tokenStatus = runner.token_set ? runner.token_hint || "已配置" : "未配置";
               const imageSummary = image ? runnerImageSummary(image) : "-";
@@ -1631,7 +1670,7 @@ function RunnerNodePanel() {
                 ...(runner.role !== "local" && runner.connection_mode === "relay"
                   ? [{ key: "deploy", icon: <Clipboard size={15} />, label: "重新生成命令" }]
                   : []),
-                { key: "update", icon: <Download size={15} />, label: "更新节点", disabled: !updateSupported || !runner.available },
+                { key: "update", icon: <Download size={15} />, label: updateActionLabel, disabled: !updateActionEnabled },
                 { key: "status", icon: <Info size={15} />, label: "更新状态", disabled: !updateSupported },
                 { type: "divider" },
                 { key: "delete", icon: <Trash2 size={15} />, label: "删除", danger: true }
@@ -1704,7 +1743,7 @@ function RunnerNodePanel() {
                         </Button>
                         {runner.role !== "local" && (
                           <Dropdown menu={{ items: runnerMenuItems, onClick: onRunnerMenuClick }} trigger={["click"]}>
-                            <Button size="small" icon={<MoreHorizontal size={15} />} loading={isBusy}>
+                            <Button size="small" type={updateActionEnabled ? "primary" : "default"} icon={<MoreHorizontal size={15} />} loading={isBusy}>
                               更多
                             </Button>
                           </Dropdown>

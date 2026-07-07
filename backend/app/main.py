@@ -145,6 +145,8 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
     _verify_worker_token(_bearer_token(authorization))
     update_supported = bool(WORKER_UPDATER_URL)
     update_target = WORKER_UPDATE_IMAGE or WORKER_IMAGE
+    update_status = _worker_update_status_for_health() if update_supported else {}
+    current_image = str(update_status.get("current_image") or WORKER_IMAGE).strip()
     capabilities = browser_capabilities(storage.get_settings())
     return {
         "ok": True,
@@ -161,10 +163,13 @@ def worker_health(authorization: str = Header(default="")) -> dict[str, Any]:
             "node_role": NODE_ROLE,
             "version": APP_VERSION,
             "build_sha": BUILD_SHA,
-            "image": WORKER_IMAGE,
+            "image": current_image,
             "update_supported": update_supported,
             "update_target_image": update_target,
-            "update_available": bool(update_supported and WORKER_IMAGE and update_target and WORKER_IMAGE != update_target),
+            "update_status": update_status.get("status") or "",
+            "update_message": update_status.get("message") or "",
+            "update_current_image": current_image,
+            "update_available": bool(update_supported and current_image and update_target and current_image != update_target),
             "browser_type_status": capabilities["browser_type_status"],
         },
     }
@@ -441,7 +446,13 @@ async def update_runner_node(runner_id: str, payload: WorkerUpdateRequest) -> di
         raise HTTPException(status_code=404, detail="Runner 不存在")
     if str(runner.get("role") or "") == "local":
         raise HTTPException(status_code=400, detail="本机 Runner 不支持远程更新")
-    result = await _worker_request(runner, "POST", "/api/worker/update", payload.model_dump(exclude_none=True), timeout=10)
+    previous_status = str(runner.get("status") or "")
+    storage.mark_probe_runner_updating(runner_id)
+    try:
+        result = await _worker_request(runner, "POST", "/api/worker/update", payload.model_dump(exclude_none=True), timeout=10)
+    except Exception:
+        storage.restore_probe_runner_status(runner_id, previous_status)
+        raise
     storage.record_audit_event("updated", "runner", runner_id, runner.get("name", ""), "推送执行节点更新", {"target_image": payload.target_image or ""})
     return {"ok": True, "message": "节点更新任务已下发", "worker": result}
 
@@ -1361,6 +1372,22 @@ async def _worker_request(
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="Runner 响应格式无效")
     return data
+
+
+def _worker_update_status_for_health() -> dict[str, Any]:
+    if not WORKER_UPDATER_URL or not WORKER_TOKEN:
+        return {}
+    try:
+        with httpx.Client(timeout=1.5) as client:
+            response = client.get(f"{WORKER_UPDATER_URL}/status", headers={"Authorization": f"Bearer {WORKER_TOKEN}"})
+            response.raise_for_status()
+            data = response.json()
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    update = data.get("update")
+    return update if isinstance(update, dict) else {}
 
 
 async def _worker_updater_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:

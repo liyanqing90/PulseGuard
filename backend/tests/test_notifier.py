@@ -170,7 +170,7 @@ class DingtalkNotifierTests(unittest.TestCase):
         self.assertIn("系统异常", send_webhook_alert.await_args.args[1])
         self.assertIn("Target crashed", send_webhook_alert.await_args.args[2])
 
-    def test_notify_system_error_defaults_to_all_sendable_channels_without_system_route(self) -> None:
+    def test_notify_system_error_requires_explicit_system_channels(self) -> None:
         settings = {
             "system_alerts_enabled": True,
             "alert_delivery_attempts": 1,
@@ -195,9 +195,9 @@ class DingtalkNotifierTests(unittest.TestCase):
                 )
             )
 
-        self.assertTrue(result["sent"])
-        send_webhook_alert.assert_awaited_once()
-        self.assertEqual(send_webhook_alert.await_args.args[0]["id"], "biz")
+        self.assertFalse(result["sent"])
+        self.assertEqual(result["reason"], "no_channels")
+        send_webhook_alert.assert_not_awaited()
 
     def test_manual_failure_obeys_continuous_failure_cooldown(self) -> None:
         run = {"id": 45, "status": "failed", "started_at": "2026-06-05T10:05:00+08:00"}

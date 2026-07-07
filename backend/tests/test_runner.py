@@ -10,7 +10,30 @@ import httpx
 from backend.app.runner import BrowserRunTarget, CheckRunner, RunFailure, RunnerEnvironmentFailure, _TASK_DURATION_ATTR
 
 
+def local_runner_stub(available: bool = True) -> dict[str, object]:
+    return {
+        "runner_id": "local",
+        "name": "local",
+        "address": "127.0.0.1",
+        "network_region": "local",
+        "browser_version": "",
+        "status": "ok" if available else "offline",
+        "enabled": available,
+        "available": available,
+        "role": "local",
+    }
+
+
 class DraftRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._runner_state_patch = patch.multiple(
+            "backend.app.runner.storage",
+            get_probe_runner=Mock(return_value=None),
+            can_schedule_runner=Mock(return_value=True),
+        )
+        self._runner_state_patch.start()
+        self.addCleanup(self._runner_state_patch.stop)
+
     def test_draft_run_does_not_update_task_status_or_send_notification(self) -> None:
         check = {
             "name": "草稿调试",
@@ -1003,6 +1026,151 @@ class DistributedRunnerTests(unittest.TestCase):
 
         self.assertEqual([runner["runner_id"] for runner in selected], ["edge-ready"])
 
+    def test_selected_parallel_returns_no_runners_when_selected_runners_are_not_schedulable(self) -> None:
+        check = {
+            "id": 40,
+            "name": "Selected unavailable relay runners",
+            "type": "api",
+            "runner_selection_mode": "selected_parallel",
+            "runner_ids": ["edge-expired"],
+        }
+        runners = [{"runner_id": "edge-expired", "enabled": True, "available": False, "status": "expired"}]
+
+        with patch("backend.app.runner.storage.list_probe_runners_by_ids", return_value=runners), patch(
+            "backend.app.runner.storage.can_schedule_runner",
+            return_value=False,
+        ):
+            selected = CheckRunner()._resolve_check_runners(check)
+
+        self.assertEqual(selected, [])
+
+    def test_missing_runner_ids_does_not_force_unavailable_local_runner(self) -> None:
+        check = {
+            "id": 40,
+            "name": "Legacy local runner",
+            "type": "api",
+            "runner_selection_mode": "selected_parallel",
+            "runner_ids": [],
+        }
+        local = {"runner_id": "local", "enabled": False, "available": False, "role": "local", "status": "offline"}
+
+        with patch("backend.app.runner.storage.get_probe_runner", return_value=local), patch(
+            "backend.app.runner.storage.can_schedule_runner",
+            return_value=False,
+        ):
+            selected = CheckRunner()._resolve_check_runners(check)
+
+        self.assertEqual(selected, [])
+
+    def test_round_robin_all_returns_no_runners_when_none_are_schedulable(self) -> None:
+        check = {
+            "id": 41,
+            "name": "Round robin no runners",
+            "type": "api",
+            "runner_selection_mode": "round_robin_all",
+        }
+
+        with patch("backend.app.runner.storage.list_schedulable_probe_runners", return_value=[]), patch(
+            "backend.app.runner.storage.next_runner_cursor"
+        ) as next_runner_cursor:
+            selected = CheckRunner()._resolve_check_runners(check)
+
+        self.assertEqual(selected, [])
+        next_runner_cursor.assert_not_called()
+
+    def test_dispatch_rechecks_runner_schedulability_before_remote_call(self) -> None:
+        async def scenario() -> tuple[dict[str, object], int, int]:
+            runner = {
+                "runner_id": "edge-1",
+                "name": "Edge",
+                "address": "http://edge:8788",
+                "network_region": "edge",
+                "enabled": True,
+                "available": True,
+                "status": "available",
+                "role": "child",
+            }
+            stale = {**runner, "available": False, "status": "unavailable"}
+            target = BrowserRunTarget(runner=runner, browser_type="")
+            check = {"id": 42, "name": "Remote stale", "type": "api"}
+
+            with patch("backend.app.runner.storage.get_probe_runner", return_value=stale), patch(
+                "backend.app.runner.storage.can_schedule_runner", return_value=False
+            ), patch("backend.app.runner.storage.get_settings", return_value={}), patch(
+                "backend.app.runner.storage.create_run", return_value={"id": 420, "check_id": 42, "status": "pending"}
+            ), patch("backend.app.runner.storage.discard_incomplete_run", return_value=True), patch(
+                "backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock
+            ) as notify_system_error, patch.object(
+                CheckRunner,
+                "_call_remote_runner",
+                new_callable=AsyncMock,
+                side_effect=AssertionError("unavailable runner should not receive work"),
+            ) as call_remote_runner:
+                result = await CheckRunner()._dispatch_runner(check, target, "scheduled", "rg-stale", capacity_managed=True)
+                return result, notify_system_error.await_count, call_remote_runner.await_count
+
+        result, system_alert_count, remote_call_count = asyncio.run(scenario())
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failure_kind"], "runner")
+        self.assertEqual(system_alert_count, 1)
+        self.assertEqual(remote_call_count, 0)
+
+    def test_remote_runner_system_failure_marks_runner_unavailable(self) -> None:
+        async def scenario() -> tuple[dict[str, object], int, object]:
+            runner = {
+                "runner_id": "edge-1",
+                "name": "Edge",
+                "address": "http://edge:8788",
+                "network_region": "edge",
+                "enabled": True,
+                "available": True,
+                "status": "available",
+                "role": "child",
+            }
+            target = BrowserRunTarget(runner=runner, browser_type="")
+            check = {"id": 43, "name": "Remote system failure", "type": "api"}
+            worker_result = {
+                "ok": True,
+                "run": {
+                    "status": "failed",
+                    "finished_at": "2026-01-01T00:00:01+08:00",
+                    "duration_ms": 0,
+                    "error_message": "Page.title: Target crashed",
+                    "logs": "Page.title: Target crashed",
+                    "failure_kind": "runner",
+                    "affects_health": False,
+                },
+            }
+
+            with patch("backend.app.runner.storage.get_probe_runner", return_value=runner), patch(
+                "backend.app.runner.storage.can_schedule_runner", return_value=True
+            ), patch("backend.app.runner.storage.get_settings", return_value={}), patch(
+                "backend.app.runner.storage.create_run", return_value={"id": 430, "check_id": 43, "status": "pending"}
+            ), patch("backend.app.runner.storage.start_run"), patch(
+                "backend.app.runner.storage.discard_incomplete_run", return_value=True
+            ), patch("backend.app.runner.storage.mark_probe_runner_unavailable", return_value={**runner, "available": False, "status": "unavailable"}) as mark_unavailable, patch(
+                "backend.app.runner.storage.should_notify_probe_runner_unavailable", return_value=True
+            ), patch("backend.app.runner.notifier.notify_system_error", new_callable=AsyncMock), patch(
+                "backend.app.runner.notifier.notify_runner_unavailable", new_callable=AsyncMock
+            ) as notify_runner_unavailable, patch.object(
+                CheckRunner,
+                "_call_remote_runner",
+                new_callable=AsyncMock,
+                return_value=worker_result,
+            ):
+                result = await CheckRunner()._dispatch_runner(check, target, "scheduled", "rg-system", capacity_managed=True)
+                return result, notify_runner_unavailable.await_count, mark_unavailable.call_args
+
+        result, unavailable_alert_count, mark_unavailable_call = asyncio.run(scenario())
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_kind"], "runner")
+        self.assertFalse(result["affects_health"])
+        self.assertEqual(mark_unavailable_call.args, ("edge-1",))
+        self.assertEqual(mark_unavailable_call.kwargs, {"status": "unhealthy"})
+        self.assertEqual(unavailable_alert_count, 1)
+
     def test_ui_browser_targets_expand_per_runner_and_browser_type(self) -> None:
         check = {
             "id": 41,
@@ -1115,13 +1283,17 @@ class DistributedRunnerTests(unittest.TestCase):
             "role": "local",
         }
 
+        def create_run(payload: dict[str, object], status: str, message: str = "") -> dict[str, object]:
+            runner_payload = payload.get("_runner") if isinstance(payload.get("_runner"), dict) else {}
+            return {"id": 310, "check_id": 31, "status": status, "error_message": message, "affects_health": False, **runner_payload}
+
         def finish_run(run_id: int, data: dict[str, object]) -> dict[str, object]:
             return {"id": run_id, "check_id": 31, "affects_health": True, **data}
 
         with patch("backend.app.runner.storage.get_check", return_value=check), patch(
             "backend.app.runner.storage.list_probe_runners_by_ids", return_value=[local_runner]
         ), patch("backend.app.runner.storage.get_settings", return_value={}), patch(
-            "backend.app.runner.storage.create_run", return_value={"id": 310, "check_id": 31, "status": "pending"}
+            "backend.app.runner.storage.create_run", side_effect=create_run
         ) as create_run, patch("backend.app.runner.storage.finish_run", side_effect=finish_run) as finish_run_mock, patch(
             "backend.app.runner.storage.get_run", return_value=None
         ), patch("backend.app.runner.storage.discard_incomplete_run", return_value=True) as discard_incomplete_run, patch(
@@ -1146,11 +1318,11 @@ class DistributedRunnerTests(unittest.TestCase):
         created_payload = create_run.call_args.args[0]
         self.assertFalse(created_payload["_run"]["affects_health"])
         finish_run_mock.assert_not_called()
-        discard_incomplete_run.assert_called_once_with(310)
-        update_run_notification.assert_not_called()
+        discard_incomplete_run.assert_not_called()
+        update_run_notification.assert_called_once_with(310, "not_required", channel=None, error=None, sent_at=None)
         update_check_status.assert_not_called()
         maybe_notify.assert_not_called()
-        notify_system_error.assert_awaited_once()
+        notify_system_error.assert_not_awaited()
 
     def test_local_distributed_runner_system_failure_sends_system_alert(self) -> None:
         async def scenario() -> tuple[dict[str, object], int]:
@@ -1302,6 +1474,8 @@ def runner_patches(max_concurrency: int = 2, max_ui_concurrency: int = 1, max_qu
         "backend.app.runner.storage",
         get_settings=Mock(return_value=settings),
         get_check=Mock(side_effect=check_for),
+        get_probe_runner=Mock(return_value=local_runner_stub()),
+        can_schedule_runner=Mock(return_value=True),
         create_run=Mock(side_effect=create_run),
         start_run=Mock(),
     )

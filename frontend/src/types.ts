@@ -426,8 +426,11 @@ export interface RunnerUpdateRequest {
 export interface RunnerUpdateStatus {
   status?: string;
   update_id?: string;
+  current_image?: string;
   target_image?: string;
   previous_image?: string;
+  update_available?: boolean;
+  update_services?: string[];
   started_at?: string;
   finished_at?: string;
   updated_at?: string;

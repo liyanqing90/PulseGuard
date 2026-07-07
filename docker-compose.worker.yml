@@ -39,6 +39,7 @@ services:
       - PULSEGUARD_WORKER_TOKEN_FILE=/app/data/worker-token
       - PULSEGUARD_WORKER_COMPOSE_FILE=/workspace/docker-compose.worker.yml
       - PULSEGUARD_WORKER_SERVICE=pulseguard-worker
+      - PULSEGUARD_WORKER_UPDATE_SERVICES=pulseguard-worker
       - PULSEGUARD_WORKER_CONTAINER=pulseguard-worker
       - PULSEGUARD_WORKER_IMAGE=${PULSEGUARD_WORKER_IMAGE:-pulseguard-worker:local}
       - PULSEGUARD_WORKER_UPDATE_IMAGE=${PULSEGUARD_WORKER_UPDATE_IMAGE:-pulseguard-worker:local}

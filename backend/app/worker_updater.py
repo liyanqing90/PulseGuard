@@ -19,6 +19,12 @@ STATUS_FILE = Path(os.getenv("PULSEGUARD_WORKER_UPDATE_STATUS_FILE", "/app/data/
 COMPOSE_FILE = os.getenv("PULSEGUARD_WORKER_COMPOSE_FILE", "/workspace/docker-compose.worker.yml")
 WORKER_SERVICE = os.getenv("PULSEGUARD_WORKER_SERVICE", "pulseguard-worker")
 WORKER_CONTAINER = os.getenv("PULSEGUARD_WORKER_CONTAINER", "pulseguard-worker")
+RELAY_CLIENT_CONTAINER = os.getenv("PULSEGUARD_RELAY_CLIENT_CONTAINER", "pulseguard-relay-client")
+UPDATE_SERVICES = tuple(
+    service.strip()
+    for service in os.getenv("PULSEGUARD_WORKER_UPDATE_SERVICES", WORKER_SERVICE).split(",")
+    if service.strip()
+) or (WORKER_SERVICE,)
 DEFAULT_IMAGE = os.getenv("PULSEGUARD_WORKER_UPDATE_IMAGE") or os.getenv("PULSEGUARD_WORKER_IMAGE", "")
 ALLOWED_PREFIXES = tuple(
     prefix.strip()
@@ -48,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "status": "ok"})
             return
         if self.path == "/status":
-            self._json({"ok": True, "update": _read_status()})
+            self._json({"ok": True, "update": _status_with_runtime(_read_status())})
             return
         self._json({"detail": "not found"}, status=404)
 
@@ -153,10 +159,22 @@ def _run_update(update_id: str, target_image: str, force: bool) -> None:
 
 
 def _compose_up(image: str) -> None:
-    env = os.environ.copy()
+    env = _compose_environment(image)
     env["PULSEGUARD_WORKER_IMAGE"] = image
     env["COMPOSE_PROJECT_NAME"] = COMPOSE_PROJECT_NAME
-    _run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--no-deps", WORKER_SERVICE], env=env)
+    _run(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--no-deps", *UPDATE_SERVICES], env=env)
+
+
+def _compose_environment(image: str) -> dict[str, str]:
+    env = os.environ.copy()
+    for container in (WORKER_CONTAINER, RELAY_CLIENT_CONTAINER):
+        for key, value in _container_environment(container).items():
+            env.setdefault(key, value)
+    if "PULSEGUARD_RUNNER_ID" not in env and env.get("PULSEGUARD_WORKER_RUNNER_ID"):
+        env["PULSEGUARD_RUNNER_ID"] = env["PULSEGUARD_WORKER_RUNNER_ID"]
+    env["PULSEGUARD_WORKER_IMAGE"] = image
+    env["COMPOSE_PROJECT_NAME"] = COMPOSE_PROJECT_NAME
+    return env
 
 
 def _wait_for_health(timeout_seconds: int = 90) -> None:
@@ -217,12 +235,72 @@ def _current_token() -> str:
         return ""
 
 
-def _current_container_image() -> str:
+def _current_container_image(container: str = WORKER_CONTAINER) -> str:
     try:
-        output = _run(["docker", "inspect", "-f", "{{.Config.Image}}", WORKER_CONTAINER])
+        output = _run(["docker", "inspect", "-f", "{{.Config.Image}}", container])
     except Exception:
         return ""
     return output.strip()
+
+
+def _current_container_image_id(container: str = WORKER_CONTAINER) -> str:
+    try:
+        output = _run(["docker", "inspect", "-f", "{{.Image}}", container])
+    except Exception:
+        return ""
+    return output.strip()
+
+
+def _image_id(image: str) -> str:
+    image = str(image or "").strip()
+    if not image:
+        return ""
+    try:
+        output = _run(["docker", "image", "inspect", "-f", "{{.Id}}", image])
+    except Exception:
+        return ""
+    return output.strip()
+
+
+def _update_available(current_image: str, target_image: str) -> bool:
+    current_id = _current_container_image_id()
+    target_id = _image_id(target_image)
+    if current_id and target_id:
+        return current_id != target_id
+    return bool(current_image and target_image and current_image != target_image)
+
+
+def _container_environment(container: str) -> dict[str, str]:
+    try:
+        output = _run(["docker", "inspect", "-f", "{{json .Config.Env}}", container])
+        values = json.loads(output)
+    except Exception:
+        return {}
+    if not isinstance(values, list):
+        return {}
+    result: dict[str, str] = {}
+    for item in values:
+        text = str(item)
+        if "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        if key:
+            result[key] = value
+    return result
+
+
+def _status_with_runtime(status: dict[str, Any]) -> dict[str, Any]:
+    result = dict(status)
+    current_image = _current_container_image()
+    target_image = str(result.get("target_image") or DEFAULT_IMAGE).strip()
+    if current_image:
+        result["current_image"] = current_image
+    if target_image:
+        result["target_image"] = target_image
+    if current_image and target_image:
+        result["update_available"] = _update_available(current_image, target_image)
+    result["update_services"] = list(UPDATE_SERVICES)
+    return result
 
 
 def _run(command: list[str], env: dict[str, str] | None = None) -> str:

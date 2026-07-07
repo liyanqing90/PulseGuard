@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend.app import main as main_module
@@ -435,7 +436,9 @@ class RunnerRouteTests(unittest.TestCase):
             "backend.app.main.BUILD_SHA", "abc123"
         ), patch("backend.app.main.WORKER_IMAGE", "pulseguard-worker:old"), patch(
             "backend.app.main.WORKER_UPDATE_IMAGE", "pulseguard-worker:new"
-        ), patch("backend.app.main.WORKER_UPDATER_URL", "http://pulseguard-worker-updater:8790"):
+        ), patch("backend.app.main.WORKER_UPDATER_URL", "http://pulseguard-worker-updater:8790"), patch(
+            "backend.app.main._worker_update_status_for_health", return_value={}
+        ):
             response = TestClient(app).get("/api/worker/health", headers={"Authorization": f"Bearer {token}"})
 
         self.assertEqual(response.status_code, 200)
@@ -444,6 +447,23 @@ class RunnerRouteTests(unittest.TestCase):
         self.assertEqual(metadata["build_sha"], "abc123")
         self.assertTrue(metadata["update_supported"])
         self.assertTrue(metadata["update_available"])
+
+    def test_worker_health_uses_updater_current_image_to_avoid_update_misreporting(self) -> None:
+        token = "pgrn_workerhealthtoken1234567890"
+        with patch("backend.app.main.WORKER_TOKEN", token), patch("backend.app.main.WORKER_IMAGE", "pulseguard-worker:old"), patch(
+            "backend.app.main.WORKER_UPDATE_IMAGE", "pulseguard-worker:new"
+        ), patch("backend.app.main.WORKER_UPDATER_URL", "http://pulseguard-worker-updater:8790"), patch(
+            "backend.app.main._worker_update_status_for_health",
+            return_value={"status": "succeeded", "current_image": "pulseguard-worker:new", "message": "worker updated"},
+        ):
+            response = TestClient(app).get("/api/worker/health", headers={"Authorization": f"Bearer {token}"})
+
+        self.assertEqual(response.status_code, 200)
+        metadata = response.json()["metadata"]
+        self.assertEqual(metadata["image"], "pulseguard-worker:new")
+        self.assertEqual(metadata["update_current_image"], "pulseguard-worker:new")
+        self.assertEqual(metadata["update_status"], "succeeded")
+        self.assertFalse(metadata["update_available"])
 
     def test_worker_update_requires_auth_and_proxies_to_updater(self) -> None:
         token = "pgrn_workerupdatetoken1234567890"
@@ -857,6 +877,10 @@ class RunnerRouteTests(unittest.TestCase):
         worker_result = {"ok": True, "message": "accepted"}
 
         with patch("backend.app.main.storage.get_probe_runner", return_value=runner), patch(
+            "backend.app.main.storage.mark_probe_runner_updating"
+        ) as mark_probe_runner_updating, patch(
+            "backend.app.main.storage.restore_probe_runner_status"
+        ) as restore_probe_runner_status, patch(
             "backend.app.main._worker_request", new=AsyncMock(return_value=worker_result)
         ) as worker_request, patch("backend.app.main.storage.record_audit_event") as record_audit_event:
             response = TestClient(app).post(
@@ -866,6 +890,8 @@ class RunnerRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["worker"], worker_result)
+        mark_probe_runner_updating.assert_called_once_with("office-1")
+        restore_probe_runner_status.assert_not_called()
         worker_request.assert_awaited_once_with(
             runner,
             "POST",
@@ -874,6 +900,32 @@ class RunnerRouteTests(unittest.TestCase):
             timeout=10,
         )
         record_audit_event.assert_called_once()
+
+    def test_runner_update_route_restores_runner_status_when_dispatch_fails(self) -> None:
+        runner = {
+            "runner_id": "office-1",
+            "name": "Office Runner",
+            "address": "http://10.0.0.8:8788",
+            "role": "child",
+            "status": "available",
+        }
+
+        with patch("backend.app.main.storage.get_probe_runner", return_value=runner), patch(
+            "backend.app.main.storage.mark_probe_runner_updating"
+        ) as mark_probe_runner_updating, patch(
+            "backend.app.main.storage.restore_probe_runner_status"
+        ) as restore_probe_runner_status, patch(
+            "backend.app.main._worker_request", new=AsyncMock(side_effect=HTTPException(status_code=400, detail="updater unavailable"))
+        ), patch("backend.app.main.storage.record_audit_event") as record_audit_event:
+            response = TestClient(app).post(
+                "/api/runners/office-1/update",
+                json={"target_image": "pulseguard-worker:new"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        mark_probe_runner_updating.assert_called_once_with("office-1")
+        restore_probe_runner_status.assert_called_once_with("office-1", "available")
+        record_audit_event.assert_not_called()
 
     def test_runner_heartbeat_route_upserts_runner(self) -> None:
         runner = {

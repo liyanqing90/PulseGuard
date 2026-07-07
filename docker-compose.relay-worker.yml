@@ -60,7 +60,9 @@ services:
       - PULSEGUARD_WORKER_TOKEN=${PULSEGUARD_WORKER_TOKEN:?PULSEGUARD_WORKER_TOKEN is required}
       - PULSEGUARD_WORKER_COMPOSE_FILE=/workspace/docker-compose.relay-worker.yml
       - PULSEGUARD_WORKER_SERVICE=pulseguard-worker
+      - PULSEGUARD_WORKER_UPDATE_SERVICES=pulseguard-worker,pulseguard-relay-client
       - PULSEGUARD_WORKER_CONTAINER=pulseguard-worker
+      - PULSEGUARD_RELAY_CLIENT_CONTAINER=pulseguard-relay-client
       - PULSEGUARD_WORKER_IMAGE=${PULSEGUARD_WORKER_IMAGE:-pulseguard-worker:local}
       - PULSEGUARD_WORKER_UPDATE_IMAGE=${PULSEGUARD_WORKER_UPDATE_IMAGE:-pulseguard-worker:local}
       - PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES=${PULSEGUARD_WORKER_ALLOWED_IMAGE_PREFIXES:-pulseguard-worker}

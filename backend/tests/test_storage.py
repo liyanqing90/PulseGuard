@@ -1257,6 +1257,77 @@ class RunnerStorageTests(unittest.TestCase):
         self.assertTrue(storage.can_schedule_runner(healthy))
         self.assertEqual(healthy["address"], "http://pulseguard-relay:19001")
 
+    def test_updating_relay_runner_is_not_schedulable_until_health_recovers(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ), patch.object(storage, "RELAY_INTERNAL_PORT_START", 19001), patch.object(storage, "RELAY_INTERNAL_PORT_END", 19002):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=int(provisioned["relay_token_version"]))
+            healthy = storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+            updating = storage.mark_probe_runner_updating(runner_id)
+            still_updating = storage.mark_probe_runner_unavailable(runner_id)
+            recovered = storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+
+        self.assertIsNotNone(healthy)
+        self.assertTrue(storage.can_schedule_runner(healthy))
+        self.assertEqual(updating["status"], "updating")
+        self.assertFalse(updating["available"])
+        self.assertFalse(storage.can_schedule_runner(updating))
+        self.assertEqual(still_updating["status"], "updating")
+        self.assertFalse(storage.can_schedule_runner(still_updating))
+        self.assertEqual(recovered["status"], "available")
+        self.assertTrue(storage.can_schedule_runner(recovered))
+
+    def test_active_relay_runner_can_reconnect_after_deploy_command_expiration(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            relay_token = str(provisioned["relay_token"])
+            version = int(provisioned["relay_token_version"])
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=version)
+            storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+            expired_at = (datetime.now().astimezone() - timedelta(seconds=1)).isoformat(timespec="seconds")
+            with storage._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE probe_runners
+                    SET status = 'connecting',
+                        deploy_command_expires_at = ?
+                    WHERE runner_id = ?
+                    """,
+                    (expired_at, runner_id),
+                )
+
+            verified = storage.verify_probe_runner_relay_token(runner_id, relay_token, version)
+            runner = storage.get_probe_runner(runner_id)
+
+        self.assertIsNotNone(verified)
+        self.assertIsNotNone(runner)
+        assert runner is not None
+        self.assertEqual(runner["status"], "connecting")
+        self.assertTrue(runner["was_available"])
+        self.assertTrue(runner["relay_token_set"])
+
+    def test_relay_runner_health_success_clears_deploy_command_expiration(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
+            storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"
+        ):
+            storage.init_db()
+            provisioned = storage.provision_probe_runner({"name": "Relay Runner", "network_region": "edge"})
+            runner_id = provisioned["runner_id"]
+            storage.mark_probe_runner_relay_connected(runner_id, token_version=int(provisioned["relay_token_version"]))
+            healthy = storage.mark_probe_runner_available(runner_id, {"status": "ok"})
+
+        self.assertIsNotNone(healthy)
+        assert healthy is not None
+        self.assertEqual(healthy["status"], "available")
+        self.assertIsNone(healthy["deploy_command_expires_at"])
+
     def test_relay_available_status_is_derived_from_fresh_heartbeat_and_health(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir, patch.object(
             storage, "DB_PATH", Path(temp_dir) / "pulseguard.db"

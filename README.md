@@ -249,9 +249,9 @@ docker logs --tail 80 pulseguard-worker
 
 命令默认后台启动容器并设置 Docker 自启策略。启动后用 `docker logs --tail 80 pulseguard-worker` 查看认证 token；需要持续观察日志时再执行 `docker logs -f pulseguard-worker`。
 
-worker 会在 `/api/worker/health` 上报版本、构建 SHA、当前镜像和是否启用平台更新。管理平台“执行节点”列表会展示这些信息。
+worker 会在 `/api/worker/health` 上报版本、构建 SHA、当前镜像和是否启用平台更新。启用 updater 时，当前镜像会优先按 Docker inspect 的真实运行镜像判断，管理平台“执行节点”列表会据此展示是否还有可更新镜像。
 
-标准子节点部署默认启用 updater。updater 会挂载宿主机 Docker socket，因此只允许更新当前 `pulseguard-worker` 服务，不支持任意命令：
+标准子节点部署默认启用 updater。updater 会挂载宿主机 Docker socket，因此只允许更新 compose 中声明的受控 PulseGuard 服务，不支持任意命令：
 
 ```powershell
 $env:COMPOSE_PROJECT_NAME = "pulseguard-worker"
@@ -262,7 +262,7 @@ docker compose -f docker-compose.worker.yml -f docker-compose.worker.build.yml u
 docker update --restart unless-stopped pulseguard-worker pulseguard-worker-updater
 ```
 
-启用后，主节点“执行节点”列表会显示“支持平台更新”，可以点击“更新节点”。更新过程由子节点 updater 执行：优先拉取目标镜像；如果镜像仓库不可达但本地已经存在目标镜像（例如 `pulseguard-worker:local`），会直接使用本地镜像继续重建 worker；随后检查 `/api/worker/health`，失败时尝试回滚到旧镜像。
+启用后，主节点“执行节点”列表会显示“支持平台更新”，可以点击“更新节点”。更新过程由子节点 updater 执行：优先拉取目标镜像；如果镜像仓库不可达但本地已经存在目标镜像（例如 `pulseguard-worker:local`），会直接使用本地镜像继续重建 worker；Relay 自动模式会同时重建 `pulseguard-worker` 和 `pulseguard-relay-client`，并从当前容器环境继承 runner、relay token、fingerprint 等必要变量；随后检查 `/api/worker/health`，失败时尝试回滚到旧镜像。
 
 如果子节点服务器不能直接访问公司 Git 项目，建议先在可访问环境构建并推送到内网镜像仓库，再让子节点 compose 指向内网镜像：
 
