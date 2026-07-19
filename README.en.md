@@ -3,72 +3,103 @@
 [简体中文](./README.md) | [English](./README.en.md)
 
 <p align="center">
-  <img src="./assets/brand/pulseguard-brand-card.en.svg" alt="PulseGuard - Local and LAN UI/API probe console" width="100%" />
+  <img src="./assets/brand/pulseguard-brand-card.en.svg" alt="PulseGuard - Local and cross-network UI/API probe console" width="100%" />
 </p>
 
-PulseGuard is a small UI/API probe console for local and LAN environments. It helps teams continuously check internal admin pages, login prerequisites, health endpoints, batch-process heartbeats, certificates, and basic network reachability. Run history, failure evidence, alert policies, and read-only status are managed in one single-instance console.
+<p align="center">
+  <strong>Continuously check pages, APIs, and network targets from one console while keeping evidence that helps explain failures.</strong>
+</p>
 
-Team marker: 新零售测试团队.
+PulseGuard is a local-first **UI/API probing and lightweight monitoring console** for individuals, small teams, and internal environments.
 
-PulseGuard is not a SaaS product, public status page, full E2E test management platform, or incident/on-call system. Its current boundary is single-instance local or LAN usage with SQLite as the default persistence layer.
+It combines scheduled checks, draft debugging, run history, failure evidence, health state, alerts, and distributed execution in a single-instance system. Typical targets include internal admin pages, login prerequisites, health endpoints, batch heartbeats, certificates, TCP/DNS, and basic network reachability.
 
-## Core Capabilities
+PulseGuard is not a public status-page service, a full E2E test-management platform, or an incident/on-call system. It solves a narrower problem:
 
-- UI/API probe tasks: scheduled runs, manual runs, draft debugging, structured assertions, and advanced Python scripts.
-- UI setup scripts: scan, draft debug, and formal runs all execute `setup_script` first to prepare login state, page prerequisites, and business context.
-- Rule maintenance: UI selector stability hints, rule invalidation checks, API response field preview, and one-click basic assertion generation.
-- Batch operations: run, enable, disable, and reschedule tasks by type, tag, and enabled state, with matched counts to prevent accidental bulk actions.
-- Run history: status, duration, error summary, screenshots, optional Trace, Response Body, recent-success comparison, and failure summary.
-- Monitoring trends: a dedicated trends page for overall UI/API and paginated task cards, with 24-hour, 7-day, 30-day, custom range, average latency, P95, P99, and failure counts.
-- Runner tracking: local Runner name, address, network zone, browser version, Runner heartbeat, and Runner status list.
-- Failure attribution: separates target failures from Runner execution environment failures.
-- Alert policies: execution alerts and system alerts use separate channel selections. Execution alerts support global, tag-level, and task-level policies with cooldown, recovery notification, and notification channel controls.
-- Operations audit: records task changes, settings changes, batch operations, config import, and version restoration.
-- Task versions: stores task definition snapshots and supports viewing and restoring historical versions.
-- Internal status page: shows sanitized task status, recent incidents, run metrics, and maintenance announcements.
-- Read-only outputs: read-only snapshot, JSON metrics, and Prometheus metrics.
-- Config transfer: export, sanitized export, import preview, and import apply. Config JSON can be managed in Git.
-- CLI/CI: run probes by task ID, type, or tag, and report pipeline results with exit codes.
-- Extended probes: templates and `ctx` helpers support passive heartbeat, TLS expiration, HTTP keyword/redirect/asset checks, TCP, and DNS.
+> When services are spread across local machines, LANs, and isolated networks, how can a team verify that they still work and distinguish a target failure from an execution-environment failure?
 
-## Recent Additions And Behavior Changes
+## Use cases
 
-- The UI brand area and health check keep the PulseGuard name and also expose the team marker `新零售测试团队`.
-- The monitoring trends page supports overall UI/API cards, paginated task cards, a detail drawer, per-card dimensions, and 24-hour, 7-day, 30-day, custom range, and daily-hour filters.
-- Trend rollups are written incrementally from new runs into `trend_rollups`; historical trend backfill is not required on startup and is disabled by default.
-- Relay onboarding can generate and regenerate child-runner deployment commands. Workers connect outbound to the main relay and do not need to expose inbound `8788`.
-- Child runners report version, build SHA, current image, and browser-type installation status. Standard deployment commands enable the updater profile by default so the main node can request controlled worker updates.
-- Browser crashes, missing browser dependencies, unavailable runners, distributed runner system failures, SQLite operational errors, and hard task-runtime timeouts are routed to system alerts instead of being stored as ordinary target-failure run records.
+- Check internal pages that require login or setup context;
+- Monitor APIs, health endpoints, and important response fields;
+- Receive passive heartbeats from batch jobs, schedulers, or devices;
+- Monitor TLS expiry, HTTP content, redirects, assets, TCP, and DNS;
+- Coordinate local, LAN, and cross-network runners from one main node;
+- Keep screenshots, response bodies, and optional Trace files for failed runs;
+- Separate target failures from browser, runner, dependency, and database failures.
 
-## Tech Stack
+## Core capabilities
 
-- Backend: FastAPI, SQLite, Playwright Python, `uv`
-- Frontend: React, TypeScript, Vite, Ant Design
-- Runtime: Docker Compose or local development processes
-- Persistence: SQLite plus local `data/` and `reports/`
+### UI and API probes
 
-## Quick Start
+- Scheduled, manual, batch, and rerun execution;
+- Structured UI steps, setup scripts, and multiple browser types;
+- API request configuration, field preview, assertions, and advanced scripts;
+- Draft runs that do not affect formal health or alert statistics.
 
-Use Docker Compose for a complete production build:
+### Trustworthy health state
 
-```powershell
+PulseGuard does not treat every transient failure as an outage. The main transition is:
+
+```text
+healthy → suspected failure → failed → suspected recovery → healthy
+```
+
+It also models unknown, stale observation, and disabled states. Browser crashes, missing dependencies, runner unavailability, and database errors are classified as Runner failures rather than target failures.
+
+### Evidence and trends
+
+- Error summaries, screenshots, and response bodies;
+- Optional Playwright Trace capture, disabled by default;
+- 24-hour, 7-day, 30-day, and custom-range trends;
+- Average successful latency, P95, P99, and failure counts;
+- Rolling retention for repeated failures to prevent unbounded evidence growth.
+
+### Distributed execution
+
+PulseGuard supports three execution sources:
+
+```text
+main node
+├── local: built-in local execution
+├── direct worker: main node reaches a LAN worker directly
+└── relay worker: worker connects outbound without exposing an inbound port
+```
+
+Multi-runner and multi-browser runs share a run group and retain runner state, browser type, failure source, duration, and evidence per result.
+
+### Alerts and read-only outputs
+
+- Separate target-execution alerts from system-failure alerts;
+- Global, tag-level, and task-level alert policies;
+- Cooldown and recovery notifications;
+- JSON, Prometheus, and token-protected read-only snapshots;
+- Config export, sanitized export, import preview, and version restoration.
+
+## Quick start
+
+Docker Compose is the recommended path:
+
+```bash
+git clone https://github.com/liyanqing90/PulseGuard.git
+cd PulseGuard
 docker compose up --build -d
 ```
 
-By default, PulseGuard is published on `0.0.0.0:8787`:
+The default published address is `0.0.0.0:8787`:
 
-- Local access: `http://127.0.0.1:8787`
-- LAN access: `http://<your LAN IP>:8787`
+- Local: `http://127.0.0.1:8787`
+- LAN: `http://<local IP>:8787`
 
-Common checks:
+Check the deployment:
 
-```powershell
+```bash
 docker compose ps
 docker compose logs --tail 80 pulseguard
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8787/api/health
+curl http://127.0.0.1:8787/api/health
 ```
 
-To restrict access to the local machine only, set the following in `.env`:
+To publish only on localhost:
 
 ```env
 PULSEGUARD_PUBLISH_HOST=127.0.0.1
@@ -78,193 +109,84 @@ PULSEGUARD_PUBLISH_PORT=8787
 PULSEGUARD_ALERT_DETAIL_BASE_URL=http://127.0.0.1:8787
 ```
 
-## Local Development
+## Relay: outbound-only workers
 
-Backend dependencies are managed with `uv`:
+Enable Relay on the main node:
 
-```powershell
-uv sync
-uv run python -m playwright install chromium
-uv run uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8787 --reload
-```
-
-Frontend dependencies are managed with npm:
-
-```powershell
-cd frontend
-npm ci
-npm run dev
-```
-
-The default frontend development URL is `http://127.0.0.1:5173`. To specify a port and backend proxy:
-
-```powershell
-cd frontend
-$env:VITE_DEV_API_TARGET="http://127.0.0.1:8787"
-npm run dev -- --host 127.0.0.1 --port 5175
-```
-
-## UI Browser Lifecycle
-
-UI tasks support the Playwright browser types `chromium`, `firefox`, and `webkit`. System settings can configure:
-
-- `enabled_browser_types`: browser types that tasks are allowed to select and run.
-- `prewarmed_browser_types`: browser types that are warmed automatically on backend startup or settings reload. They must also be enabled and may be empty.
-- `browser_pool_sizes`: the empty `BrowserContext` reserve size for each browser type. Each type defaults to 5.
-- `browser_recycle_after_runs`: how many UI contexts a warmed browser can complete before it is recycled. The default is 20. Failure screenshots are still written to `reports/` before recycling; Trace is recorded only when enabled in system settings, and recycling releases Playwright temporary resources under `/tmp/playwright-artifacts-*`.
-- `similar_failure_retention_count`: when the same task keeps failing or timing out with the same error, detailed run records use a rolling window. The default keeps the latest 10 records and deletes artifacts attached to older compacted records.
-- `trace_artifacts_enabled`: whether failed UI runs record Playwright Trace zip files. The default is off. Failure screenshots and available Response Body evidence remain available when Trace is off.
-
-Each prewarmed browser type keeps one Playwright browser process alive and pre-creates empty `BrowserContext` instances according to that type's pool size. Each UI task leases one exclusive context/page. When the task ends, only that context is closed; the browser process stays alive and the pool refills an empty context. Web and H5 sizing are separated by context options, so different viewport tasks can run concurrently under the same browser process.
-
-`browser_type` only applies to UI tasks. Execution resolves target nodes first, then browser types inside each node. Node multi-select plus browser type multi-select creates a node x browser-type execution matrix. A browser type runs only when it is enabled in settings and installed on the selected node; missing or disabled combinations are recorded as runner-side failures. When new browser types are enabled, the main node asks the local process and available child nodes to install the matching Playwright browsers. For each formal worker run, the main node also sends `enabled_browser_types`, `prewarmed_browser_types`, and `browser_pool_sizes`; child nodes reload their resource pools and prewarm browsers from the same execution settings.
-
-## Remote Runners
-
-PulseGuard keeps the built-in `local` Runner enabled by default. Child runners support two connection modes:
-
-- Manual mode: the main node must directly reach `http://<worker>:8788`. Add the child runner in Settings with its address and worker token.
-- Relay mode: the worker host does not expose inbound ports. `pulseguard-relay-client` connects outbound to the main node relay, verifies the self-signed server fingerprint, and forwards traffic to the local worker.
-
-Enable the relay server on the main node:
-
-```sh
-export PULSEGUARD_RELAY_PUBLIC_HOST="<main public IP>"
+```bash
+export PULSEGUARD_RELAY_PUBLIC_HOST="<public host or IP>"
 docker compose -f docker-compose.yml -f docker-compose.relay.yml up --build -d
 ```
 
-The default public relay port is `9443`. In Settings > Execution > Add child runner, choose “Generate deployment command” and enter a worker-reachable `docker-compose.relay-worker.yml` URL to create a one-time worker deployment command for Linux shell or PowerShell. Relay worker deployments use that compose file; the worker exposes `8788` only inside the compose network.
+Only the public TCP port `9443` is required by default. Workers do not publish `8788` on the host; the relay client connects outbound to the main node.
 
-Relay stream concurrency follows the system “max concurrent tasks” setting by default. `PULSEGUARD_RELAY_MAX_CONCURRENT_STREAMS` is only the fallback while settings or the database are unavailable. Extra streams are rejected so the main-node queue remains responsible for task ordering and backpressure.
+Relay uses self-signed TLS, server-fingerprint pinning, one-time deployment credentials, hashed/encrypted token storage, and an internal-only control network. See the [operations reference](./docs/operations-reference.en.md) for the complete model.
 
-Relay runner states:
+## Technology
 
-- `pending_deployment`, `expired`, and `connecting` are not scheduled by “round-robin all enabled runners” and do not trigger runner-unavailable alerts.
-- A relay runner becomes schedulable only after the relay session is connected and `/api/worker/health` succeeds through the internal relay port.
-- Regenerating the deployment command keeps the runner ID and internal port, rotates the relay token, and invalidates old commands.
-- Runner-side failures are kept as `status=skipped`, `failure_kind=runner`, and `affects_health=false` run records. They remain visible without counting as target failures.
+| Layer | Technology |
+| --- | --- |
+| Backend | FastAPI, SQLite, Playwright Python, uv |
+| Frontend | React, TypeScript, Vite, Ant Design |
+| Runtime | Docker Compose or local processes |
+| Storage | SQLite, `data/`, `reports/` |
+| Remote execution | Direct workers and WebSocket Relay |
 
-Scheduled distributed runs enter the main-node queue first. The scheduler keeps a 30-second misfire grace window so short queue delays do not silently drop run records.
+## Product boundaries
 
-## Verification
+- Single-instance and local/LAN-first;
+- SQLite by default, with no required external database;
+- Workers execute tasks but do not own scheduling, alerts, or source-of-truth data;
+- Custom Python scripts are trusted local capabilities, not a security sandbox;
+- Evidence uses retention policies rather than permanent full-artifact storage;
+- Recording is not the primary path; structured rules, templates, and setup scripts are preferred.
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [Operations reference](./docs/operations-reference.en.md) | Local development, browser pools, runners, Relay, tokens, API, and troubleshooting |
+| [中文运维参考](./docs/operations-reference.md) | Full Chinese operations reference |
+| [China deployment](./docs/china-deployment.md) | Mirrors and dependency setup for mainland networks |
+| [Volcano deployment](./docs/volcano-deployment.md) | Main-node, local-worker, and migration workflow |
+
+## Validation
 
 Backend:
 
-```powershell
+```bash
 uv run python -m unittest discover -s backend/tests -p 'test_*.py' -v
 ```
 
 Frontend:
 
-```powershell
+```bash
 cd frontend
 npm run build
 ```
 
-Docker:
+Lockfile and deployment checks:
 
 ```powershell
 uv lock --check
 .\scripts\deploy.ps1
 ```
 
-China-network deployment notes live in [docs/china-deployment.md](./docs/china-deployment.md). Volcano main-node and local relay-worker notes live in [docs/volcano-deployment.md](./docs/volcano-deployment.md). To sync local main-node data to Volcano:
-
-```powershell
-.\scripts\sync-volcano-main.ps1 -RemoteEnvPath "D:\project\PulseGuard\remote.env" -DeploymentMode auto
-```
-
-## Script Task Entry Points
-
-Advanced scripts use a fixed entry point:
-
-```python
-async def check(ctx):
-    response = await ctx.request()
-    ctx.assert_status(response, 200)
-```
-
-UI tasks can use `setup_script` first to prepare page prerequisites:
-
-```python
-async def setup(ctx):
-    page = await ctx.new_page()
-    await page.goto(ctx.entry_url)
-    return page
-```
-
-Structured UI/API assertions do not require an advanced script. Complex login, multi-window flows, or business branches can still use script mode.
-
-## Data And Security Boundaries
-
-- SQLite is the default persistence layer. The database file lives in `data/`.
-- Trend data is stored in the SQLite `trend_rollups` table with latency histograms and summary metrics. New runs write trends automatically. Historical trend backfill is disabled by default; if old data must be backfilled, start once with `PULSEGUARD_TREND_BACKFILL_ON_STARTUP=true`.
-- Screenshots, enabled Trace files, Response Body artifacts, and archived summaries live in `reports/`.
-- Environment variables, webhooks, DingTalk secrets, read-only tokens, common auth headers, and cookies are redacted in public settings, run records, read-only outputs, and the status page.
-- User-defined Python probe scripts are a trusted local tool capability, not a security sandbox.
-- The internal status page only shows sanitized summaries. It does not expose scripts, headers, webhooks, environment variables, response bodies, error stacks, or Runner topology.
-- Recording is not the current mainline. Multi-step probes should prioritize templates, setup scripts, and structured rules.
-
-## Common API Endpoints
-
-- `GET /api/health`: health check with application name and team marker
-- `GET /api/status-page`: internal status page data
-- `GET /api/metrics.json`: JSON metrics
-- `GET /api/metrics`: Prometheus metrics
-- `GET /api/read-only/snapshot`: read-only snapshot, requires a configured read-only token
-- `GET /api/runs/{id}`: run detail based on execution snapshots; UI runs attach the request basics captured for that run (URL, viewport, timeout), while API runs keep request/response snapshots instead of reloading the current task definition
-- `GET /api/runners` / `POST /api/runners`: list runners and create manual child runners
-- `GET /api/relay/status`: relay enablement, public URL, and server fingerprint
-- `POST /api/runners/provision`: create a relay child runner and one-time deployment command
-- `POST /api/runners/{runner_id}/provision/regenerate`: regenerate a relay deployment command
-- `POST /api/runners/heartbeat`: Runner heartbeat
-- `GET /api/worker/health` / `POST /api/worker/run`: child worker health and execution entry points
-- `POST /api/worker/browser-types/install`: request a worker to install enabled Playwright browser types
-- `POST /api/heartbeats/{key}`: passive heartbeat report
-
-## Repository Structure
+## Project layout
 
 ```text
-backend/                 FastAPI backend, storage, runner, alerts, tests
-frontend/                React frontend, pages, workflow components, design styles
-data/                    SQLite data directory
-reports/                 Screenshots, enabled Trace files, Response Body artifacts, archived summaries
-docs/                    Roadmap, design, and feature documents
-Dockerfile               Production image build
-docker-compose.yml       Single-instance deployment
-docker-compose.relay.yml Main-node relay server overlay
-docker-compose.relay-worker.yml Relay worker deployment
-pyproject.toml           Backend dependency definition
-uv.lock                  Backend dependency lockfile
+backend/                    FastAPI backend, storage, runners, alerts, tests
+frontend/                   React application, components, and styles
+data/                       SQLite data
+reports/                    screenshots, Trace, response bodies, summaries
+docs/                       deployment, design, and operations docs
+Dockerfile                  main-node image
+docker-compose.yml          main-node deployment
+docker-compose.relay.yml    Relay service
+Dockerfile.worker           worker image
+docker-compose.worker.yml   worker deployment
 ```
 
-## Current Direction
+---
 
-The near-term goal is to make PulseGuard a stable internal probe workbench:
-
-- Strengthen structured rules, scan candidates, failure summaries, and config transfer first.
-- Keep the SQLite single-instance model unless the deployment model changes to multi-instance, multi-user, or high-volume historical analytics.
-- AI-assisted rule generation and Playwright case import are future enhancements. They must redact by default and save only after user confirmation.
-- Recording remains a long-term observation item and is not part of the current mainline.
-
-## Brand Assets
-
-PulseGuard brand assets live in `assets/brand/`:
-
-- `pulseguard-mark.svg`: light-background project icon for favicon, app sidebar, and small-size usage.
-- `pulseguard-brand-card.svg`: Chinese README and project-introduction brand card.
-- `pulseguard-brand-card.en.svg`: English README and project-introduction brand card.
-- `pulseguard-logo-concept.png`: light-background imagegen concept reference. The official mark is the SVG asset.
-
-The brand uses the project design system's light panel surface, control blue, and status green. It does not use dark icon backgrounds, gradients, or glassmorphism.
-
-## License
-
-PulseGuard is open source under the [Apache License 2.0](./LICENSE). You may use it commercially, modify it, and redistribute it, but you must keep copyright, license, and attribution notices as required by the license.
-
-When redistributing or publishing derivative works based on this project, keep:
-
-- [LICENSE](./LICENSE)
-- [NOTICE](./NOTICE)
-- Project name `PulseGuard`
-- Repository link `git@git.corpautohome.com:liyanqing/PulseGuard.git`
+PulseGuard is created and maintained by [Qingye](https://github.com/liyanqing90).
